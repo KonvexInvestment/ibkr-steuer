@@ -595,7 +595,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         ib_tax_dir = sys.argv[1]
     else:
-        ib_tax_dir = '/Users/bennett/Documents/IB Tax/'
+        ib_tax_dir = './'
         
     calculate_tax(ib_tax_dir)
 

@@ -82,8 +82,8 @@ if __name__ == "__main__":
         xml_file = sys.argv[1]
         output_dir = sys.argv[2]
     else:
-        xml_file = "/Users/bennett/Documents/IB Tax/U5248983_U5248983_20250101_20251231_AF_NA_db49de5f8b01ff54fd518693b2fef5b1.xml"
-        output_dir = "/Users/bennett/Documents/IB Tax/"
+        xml_file = "input.xml"
+        output_dir = "./"
     
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)

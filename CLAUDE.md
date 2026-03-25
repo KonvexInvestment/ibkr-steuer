@@ -96,6 +96,6 @@ IBKR bundles the option premium into the stock's `fifoPnlRealized` and shows `fi
 
 ## Data Files (local only, not in repo)
 
-- `U5248983_...xml` — IBKR Flex Query XML (source of truth, covers 2025-01-01 to 2025-12-31)
+- IBKR Flex Query XML (source of truth, covers 2025-01-01 to 2025-12-31)
 - `trades.csv`, `statement_of_funds.csv`, `pnl_summary.csv`, `financial_instruments.csv`, `account_info.csv` — extracted CSVs
 - `Grundlage/` — BMF-Schreiben PDF, Anlage KAP 2025 Formular (reference documents)

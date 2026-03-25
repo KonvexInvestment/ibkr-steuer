@@ -2,7 +2,7 @@ import csv
 import os
 
 def audit_tax():
-    file_path = '/Users/bennett/Documents/IB Tax/statement_of_funds.csv'
+    file_path = 'statement_of_funds.csv'
     if not os.path.exists(file_path):
         print("File not found")
         return
