@@ -2,7 +2,7 @@
 
 Automatische Berechnung der Anlage KAP (Zeilen 19, 20, 22, 23, 41) aus Interactive Brokers Flex Query XML-Exporten. Laeuft komplett im Browser - keine Installation, keine Cloud, keine Daten verlassen Ihren Rechner.
 
-**[Jetzt starten](https://bennettb.github.io/ibkr-steuer/)** (Link anpassen nach GitHub Pages Aktivierung)
+**[Jetzt starten](https://konvexinvestment.github.io/ibkr-steuer/)**
 
 ## Features
 
@@ -28,7 +28,7 @@ Die App laeuft **vollstaendig im Browser** via WebAssembly (stlite/Pyodide). Es 
 ## Lokale Entwicklung
 
 ```bash
-git clone https://github.com/DEIN-USERNAME/ibkr-steuer.git
+git clone https://github.com/KonvexInvestment/ibkr-steuer.git
 cd ibkr-steuer
 python3 -m venv .venv
 source .venv/bin/activate
