@@ -321,6 +321,12 @@ st.markdown(COLOR_VARS, unsafe_allow_html=True)
 st.markdown('<p class="page-title">🇩🇪 Steuerbericht 2025</p>', unsafe_allow_html=True)
 st.markdown('<p class="page-sub">Anlage KAP · Interactive Brokers Flex Query</p>', unsafe_allow_html=True)
 
+st.markdown("""
+<div style="background: rgba(96,165,250,0.08); border: 1px solid rgba(96,165,250,0.2); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
+    <strong style="color: #60a5fa;">Datenschutz:</strong> Alle Berechnungen erfolgen ausschliesslich lokal in Ihrem Browser. Es werden keine Daten an Server uebertragen, gespeichert oder an Dritte weitergegeben.
+</div>
+""", unsafe_allow_html=True)
+
 uploaded_file = st.file_uploader("IBKR Flex Query hochladen (XML)", type="xml",
                                   label_visibility="collapsed")
 
@@ -562,3 +568,38 @@ st.download_button(
     mime="text/plain",
     use_container_width=True
 )
+
+# ── Rechtliche Hinweise ──────────────────────────────────────────────────────
+
+st.markdown('<div class="section-title">Rechtliche Hinweise</div>', unsafe_allow_html=True)
+
+st.markdown("""
+<div style="background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 1.25rem 1.25rem; font-size: 0.78rem; color: #64748b; line-height: 1.7;">
+
+<strong style="color: #94a3b8;">Haftungsausschluss</strong><br>
+Dieses Tool dient ausschliesslich zur Unterstuetzung bei der Erstellung der Einkommensteuererklaerung. Die berechneten Werte sind unverbindlich und ohne Gewaehr fuer Richtigkeit, Vollstaendigkeit oder Aktualitaet. Der Nutzer ist fuer die Pruefung aller Angaben in seiner Steuererklaerung selbst verantwortlich. Die Nutzung erfolgt auf eigenes Risiko.
+
+<br><br>
+<strong style="color: #94a3b8;">Keine Steuerberatung</strong><br>
+Dieses Tool stellt keine Steuerberatung im Sinne des Steuerberatungsgesetzes (StBerG) dar und ersetzt nicht die Beratung durch einen Steuerberater, Wirtschaftspruefer oder eine andere zur Steuerberatung befugte Person. Bei Unsicherheiten oder komplexen Sachverhalten konsultieren Sie bitte einen steuerlichen Berater.
+
+<br><br>
+<strong style="color: #94a3b8;">Keine Haftung</strong><br>
+Die Entwickler und Mitwirkenden dieses Projekts haften nicht fuer Schaeden, die durch die Nutzung oder Nichtnutzung der berechneten Informationen entstehen, einschliesslich, aber nicht beschraenkt auf finanzielle Verluste, Steuernachzahlungen, Bussgelder oder Zinsen. Dies gilt sowohl fuer direkte als auch fuer indirekte Schaeden, unabhaengig davon, ob diese vorhersehbar waren.
+
+<br><br>
+<strong style="color: #94a3b8;">Datenschutz und Datenverarbeitung</strong><br>
+Saemtliche Berechnungen werden ausschliesslich lokal im Browser des Nutzers ausgefuehrt (clientseitige Verarbeitung mittels WebAssembly). Es werden zu keinem Zeitpunkt personenbezogene Daten, Finanzdaten oder hochgeladene Dateien an einen Server uebertragen, gespeichert oder an Dritte weitergegeben. Es findet kein Tracking, keine Analyse und keine Protokollierung statt. Die Anwendung erfuellt die Anforderungen der DSGVO, da keine Datenverarbeitung durch den Anbieter erfolgt.
+
+<br><br>
+<strong style="color: #94a3b8;">Rechtsstand und Aktualitaet</strong><br>
+Die steuerlichen Berechnungen basieren auf dem Rechtsstand des Steuerjahres 2025, insbesondere auf §20 EStG, dem BMF-Schreiben vom 14.05.2025 (Einzelfragen zur Abgeltungsteuer) sowie dem Jahressteuergesetz 2024. Aenderungen der Rechtslage, der Verwaltungsauffassung oder der Rechtsprechung nach Veroeffentlichung dieses Tools werden nicht automatisch beruecksichtigt.
+
+<br><br>
+<strong style="color: #94a3b8;">Open Source</strong><br>
+Dieses Projekt ist unter der MIT-Lizenz veroeffentlicht. Der Quellcode ist frei einsehbar und pruefbar unter
+<a href="https://github.com/KonvexInvestment/ibkr-steuer" target="_blank" style="color: #60a5fa;">github.com/KonvexInvestment/ibkr-steuer</a>.
+Jeder kann den Code einsehen, pruefen und zur Verbesserung beitragen.
+
+</div>
+""", unsafe_allow_html=True)
