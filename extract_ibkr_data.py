@@ -312,10 +312,48 @@ def parse_ibkr_xml(xml_file_path, output_dir):
             writer.writerow({'fxTranslationGainLoss': fx_tgl})
         print(f"Saved fxTranslationGainLoss: {fx_tgl} to {fx_tgl_path}")
 
+    # Detect tax year from FlexStatement period
+    flex_stmt = root.find('.//FlexStatement')
+    tax_year_detected = None
+    if flex_stmt is not None:
+        to_date = flex_stmt.get('toDate', '')
+        if to_date and len(to_date) >= 4:
+            tax_year_detected = to_date[:4]
+            print(f"Steuerjahr erkannt: {tax_year_detected} (Zeitraum: {flex_stmt.get('fromDate', '?')} – {to_date})")
+
+    # Detect and extract FxTransactions (IBKR's own FIFO PnL per FX event)
+    fx_trans_node = root.find('.//FxTransactions')
+    fx_trans_count = len(list(fx_trans_node)) if fx_trans_node is not None else -1
+    if fx_trans_count > 0:
+        print(f"FxTransactions: {fx_trans_count} Einträge gefunden (IBKR-internes FIFO)")
+        fx_pnl_fields = ['reportDate', 'dateTime', 'functionalCurrency', 'fxCurrency',
+                         'activityDescription', 'quantity', 'proceeds', 'cost', 'realizedPL',
+                         'code', 'levelOfDetail']
+        fx_pnl_rows = []
+        for elem in fx_trans_node:
+            row = {field: elem.get(field, '') for field in fx_pnl_fields}
+            if row.get('levelOfDetail') == 'TRANSACTION' and row.get('realizedPL'):
+                fx_pnl_rows.append(row)
+        if fx_pnl_rows:
+            fx_pnl_path = os.path.join(output_dir, 'fx_realized_pnl.csv')
+            with open(fx_pnl_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=fx_pnl_fields)
+                writer.writeheader()
+                writer.writerows(fx_pnl_rows)
+            total_pnl = sum(float(r['realizedPL']) for r in fx_pnl_rows)
+            print(f"Saved {len(fx_pnl_rows)} FX realized PnL entries to {fx_pnl_path} (Total: {total_pnl:,.2f} EUR)")
+    elif fx_trans_count == 0:
+        print(f"FxTransactions: Sektion vorhanden aber leer (Flex Query Konfiguration prüfen)")
+    else:
+        print(f"FxTransactions: Sektion nicht vorhanden")
+
     # Extract AccountInformation (single element with base currency)
     acct_info = acct_info_node
     if acct_info is not None:
         acct_data = acct_info.attrib.copy()
+        acct_data['fx_transactions_count'] = str(fx_trans_count)
+        if tax_year_detected:
+            acct_data['tax_year'] = tax_year_detected
         acct_path = os.path.join(output_dir, 'account_info.csv')
         with open(acct_path, 'w', newline='', encoding='utf-8') as f:
             headers = sorted(acct_data.keys())

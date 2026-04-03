@@ -107,14 +107,29 @@ def parse_ibkr_csv_report(csv_path):
     fx_total_gain = 0.0
     fx_total_loss = 0.0
     category_totals = {}  # {category: {gain, loss, net}}
+    income_totals = {}  # {dividends_eur, interest_eur, withholding_tax_eur}
 
     last_category = None
 
     with open(csv_path, 'r', encoding='utf-8-sig') as f:
         for line in f:
+            parts = list(csv_module.reader(io.StringIO(line)))[0]
+
+            # Dividenden/Zinsen/Quellensteuer EUR totals
+            if len(parts) >= 6:
+                field = parts[2].strip() if len(parts) > 2 else ''
+                if line.startswith('Dividenden,Data,Gesamt Dividenden in EUR'):
+                    income_totals['dividends_eur'] = safe_float(parts[5], 0)
+                    continue
+                elif line.startswith('Zinsen,Data,Gesamt Zinsen in EUR'):
+                    income_totals['interest_eur'] = safe_float(parts[5], 0)
+                    continue
+                elif line.startswith('Quellensteuer,Data,Gesamtwert in EUR'):
+                    income_totals['withholding_tax_eur'] = safe_float(parts[5], 0)
+                    continue
+
             if not line.startswith('Übersicht  zur realisierten und unrealisierten Performance,Data,'):
                 continue
-            parts = list(csv_module.reader(io.StringIO(line)))[0]
             if len(parts) < 10:
                 continue
 
@@ -160,6 +175,7 @@ def parse_ibkr_csv_report(csv_path):
         'fx_total_gain': fx_total_gain,
         'fx_total_loss': fx_total_loss,
         'category_totals': category_totals,
+        'income_totals': income_totals,
     }
 
 
@@ -332,15 +348,24 @@ def calculate_fx_gains(trades, fx_transactions, tax_year, base_currency='EUR'):
     return results, total_gain, total_loss, has_prior_data
 
 
-def calculate_tax(ib_tax_dir, tax_year=2025, fx_csv_path=None):
-    # 0. Detect base currency from account_info.csv
-    base_currency = 'USD'  # default for backward compatibility
+def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
+    # 0. Detect base currency, tax year, and XML metadata from account_info.csv
+    base_currency = 'EUR'  # default — most IBKR accounts for German tax filers are EUR-based
+    xml_has_fx_data = False
     acct_path = os.path.join(ib_tax_dir, 'account_info.csv')
     if os.path.exists(acct_path):
         acct_rows = load_csv(acct_path)
         if acct_rows:
-            base_currency = acct_rows[0].get('currency', 'USD')
-    print(f"Base currency: {base_currency}")
+            base_currency = acct_rows[0].get('currency', 'EUR')
+            fx_count = int(acct_rows[0].get('fx_transactions_count', '-1'))
+            xml_has_fx_data = fx_count > 0
+            if tax_year is None:
+                detected = acct_rows[0].get('tax_year', '')
+                if detected:
+                    tax_year = int(detected)
+    if tax_year is None:
+        tax_year = 2025  # fallback
+    print(f"Base currency: {base_currency}, Steuerjahr: {tax_year}")
 
     # 1. Load and Deduplicate Trades
     all_trades = load_csv(os.path.join(ib_tax_dir, 'trades.csv'))
@@ -417,9 +442,12 @@ def calculate_tax(ib_tax_dir, tax_year=2025, fx_csv_path=None):
     options_loss = 0.0
 
     for t in trades:
-        # Only process trades from the tax year
+        # Use reportDate for tax year assignment (Settlement/Buchungsdatum)
+        # Trades at year boundary (e.g., dateTime=2023-12-29, settlement=2024-01-02)
+        # belong to the tax year of settlement
+        report_date = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
         date = parse_date(t.get('dateTime') or t.get('tradeDate'))
-        if not date or date.year != tax_year:
+        if not report_date or report_date.year != tax_year:
             continue
 
         # Check if Realized PnL event
@@ -587,17 +615,18 @@ def calculate_tax(ib_tax_dir, tax_year=2025, fx_csv_path=None):
             cross_year_by_year[yr] = cross_year_by_year.get(yr, 0) + det['premium_eur']
 
     # --- PLAUSIBILITY: Raw Sums for Reconciliation ---
-    raw_div_base = sum(safe_float(f.get('amount')) for f in funds if f.get('activityCode') == 'DIV' and (d := parse_date(f.get('date'))) is not None and d.year == tax_year)
-    raw_tax_base = sum(safe_float(f.get('amount')) for f in funds if f.get('activityCode') in ['FRTAX', 'WHT'] and (d := parse_date(f.get('date'))) is not None and d.year == tax_year)
-    
+    # Use reportDate (booking date) for year assignment — Zuflussprinzip (§11 EStG)
+    raw_div_base = sum(safe_float(f.get('amount')) for f in funds if f.get('activityCode') == 'DIV' and (d := parse_date(f.get('reportDate') or f.get('date'))) is not None and d.year == tax_year)
+    raw_tax_base = sum(safe_float(f.get('amount')) for f in funds if f.get('activityCode') in ['FRTAX', 'WHT'] and (d := parse_date(f.get('reportDate') or f.get('date'))) is not None and d.year == tax_year)
+
     # 4. Dividends, Interest, and Withholding Tax
     dividends_eur = 0.0
     interest_eur = 0.0  # Bond coupons, credit interest
     withholding_tax_eur = 0.0
-    
+
     funds_processed = 0
     funds_skipped_year = 0
-    
+
     for f in funds:
         code = f.get('activityCode')
         # DIV = Dividends, PIL = Payment in Lieu (short dividends)
@@ -607,10 +636,13 @@ def calculate_tax(ib_tax_dir, tax_year=2025, fx_csv_path=None):
         # FRTAX/WHT = Withholding Tax
         if code not in ['DIV', 'PIL', 'INTR', 'CINT', 'INTP', 'DINT', 'FRTAX', 'WHT']:
             continue
-            
+
+        # Use reportDate (booking/settlement date) for tax year assignment
+        # Zuflussprinzip (§11 EStG): taxed when received, not when the underlying event occurred
+        # Example: Tax reclaim processed in 2025 for a 2024 dividend → belongs to 2025
+        report_date = parse_date(f.get('reportDate') or f.get('date'))
         date = parse_date(f.get('date') or f.get('reportDate'))
-        # Only process entries for the report year (2025)
-        if not date or date.year != tax_year:
+        if not report_date or report_date.year != tax_year:
             funds_skipped_year += 1
             continue
             
@@ -747,18 +779,49 @@ def calculate_tax(ib_tax_dir, tax_year=2025, fx_csv_path=None):
     fx_has_prior_data = True
     fx_source = 'none'  # 'csv', 'fifo', or 'none'
     csv_category_totals = {}  # plausibility data from CSV report
+    csv_income_totals = {}  # dividends/interest/withholding tax from CSV report
 
-    # Option A: Exact FX from IBKR standard CSV report
-    if fx_csv_path and os.path.exists(fx_csv_path) and base_currency == 'EUR':
+    # Parse IBKR standard CSV report (plausibility data always, FX only for EUR-base)
+    if fx_csv_path and os.path.exists(fx_csv_path):
         csv_data = parse_ibkr_csv_report(fx_csv_path)
-        fx_results = csv_data['fx_results']
-        fx_total_gain = csv_data['fx_total_gain']
-        fx_total_loss = csv_data['fx_total_loss']
         csv_category_totals = csv_data['category_totals']
-        fx_source = 'csv'
-        print(f"FX: Exakte Werte aus IBKR Standard-Bericht übernommen.")
+        csv_income_totals = csv_data.get('income_totals', {})
+        if base_currency == 'EUR':
+            fx_results = csv_data['fx_results']
+            fx_total_gain = csv_data['fx_total_gain']
+            fx_total_loss = csv_data['fx_total_loss']
+            fx_source = 'csv'
+            print(f"FX: Exakte Werte aus IBKR Standard-Bericht übernommen.")
 
-    # Option B: FIFO approximation from fx_transactions.csv
+    # Option B: Exact FX from XML FxTransactions (IBKR's own FIFO, per-transaction realizedPL)
+    fx_pnl_path = os.path.join(ib_tax_dir, 'fx_realized_pnl.csv')
+    if not fx_results and os.path.exists(fx_pnl_path) and base_currency == 'EUR':
+        fx_pnl_rows = load_csv(fx_pnl_path)
+        fx_by_curr = {}
+        for row in fx_pnl_rows:
+            rd = parse_date(row.get('reportDate'))
+            if not rd or rd.year != tax_year:
+                continue
+            curr = row.get('fxCurrency', '')
+            pnl = safe_float(row.get('realizedPL'), 0)
+            if not curr or abs(pnl) < 0.001:
+                continue
+            if curr not in fx_by_curr:
+                fx_by_curr[curr] = {'gain': 0, 'loss': 0, 'net': 0, 'lots_remaining': 0, 'disposals_count': 0}
+            if pnl > 0:
+                fx_by_curr[curr]['gain'] += pnl
+            else:
+                fx_by_curr[curr]['loss'] += pnl
+            fx_by_curr[curr]['net'] += pnl
+            fx_by_curr[curr]['disposals_count'] += 1
+        if fx_by_curr:
+            fx_results = fx_by_curr
+            fx_total_gain = sum(d['gain'] for d in fx_by_curr.values())
+            fx_total_loss = sum(d['loss'] for d in fx_by_curr.values())
+            fx_source = 'xml'
+            print(f"FX: Exakte Werte aus XML FxTransactions übernommen ({len(fx_pnl_rows)} Einträge).")
+
+    # Option C: FIFO approximation from fx_transactions.csv (least accurate)
     fx_path = os.path.join(ib_tax_dir, 'fx_transactions.csv')
     if not fx_results and os.path.exists(fx_path) and base_currency == 'EUR':
         fx_transactions = load_csv(fx_path)
@@ -842,6 +905,7 @@ def calculate_tax(ib_tax_dir, tax_year=2025, fx_csv_path=None):
         "options_net_eur": options_gain + options_loss,
         "withholding_tax_eur": withholding_tax_eur,
         "base_currency": base_currency,
+        "tax_year": tax_year,
         # FX currency gains/losses
         "fx_results": fx_results,
         "fx_total_gain": fx_total_gain,
@@ -850,7 +914,9 @@ def calculate_tax(ib_tax_dir, tax_year=2025, fx_csv_path=None):
         "fx_translation": fx_translation,
         "fx_has_prior_data": fx_has_prior_data,
         "fx_source": fx_source,
+        "xml_has_fx_data": xml_has_fx_data,
         "csv_category_totals": csv_category_totals,
+        "csv_income_totals": csv_income_totals,
         # Plausibility Metadata
         "has_trade_price": has_trade_price,
         "audit": {

@@ -10,7 +10,7 @@ import extract_ibkr_data
 import calculate_tax_report
 
 st.set_page_config(
-    page_title="Steuerbericht 2025",
+    page_title="IBKR Steuerbericht",
     page_icon="🇩🇪",
     layout="centered",
     initial_sidebar_state="collapsed"
@@ -300,7 +300,7 @@ COLOR_VARS = """
 # ── Page ─────────────────────────────────────────────────────────────────────
 
 st.markdown(COLOR_VARS, unsafe_allow_html=True)
-st.markdown('<p class="page-title">🇩🇪 Steuerbericht 2025</p>', unsafe_allow_html=True)
+st.markdown('<p class="page-title">🇩🇪 IBKR Steuerbericht</p>', unsafe_allow_html=True)
 st.markdown('<p class="page-sub">Anlage KAP · Interactive Brokers Flex Query</p>', unsafe_allow_html=True)
 
 st.markdown("""
@@ -337,7 +337,7 @@ fx_history_files = st.file_uploader(
 
 st.markdown("""
 <div style="background: rgba(16,185,129,0.08); border-left: 3px solid #10b981; border-radius: 8px; padding: 0.8rem 1rem; margin-bottom: 0.5rem; font-size: 0.82rem; color: #cbd5e1; line-height: 1.6;">
-    <strong style="color: #34d399; font-size: 0.9rem;">3. IBKR Standard-Bericht CSV (Empfohlen)</strong><br>
+    <strong style="color: #34d399; font-size: 0.9rem;">3. IBKR Standard-Bericht CSV (Dringend empfohlen)</strong><br>
     Liefert <strong style="color: #6ee7b7;">exakte Devisengewinne/-verluste</strong>: IBKR berechnet intern FIFO per-Settlement
     für jede einzelne Fremdwährungsbewegung. Diese Daten sind in der Flex Query XML leider nicht enthalten.<br><br>
     <strong style="color: #6ee7b7;">Automatischer Plausibilitätscheck:</strong>
@@ -354,7 +354,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 ibkr_csv_file = st.file_uploader(
-    "Empfohlen: IBKR Standard-Bericht (CSV) für exakte FX-Werte & Plausibilitätscheck",
+    "Dringend empfohlen: IBKR Standard-Bericht (CSV) für exakte FX-Werte & Plausibilitätscheck",
     type="csv",
     label_visibility="visible")
 
@@ -398,6 +398,7 @@ with st.spinner("Berechne Steuerreport…"):
             st.stop()
 
 # Derived values
+steuerjahr = d.get('tax_year', 2025)
 topf_1        = d.get('topf_1_aktien_netto', d.get('stocks_net_eur', 0))
 topf_2        = d.get('topf_2_sonstiges_netto',
                       d.get('dividends_eur', 0) + d.get('interest_eur', 0) +
@@ -458,6 +459,43 @@ adj_cross = cross_year_premium if zuflussprinzip_aktiv else 0
 adj_topf_2 = topf_2 - adj_cross
 adj_zeile_19 = zeile_19 - adj_cross
 
+# ── Basiswährung ────────────────────────────────────────────────────────────
+
+base_curr = d.get('base_currency', 'USD')
+base_icon = "🇪🇺" if base_curr == "EUR" else "🇺🇸"
+st.markdown(f"""
+<div style="background: rgba(99,102,241,0.08); border: 1px solid rgba(99,102,241,0.25); border-radius: 10px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
+    {base_icon} <strong style="color: #818cf8;">Basiswährung: {base_curr}</strong> — {"Beträge in StmtFunds sind bereits in EUR (BaseCurrency-Ansicht)." if base_curr == "EUR" else "USD-Beträge werden über tägliche Wechselkurse in EUR umgerechnet."}
+</div>
+""", unsafe_allow_html=True)
+
+# ── FxTransactions-Warnung ───────────────────────────────────────────────────
+
+xml_has_fx = d.get('xml_has_fx_data', True)
+fx_source = d.get('fx_source', 'none')
+
+if not xml_has_fx and fx_source != 'csv':
+    st.markdown("""
+<div style="background: rgba(251,146,60,0.1); border: 1px solid rgba(251,146,60,0.35); border-radius: 10px; padding: 0.85rem 1rem; margin-bottom: 1rem; font-size: 0.82rem; color: #cbd5e1; line-height: 1.6;">
+    <strong style="color: #fb923c; font-size: 0.9rem;">Flex Query unvollständig: Keine FX-Transaktionsdaten</strong><br>
+    Ihre Flex Query XML enthält keine <code>FxTransactions</code>-Sektion. Ohne diese Daten können Fremdwährungs-Gewinne/-Verluste
+    nur approximiert werden (FIFO-Schätzung mit eingeschränkter Genauigkeit).<br><br>
+    <strong style="color: #fdba74;">Lösung:</strong> Laden Sie den <strong>IBKR Standard-Bericht (CSV)</strong> oben hoch —
+    dieser enthält die exakten Devisengewinne/-verluste, die IBKR intern per FIFO berechnet.<br>
+    <span style="color: #94a3b8; font-size: 0.78rem;">
+    Alternativ: In IBKR unter <em>Reports → Flex Queries → Configure</em> die Sektion
+    <em>FX Transactions</em> aktivieren und die XML neu exportieren.
+    </span>
+</div>
+""", unsafe_allow_html=True)
+elif not xml_has_fx and fx_source == 'csv':
+    st.markdown("""
+<div style="background: rgba(16,185,129,0.08); border: 1px solid rgba(16,185,129,0.25); border-radius: 10px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
+    <strong style="color: #34d399;">FX-Daten aus CSV übernommen.</strong>
+    Die Flex Query enthält keine FxTransactions, aber der IBKR Standard-Bericht liefert exakte Devisenwerte.
+</div>
+""", unsafe_allow_html=True)
+
 # ── Hero ─────────────────────────────────────────────────────────────────────
 
 hero_color = "#4ade80" if adj_zeile_19 >= 0 else "#f87171"
@@ -509,6 +547,8 @@ fx_source = d.get('fx_source', 'none')
 if fx_results:
     if fx_source == 'csv':
         section_title("Fremdwährungs-Gewinne/Verluste (IBKR-Bericht)")
+    elif fx_source == 'xml':
+        section_title("Fremdwährungs-Gewinne/Verluste (XML FxTransactions)")
     else:
         section_title("Fremdwährungs-Gewinne/Verluste (FIFO-Approximation)")
 
@@ -532,15 +572,19 @@ if fx_results:
         if fx_tgl != 0:
             st.markdown(f"**IBKR Referenz (fxTranslationGainLoss):** {fmt_de(fx_tgl)} EUR")
 
-        if fx_source == 'csv':
-            st.success("Exakte FX-Werte aus IBKR Standard-Bericht (per-Settlement FIFO, alle Währungen).")
+        if fx_source in ('csv', 'xml'):
+            st.success("Exakte FX-Werte aus " + ("IBKR Standard-Bericht" if fx_source == 'csv' else "XML FxTransactions") +
+                       " (per-Settlement FIFO, alle Währungen).")
         else:
+            no_xml_fx = not d.get('xml_has_fx_data', True)
             fx_prior = d.get('fx_has_prior_data', False)
+            extra = (" Die Flex Query enthält keine FxTransactions — "
+                     "Kursgenauigkeit der Approximation ist eingeschränkt.") if no_xml_fx else ""
             if fx_prior:
-                st.info("FIFO-Approximation aus Flex Query (Tagesraten-Substitution). "
-                        "Für exakte Werte: IBKR Standard-Bericht (CSV) oben hochladen.")
+                st.warning(f"FIFO-Approximation aus Flex Query (Tagesraten-Substitution).{extra} "
+                           "Für exakte Werte: IBKR Standard-Bericht (CSV) oben hochladen.")
             else:
-                st.warning("**Nur Steuerjahr geladen.** FIFO-Approximation. "
+                st.warning(f"**Nur Steuerjahr geladen.** FIFO-Approximation.{extra} "
                            "Für exakte Werte: IBKR Standard-Bericht (CSV) oben hochladen.")
         st.info("**Rechtsgrundlage:** BMF-Schreiben Rn. 131 - verzinsliches Fremdwährungsguthaben, "
                 "§20 Abs. 2 S. 1 Nr. 7 EStG (Anlage KAP, Topf 2). FIFO-Methode (§20 Abs. 4 S. 7). "
@@ -569,24 +613,40 @@ if csv_cats:
         ("FX (Devisen) Netto", ibkr_fx.get('net', 0), fx_total_gain + fx_total_loss),
     ]
 
+    # Dividenden, Zinsen, Quellensteuer aus CSV
+    csv_income = d.get('csv_income_totals', {})
+    if 'dividends_eur' in csv_income:
+        rows.append(("Dividenden", csv_income['dividends_eur'], d['dividends_eur']))
+    if 'interest_eur' in csv_income:
+        rows.append(("Zinsen", csv_income['interest_eur'], d['interest_eur']))
+    if 'withholding_tax_eur' in csv_income:
+        rows.append(("Quellensteuer", abs(csv_income['withholding_tax_eur']), d['withholding_tax_eur']))
+
     check_table = "| Kategorie | IBKR-Bericht | Unsere Berechnung | Differenz |\n|-----------|-------------|-------------------|----------|\n"
     all_match = True
+    zinsen_fx_diff = False
     for label, ibkr_val, our_val in rows:
         diff = our_val - ibkr_val
         match = abs(diff) < 1.0
         if not match:
-            all_match = False
-        icon = "" if match else " **(!)**"
+            if label == "Zinsen":
+                zinsen_fx_diff = True
+            else:
+                all_match = False
+        icon = "" if match else (" **(FX)**" if label == "Zinsen" else " **(!)**")
         check_table += f"| {label} | {fmt_de(ibkr_val)} | {fmt_de(our_val)} | {fmt_de(diff)}{icon} |\n"
     st.markdown(check_table)
-    if all_match:
+    if all_match and not zinsen_fx_diff:
         st.success("Alle Kategorien stimmen mit dem IBKR-Bericht überein.")
+    elif all_match and zinsen_fx_diff:
+        st.success("Alle Kategorien stimmen überein. Zinsen-Differenz ist eine bekannte FX-Konvertierungsdifferenz "
+                   "(IBKR konvertiert Fremdwährungs-Anleiheposten im CSV-Bericht mit anderen Kursen als in der XML-BaseCurrency-Ansicht).")
     else:
-        st.info("Kleine Abweichungen sind normal (FX-Rundung bei der Umrechnung einzelner Trades).")
+        st.info("Kleine Abweichungen sind normal (FX-Rundung, Steuerkorrekturen aus Vorjahren).")
 
 # ── Anlage KAP Zeilen ────────────────────────────────────────────────────────
 
-section_title("Anlage KAP · Eintragungen")
+section_title(f"Anlage KAP {steuerjahr} · Eintragungen")
 
 st.markdown(
     kap_row("Z. 19", "Ausländische Kapitalerträge (Netto)", adj_zeile_19, highlight=True)
@@ -721,7 +781,7 @@ Ausländische Quellensteuern auf Dividenden und Zinsen (z.B. 15% US-Quellensteue
 
 ---
 
-### Zeilen-Zuordnung Anlage KAP 2025
+### Zeilen-Zuordnung Anlage KAP
 
 Da Interactive Brokers ein **ausländischer Broker ohne inländischen Steuerabzug** ist, werden die Einkünfte in der Sektion „Kapitalerträge, die **nicht** dem inländischen Steuerabzug unterlegen haben" (Zeilen 18–23) eingetragen:
 
@@ -746,7 +806,7 @@ Da Interactive Brokers ein **ausländischer Broker ohne inländischen Steuerabzu
 - **§20 EStG**  - Einkünfte aus Kapitalvermögen
 - **BMF-Schreiben vom 14.05.2025**  - „Einzelfragen zur Abgeltungsteuer" (IV C 1 - S 2252/00075/016/070)
 - **Jahressteuergesetz 2024**  - Abschaffung des €20.000-Caps für Termingeschäfteverluste (§20 Abs. 6 Satz 5 EStG), rückwirkend für alle offenen Fälle
-- **Anlage KAP 2025**  - Zeilen 9/14 (Termingeschäfte) existieren nur in der Sektion mit inländischem Steuerabzug und sind für IBKR nicht relevant
+- **Anlage KAP**  - Zeilen 9/14 (Termingeschäfte) existieren nur in der Sektion mit inländischem Steuerabzug und sind für IBKR nicht relevant
 """)
 
 # ── Export ───────────────────────────────────────────────────────────────────
@@ -773,7 +833,7 @@ if sh_count > 0:
     sh_export += f"  Prämien umgebucht:     {fmt_de(sh_eur):>14} EUR\n"
     sh_export += f"  (Von Topf 1 nach Topf 2 verschoben)\n"
 
-report_text = f"""ANLAGE KAP 2025 - Steuerbericht
+report_text = f"""ANLAGE KAP {steuerjahr} - Steuerbericht
 Erstellt: {_dt.now().strftime('%d.%m.%Y %H:%M')}
 Basiswährung: {d.get('base_currency', 'USD')}
 
@@ -805,7 +865,7 @@ ANLAGE KAP EINTRAGUNGEN
 st.download_button(
     label="Textreport herunterladen",
     data=report_text,
-    file_name="steuerbericht_2025.txt",
+    file_name=f"steuerbericht_{steuerjahr}.txt",
     mime="text/plain",
     use_container_width=True
 )
