@@ -407,11 +407,11 @@ zuflussprinzip_aktiv = False
 if has_cross_year:
     st.markdown(f"""
 <div style="background: rgba(168,85,247,0.08); border: 1px solid rgba(168,85,247,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #a855f7;">Zuflussprinzip (BMF Rn. 27-28):</strong> {len(cross_year_details)} Stillhalterprämie(n) erkannt, deren Optionsverkauf in einem Vorjahr stattfand ({fmt_de(cross_year_premium)} EUR). Nach dem Zuflussprinzip gehören diese steuerlich in das Verkaufsjahr der Option.
+    <strong style="color: #a855f7;">Zuflussprinzip (BMF Rn. 25, 33):</strong> {len(cross_year_details)} Stillhalterprämie(n) erkannt, deren Optionsverkauf in einem Vorjahr stattfand ({fmt_de(cross_year_premium)} EUR). Nach dem Zuflussprinzip gehören diese steuerlich in das Verkaufsjahr der Option.
 </div>
 """, unsafe_allow_html=True)
     zuflussprinzip_aktiv = st.checkbox(
-        "Zuflussprinzip anwenden (BMF Rn. 27-28)",
+        "Zuflussprinzip anwenden (BMF Rn. 25, 33)",
         value=False,
         help="Verschiebt Stillhalterprämien aus Vorjahren aus dem aktuellen Steuerjahr heraus. "
              "Diese Prämien gehören in die Steuererklärung des jeweiligen Vorjahres.")
@@ -519,7 +519,7 @@ st.markdown(
 # ── Zuflussprinzip Details ────────────────────────────────────────────────────
 
 if zuflussprinzip_aktiv and cross_year_details:
-    section_title("Zuflussprinzip · Vorjahres-Prämien (BMF Rn. 27-28)")
+    section_title("Zuflussprinzip · Vorjahres-Prämien (BMF Rn. 25, 33)")
     st.markdown("""
 <div style="background: rgba(168,85,247,0.06); border: 1px solid rgba(168,85,247,0.2); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.82rem; color: #94a3b8;">
     Die folgenden Stillhalterprämien wurden <strong>aus dem aktuellen Steuerjahr herausgerechnet</strong>,
@@ -612,7 +612,7 @@ IBKR bündelt beides im Aktien-Trade. Dieses Tool erkennt Assignments automatisc
 
 ---
 
-### Put-Assignments (BMF Rn. 31)
+### Put-Assignments (BMF Rn. 33)
 
 Bei Ausübung einer verkauften Put-Option kaufen Sie die Aktie zum Strike-Preis. Die erhaltene Prämie **mindert die Anschaffungskosten** der Aktie  - sie wird also nicht sofort als Ertrag erfasst, sondern verringert den Einstandspreis. Der steuerliche Effekt zeigt sich erst beim späteren Verkauf der Aktie.
 
