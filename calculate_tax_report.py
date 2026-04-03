@@ -226,15 +226,20 @@ def calculate_tax(ib_tax_dir, tax_year=2025):
     
     for t in all_trades:
         # Create a unique key based on relevant fields
-        # Note: floating point fields might vary slightly? using string repr
-        key = (
-            t.get('dateTime'), 
-            t.get('isin'), 
-            t.get('buySell'), 
-            t.get('quantity'), 
-            t.get('closePrice'), # closePrice is used for trade value
-            t.get('fifoPnlRealized')
-        )
+        # Include tradeID when available (extended Flex Query) to avoid
+        # falsely deduplicating partial fills with identical attributes
+        trade_id = t.get('tradeID', '').strip()
+        if trade_id:
+            key = (trade_id,)
+        else:
+            key = (
+                t.get('dateTime'),
+                t.get('isin'),
+                t.get('buySell'),
+                t.get('quantity'),
+                t.get('closePrice'),
+                t.get('fifoPnlRealized')
+            )
         if key in unique_trades_set:
             duplicates_count += 1
             continue
@@ -473,8 +478,9 @@ def calculate_tax(ib_tax_dir, tax_year=2025):
         # DIV = Dividends, PIL = Payment in Lieu (short dividends)
         # INTR = Bond Coupon/Interest, CINT = Credit Interest
         # INTP = Accrued Interest Paid (Stückzinsen)
+        # DINT = Debit Interest (Margin-Sollzinsen, Leihgebühren, SYEP)
         # FRTAX/WHT = Withholding Tax
-        if code not in ['DIV', 'PIL', 'INTR', 'CINT', 'INTP', 'FRTAX', 'WHT']:
+        if code not in ['DIV', 'PIL', 'INTR', 'CINT', 'INTP', 'DINT', 'FRTAX', 'WHT']:
             continue
             
         date = parse_date(f.get('date') or f.get('reportDate'))
@@ -511,9 +517,10 @@ def calculate_tax(ib_tax_dir, tax_year=2025):
             # negative = paid (short position owes dividend)
             # Net with dividends as per German tax law
             dividends_eur += amount_eur
-        elif code in ['INTR', 'CINT', 'INTP']:
+        elif code in ['INTR', 'CINT', 'INTP', 'DINT']:
             # Interest income (bond coupons, credit interest)
             # INTP = Accrued interest paid (deductible Stückzinsen)
+            # DINT = Debit interest (margin interest, borrow fees, SYEP — negative)
             interest_eur += amount_eur
         elif code in ['FRTAX', 'WHT']:
             # Tax is usually negative. We want the absolute value of the NET tax paid.
@@ -533,14 +540,16 @@ def calculate_tax(ib_tax_dir, tax_year=2025):
     if os.path.exists(summary_path):
         summary_rows = load_csv(summary_path)
         
-        # Track PnL by ISIN from trades.csv
+        # Track PnL by ISIN from trades.csv (in base currency for correct comparison)
         pnl_by_isin = {}
         for t in trades:
             isin = t.get('isin', '').strip()
             if not isin:
                 continue
-            pnl_val = float(t.get('fifoPnlRealized', 0) or 0)
-            pnl_by_isin[isin] = pnl_by_isin.get(isin, 0) + pnl_val
+            pnl_raw = safe_float(t.get('fifoPnlRealized'), 0)
+            fx = safe_float(t.get('fxRateToBase'), 1.0)
+            pnl_base = pnl_raw * fx
+            pnl_by_isin[isin] = pnl_by_isin.get(isin, 0) + pnl_base
             
         # FX rate for summary fallback (pnl_summary is "InBase" = base currency)
         if base_currency == 'EUR':
