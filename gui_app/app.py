@@ -337,24 +337,22 @@ fx_history_files = st.file_uploader(
 
 st.markdown("""
 <div style="background: rgba(16,185,129,0.08); border-left: 3px solid #10b981; border-radius: 8px; padding: 0.8rem 1rem; margin-bottom: 0.5rem; font-size: 0.82rem; color: #cbd5e1; line-height: 1.6;">
-    <strong style="color: #34d399; font-size: 0.9rem;">3. IBKR Standard-Bericht CSV (Dringend empfohlen)</strong><br>
-    Liefert <strong style="color: #6ee7b7;">exakte Devisengewinne/-verluste</strong>: IBKR berechnet intern FIFO per-Settlement
-    für jede einzelne Fremdwährungsbewegung. Diese Daten sind in der Flex Query XML leider nicht enthalten.<br><br>
+    <strong style="color: #34d399; font-size: 0.9rem;">3. IBKR Standard-Bericht CSV (Plausibilitätscheck)</strong><br>
     <strong style="color: #6ee7b7;">Automatischer Plausibilitätscheck:</strong>
-    Der IBKR-Bericht enthält aggregierte Summen pro Kategorie (Aktien, Optionen, Futures, Anleihen, Devisen).
-    Dieses Tool berechnet jeden einzelnen Trade separat aus der Flex Query XML, inklusive korrekter Topf-Zuordnung,
-    Stillhalterprämien-Separation und Währungsumrechnung. Die so berechneten Einzelwerte werden dann aufsummiert und
-    automatisch mit den aggregierten IBKR-Summen verglichen. Cent-genaue Übereinstimmung bei Aktien und Optionen/Futures ist das Ziel.<br><br>
+    Der IBKR-Bericht enthält aggregierte Summen pro Kategorie (Aktien, Optionen, Futures, Anleihen, Devisen, Dividenden, Zinsen, Quellensteuer).
+    Diese werden automatisch mit unserer Einzelberechnung aus der Flex Query XML verglichen — cent-genaue Übereinstimmung ist das Ziel.<br><br>
+    <strong style="color: #6ee7b7;">FX-Fallback:</strong>
+    Falls Ihre Flex Query keine <code>FxTransactions</code>-Sektion enthält, liefert der CSV-Bericht die exakten Devisengewinne/-verluste als Ersatz.<br><br>
     <span style="background: rgba(16,185,129,0.12); border-radius: 6px; padding: 0.4rem 0.6rem; display: inline-block; margin-top: 0.2rem; color: #94a3b8;">
     <strong style="color: #a7f3d0;">So erstellen:</strong>
     IBKR &rarr; Performance &amp; Berichte &rarr; Kontoauszüge &rarr;
-    <strong>Übersicht: realisierter G&amp;V</strong> &rarr; Zeitraum 01.01.&ndash;31.12.2025 &rarr; Format: CSV &rarr; Erstellen
+    <strong>Übersicht: realisierter G&amp;V</strong> &rarr; Zeitraum wählen &rarr; Format: CSV &rarr; Erstellen
     </span>
 </div>
 """, unsafe_allow_html=True)
 
 ibkr_csv_file = st.file_uploader(
-    "Dringend empfohlen: IBKR Standard-Bericht (CSV) für exakte FX-Werte & Plausibilitätscheck",
+    "IBKR Standard-Bericht (CSV) für Plausibilitätscheck & FX-Fallback",
     type="csv",
     label_visibility="visible")
 
