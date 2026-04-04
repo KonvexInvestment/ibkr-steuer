@@ -820,6 +820,163 @@ Da Interactive Brokers ein **ausländischer Broker ohne inländischen Steuerabzu
 - **Anlage KAP**  - Zeilen 9/14 (Termingeschäfte) existieren nur in der Sektion mit inländischem Steuerabzug und sind für IBKR nicht relevant
 """)
 
+with st.expander("Berechnungsdetails — So werden die XML-Daten verarbeitet"):
+    st.markdown(f"""
+### Schritt 1: XML-Extraktion
+
+Die IBKR Flex Query XML wird in einzelne CSV-Dateien zerlegt. Jede XML-Sektion enthält spezifische Daten:
+
+| XML-Sektion | Inhalt | Wichtige Felder | Filter |
+|---|---|---|---|
+| `<Trades>` | Alle Trades (Aktien, Optionen, Futures, Anleihen) | `assetCategory`, `fifoPnlRealized`, `fxRateToBase`, `dateTime`, `reportDate`, `buySell`, `transactionType` | Nur `levelOfDetail=EXECUTION` — ORDER, CLOSED_LOT, SYMBOL_SUMMARY werden gefiltert |
+| `<StmtFunds>` | Cash-Bewegungen (Dividenden, Zinsen, Steuern, Gebühren) | `activityCode`, `amount`, `currency`, `fxRateToBase`, `date`, `reportDate`, `transactionID` | Alle Einträge; Duplikate per `transactionID` entfernt |
+| `<FIFOPerformanceSummaryInBase>` | Aggregierter PnL pro Instrument | `assetCategory`, `isin`, `totalRealizedPnl` | Fallback wenn Trade in Trades-Sektion fehlt (z.B. T-Bill/Bond Maturity) |
+| `<FxTransactions>` | FX-Gewinne/-Verluste (IBKR-internes FIFO) | `fxCurrency`, `realizedPL`, `proceeds`, `cost`, `reportDate` | Nur `levelOfDetail=TRANSACTION` mit `realizedPL` ≠ 0 |
+| `<AccountInformation>` | Kontodaten | `currency` (Basiswährung) | Einzelner Eintrag |
+| `<FlexStatement>` | Berichtszeitraum | `fromDate`, `toDate` | Steuerjahr = `toDate[:4]` |
+
+**Multi-XML (Vorjahre):** Trades aus allen XMLs werden in eine gemeinsame `trades.csv` zusammengeführt (für Stillhalter-Matching über Jahresgrenzen). FX-Transaktionen werden chronologisch gemergt mit Deduplizierung per `transactionID`.
+
+---
+
+### Schritt 2: Deduplizierung
+
+IBKR liefert in einigen Sektionen Duplikate:
+
+| Quelle | Duplikat-Ursache | Deduplizierungs-Schlüssel |
+|---|---|---|
+| **Trades** | Erweiterte Flex Queries enthalten ORDER + EXECUTION für denselben Trade | `tradeID` (wenn vorhanden) oder `(dateTime, isin, buySell, quantity, closePrice, fifoPnlRealized)` |
+| **StmtFunds** | IBKR bucht EUR-Transaktionen doppelt (Original-Währung + BaseCurrency-Ansicht) | `transactionID` — erster Eintrag hat korrekten `fxRateToBase`, Duplikat hat `fxRateToBase=1` |
+
+---
+
+### Schritt 3: Kapitalgewinne berechnen
+
+Für jeden Trade im Steuerjahr (`reportDate.year == Steuerjahr`):
+
+```
+PnL (EUR) = fifoPnlRealized × fxRateToBase
+```
+
+| Feld | Bedeutung |
+|---|---|
+| `fifoPnlRealized` | IBKR's FIFO-basierter realisierter Gewinn/Verlust in **Trade-Währung** |
+| `fxRateToBase` | Umrechnungskurs Trade-Währung → Basiswährung (EUR) |
+| `reportDate` | Buchungsdatum (bestimmt das Steuerjahr — Zuflussprinzip) |
+| `assetCategory` | Topf-Zuordnung: `STK` → Topf 1, alles andere → Topf 2 |
+
+**Topf-Zuordnung:**
+
+| `assetCategory` | Steuerliche Einordnung | Topf |
+|---|---|---|
+| `STK` | Aktienveräußerung (§20 Abs. 2 Nr. 1) | **Topf 1** |
+| `OPT` | Termingeschäft — Option (§20 Abs. 2 Nr. 3) | Topf 2 |
+| `FUT` | Termingeschäft — Future (§20 Abs. 2 Nr. 3) | Topf 2 |
+| `FOP` / `FSFOP` | Termingeschäft — Future-Option (§20 Abs. 2 Nr. 3) | Topf 2 |
+| `BILL` | Kapitalforderung — T-Bill (§20 Abs. 2 Nr. 7) | Topf 2 |
+| `BOND` | Kapitalforderung — Anleihe (§20 Abs. 2 Nr. 7) | Topf 2 |
+
+**Jahresfilter:** Es wird `reportDate` verwendet, nicht `dateTime`. Grund: Trades am Jahresende (z.B. `dateTime=2024-12-29`, Settlement `reportDate=2025-01-02`) gehören steuerlich zum Settlement-Jahr. Dies entspricht dem Zuflussprinzip (§11 EStG).
+
+---
+
+### Schritt 4: Stillhalterprämien separieren (BMF Rn. 26, 33)
+
+Bei Optionsassignments bündelt IBKR die Prämie in den Aktien-PnL. Das BMF verlangt eine Trennung:
+
+**Erkennung eines Assignments:**
+- `assetCategory` ∈ (OPT, FOP, FSFOP)
+- `transactionType` = `BookTrade` (keine Börsentransaktion, sondern Ausbuchung)
+- `buySell` = `BUY` (Short-Position wird geschlossen)
+- `putCall` ∈ (C, P) — sowohl Calls als auch Puts
+- `fifoPnlRealized` ≈ 0 (IBKR zeigt keinen PnL auf der Option)
+
+**Original-Verkauf finden:**
+- Alle `ExchTrade SELL` mit identischem `strike`, `expiry`, `putCall`
+- Können mehrere Teilfüllungen sein → gewichteter Durchschnitt
+
+**Prämien-Berechnung:**
+```
+Prämie (Trade-Währung) = tradePrice × multiplier × quantity
+Prämie (EUR) = Prämie × fxRateToBase (gewichtet über Teilfüllungen)
+```
+
+**Topf-Umbuchung:**
+- `stocks_gain -= Prämie` (aus Topf 1 entfernen)
+- `options_gain += Prämie` (in Topf 2 als §20 Abs. 1 Nr. 11)
+
+**Cross-Year:** Wenn die Option in einem Vorjahr verkauft wurde (z.B. 2024) und im Steuerjahr (2025) assigned wird, gehört die Prämie ins Vorjahr (Zuflussprinzip). Vorjahres-XMLs müssen hochgeladen werden, damit der Original-SELL gefunden wird.
+
+**Cross-Year Put-Korrektur:** Wenn Aktien aus Put-Assignments früherer Jahre im Steuerjahr verkauft werden, wird IBKR's PnL korrigiert — die Prämie war bereits im Assignment-Jahr versteuert und darf die Anschaffungskosten nicht mindern. FIFO-Lot-Matching per Symbol.
+
+---
+
+### Schritt 5: Dividenden, Zinsen & Quellensteuer
+
+Aus `statement_of_funds.csv` werden Cash-Positionen nach `activityCode` zugeordnet:
+
+| `activityCode` | Bedeutung | Zuordnung |
+|---|---|---|
+| `DIV` | Dividenden | Topf 2 (§20 Abs. 1 Nr. 1) |
+| `PIL` | Payment in Lieu (Ersatzzahlung bei Wertpapierleihe) | Wie Dividende, Topf 2 |
+| `INTR` | Anleihekupon / Zinserträge | Topf 2 (§20 Abs. 1 Nr. 7) |
+| `CINT` | Credit Interest (Guthabenzinsen) | Topf 2 |
+| `INTP` | Stückzinsen (beim Kauf gezahlt) | Negative Einnahmen, Topf 2 (BMF Rn. 51) |
+| `DINT` | Debit Interest (Sollzinsen, Leihgebühren, SYEP) | Negativ, Topf 2 |
+| `FRTAX` / `WHT` | Quellensteuer (Withholding Tax) | Zeile 41 (anrechenbar) |
+
+**Währungsumrechnung (EUR-Basis):** `amount` ist bereits in EUR (BaseCurrency-Ansicht). Keine weitere Umrechnung nötig.
+
+**Jahresfilter:** `reportDate.year == Steuerjahr` — Steuer-Rückforderungen (Tax Reclaims) aus Vorjahren, die im Steuerjahr gebucht werden, sind korrekt dem Buchungsjahr zugeordnet.
+
+---
+
+### Schritt 6: Währungsumrechnung
+
+{"**Ihr Konto: EUR-Basis.** Alle Beträge in `statement_of_funds` und `fifoPnlRealized × fxRateToBase` sind direkt in EUR. Es wird kein separater Tageskurs-Lookup benötigt." if base_curr == "EUR" else "**Ihr Konto: USD-Basis.** Zweistufige Umrechnung: (1) `fifoPnlRealized × fxRateToBase` → USD, (2) USD → EUR über täglichen Wechselkurs aus Rate-Map (gebaut aus EUR-Einträgen in Trades + Funds)."}
+
+| Szenario | Formel |
+|---|---|
+| **EUR-Base, EUR-Trade** | `PnL_EUR = fifoPnlRealized × fxRateToBase` (fxRate ≈ 1.0) |
+| **EUR-Base, USD-Trade** | `PnL_EUR = fifoPnlRealized × fxRateToBase` (fxRate ≈ 0.86–0.92) |
+| **USD-Base, USD-Trade** | `PnL_EUR = fifoPnlRealized × fxRateToBase × daily_usd_eur_rate` |
+| **USD-Base, EUR-Trade** | `PnL_EUR = amount_eur` (direkt, da Trade in EUR) |
+
+**Plausibilitätsprüfung:** USD→EUR-Kurse außerhalb [0.70, 1.30] werden verworfen. `fxRateToBase=1.0` auf EUR-Währungseinträgen wird als Duplikat übersprungen.
+
+---
+
+### Schritt 7: FX-Gewinne/-Verluste
+
+Fremdwährungsgewinne/-verluste entstehen durch Kursänderungen auf verzinslichen Fremdwährungskonten (BMF Rn. 131, §20 Abs. 2 S. 1 Nr. 7 EStG).
+
+**Datenquellen (Priorität):**
+
+| Priorität | Quelle | Genauigkeit | Wann verfügbar |
+|---|---|---|---|
+| 1. | **XML `<FxTransactions>`** | Exakt (IBKR-internes FIFO, `realizedPL` pro Transaktion) | Wenn in Flex Query aktiviert |
+| 2. | **IBKR Standard-Bericht (CSV)** | Exakt (gleiche Daten wie #1, aggregiert) | Manuell erstellt |
+| 3. | **FIFO-Approximation** | Ungenau (~84% der Tageskurse unbrauchbar) | Immer (aus StmtFunds) |
+
+FX-Gewinne/-Verluste fließen in **Topf 2**.
+
+---
+
+### Schritt 8: Anlage KAP Berechnung
+
+```
+Topf 1 = Aktiengewinne + Aktienverluste (nach Stillhalter-Separation)
+Topf 2 = Dividenden + Zinsen + Optionsgewinne + Optionsverluste
+         (inkl. Stillhalterprämien + FX-Gewinne/-Verluste)
+
+Zeile 19 = Topf 1 + Topf 2 (Nettobetrag)
+Zeile 20 = Aktiengewinne (brutto, ohne Verluste)
+Zeile 22 = |Verluste ohne Aktien| (positiver Betrag)
+Zeile 23 = |Aktienverluste| (positiver Betrag)
+Zeile 41 = |Quellensteuer| (anrechenbar, positiver Betrag)
+```
+""")
+
 # ── Export ───────────────────────────────────────────────────────────────────
 
 section_title("Export")
