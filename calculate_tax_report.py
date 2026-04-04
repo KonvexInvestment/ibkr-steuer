@@ -483,13 +483,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
 
     # --- Stillhalterprämien: separate assigned option premiums from stock PnL ---
     # When a short option is assigned, IBKR bundles the premium into the stock's
-    # fifoPnlRealized and shows pnl=0 on the option BookTrade. Per BMF Rn. 25-35,
-    # the premium is §20 Abs. 1 Nr. 11 income (Topf 2), not stock gain (Topf 1).
+    # fifoPnlRealized and shows pnl=0 on the option BookTrade. Per BMF Rn. 26 (Call)
+    # and Rn. 33 (Put), the premium is §20 Abs. 1 Nr. 11 income (Topf 2), and is
+    # NOT to be considered in the stock gain/loss calculation (Topf 1).
     #
-    # Detection: OPT BookTrade with fifoPnlRealized=0 → assignment
-    # Only SHORT CALL assignments need fixing:
-    #   - Short call assigned (BUY closing, putCall=C): premium bundled into stock SALE PnL
-    #   - Short put assigned: premium reduces stock cost basis (BMF Rn. 31) — correct as-is
+    # Detection: OPT BookTrade BUY with fifoPnlRealized≈0 → assignment
+    # Both CALL and PUT assignments need fixing:
+    #   - Short call assigned (Rn. 26): premium bundled into stock SALE PnL
+    #   - Short put assigned (Rn. 33): premium reduces stock acquisition cost
     #   - Long option exercised: premium is acquisition cost — correct as-is
 
     stillhalter_premium_eur = 0.0
@@ -501,9 +502,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                        if t.get('assetCategory') in ('OPT', 'FOP', 'FSFOP')
                        and t.get('transactionType') == 'BookTrade'
                        and t.get('buySell') == 'BUY'      # closing a short position
-                       and t.get('putCall') == 'C'         # call options only
+                       and t.get('putCall') in ('C', 'P')  # both call and put assignments
                        and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01
-                       and (d := parse_date(t.get('dateTime') or t.get('tradeDate'))) is not None
+                       and (d := parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))) is not None
                        and d.year == tax_year]             # only assignments in tax year
 
     for a in opt_assignments:
@@ -583,7 +584,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                 orig_sell_date = od
         assignment_date = parse_date(a.get('dateTime') or a.get('tradeDate'))
         stillhalter_details.append({
-            'symbol': a.get('symbol') or a.get('description') or f"{strike} {expiry} C",
+            'symbol': a.get('symbol') or a.get('description') or f"{strike} {expiry} {pc}",
             'strike': strike,
             'expiry': expiry,
             'quantity': a_qty,
@@ -601,7 +602,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         price_source = "tradePrice" if has_trade_price else "closePrice (Näherung)"
         print(f"Stillhalterprämien: {stillhalter_count} Assignments, {stillhalter_premium_eur:,.2f} EUR von Topf 1 → Topf 2 verschoben (Quelle: {price_source}).")
     if stillhalter_unmatched:
-        print(f"  (!) WARNUNG: {len(stillhalter_unmatched)} Call-Assignment(s) — der ursprüngliche Optionsverkauf "
+        print(f"  (!) WARNUNG: {len(stillhalter_unmatched)} Assignment(s) — der ursprüngliche Optionsverkauf "
               f"(ExchTrade SELL) wurde nicht gefunden. Vermutlich in einem Vorjahr eröffnet. "
               f"Ohne diesen kann die Stillhalterprämie nicht berechnet und von Topf 1 (Aktien) "
               f"nach Topf 2 (Sonstiges) verschoben werden. Vorjahres-XMLs per --history laden.")
