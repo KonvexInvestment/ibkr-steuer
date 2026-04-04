@@ -513,6 +513,26 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+# ── Cross-Year Put-Korrektur ─────────────────────────────────────────────────
+
+cross_put_corrections = d.get('audit', {}).get('cross_year_put_corrections', [])
+cross_put_total = d.get('audit', {}).get('cross_year_put_total', 0)
+if cross_put_corrections:
+    st.markdown(f"""
+<div style="background: rgba(168,85,247,0.08); border: 1px solid rgba(168,85,247,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
+    <strong style="color: #a855f7;">Put-Assignment Korrektur (BMF Rn. 33):</strong>
+    {len(cross_put_corrections)} Aktienverkäufe stammen aus Put-Assignments früherer Jahre.
+    Die Prämie ({fmt_de(cross_put_total)} EUR) wurde bereits im Assignment-Jahr versteuert und wird
+    hier vom Aktien-PnL abgezogen (Einstandskurs = Strike, nicht Strike minus Prämie).
+</div>
+""", unsafe_allow_html=True)
+    with st.expander(f"Details: {len(cross_put_corrections)} Cross-Year Put-Korrekturen"):
+        put_table = "| Symbol | Shares | Strike | Korrektur | Aus Jahr |\n|--------|--------|--------|-----------|----------|\n"
+        for c in cross_put_corrections:
+            put_table += f"| {c['symbol']} | {c['shares']} | {c['strike']} | {fmt_de(c['correction_eur'])} EUR | {c['assignment_year']} |\n"
+        put_table += f"| **Gesamt** | | | **{fmt_de(cross_put_total)} EUR** | |\n"
+        st.markdown(put_table)
+
 # ── Topf 2: Sonstiges ────────────────────────────────────────────────────────
 
 section_title("Topf 2 · Sonstiges (inkl. Termingeschäfte, Dividenden, Zinsen)")
