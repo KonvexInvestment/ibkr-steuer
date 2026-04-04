@@ -314,7 +314,7 @@ st.markdown("""
     <strong style="color: #60a5fa; font-size: 0.9rem;">1. Flex Query XML (Pflicht)</strong><br>
     Die Hauptdatenquelle. Enthält alle Trades, Dividenden, Zinsen, Quellensteuer und Stillhalter-Details.
     Daraus werden die Anlage KAP Zeilen berechnet (Topf 1 Aktien, Topf 2 Sonstiges, Stillhalterprämien-Separation).<br>
-    <span style="color: #64748b;">IBKR &rarr; Performance &amp; Berichte &rarr; Flex-Abfragen &rarr; XML exportieren (Zeitraum: 01.01.&ndash;31.12.2025)</span>
+    <span style="color: #64748b;">IBKR &rarr; Performance &amp; Berichte &rarr; Flex-Abfragen &rarr; XML exportieren (gewünschter Zeitraum)</span>
 </div>
 """, unsafe_allow_html=True)
 

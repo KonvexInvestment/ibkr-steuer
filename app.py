@@ -7,7 +7,7 @@ import extract_ibkr_data
 import calculate_tax_report
 
 st.set_page_config(
-    page_title="Steuerbericht 2025",
+    page_title="IBKR Steuerbericht",
     page_icon="🇩🇪",
     layout="centered",
     initial_sidebar_state="collapsed"
@@ -297,7 +297,7 @@ COLOR_VARS = """
 # ── Page ─────────────────────────────────────────────────────────────────────
 
 st.markdown(COLOR_VARS, unsafe_allow_html=True)
-st.markdown('<p class="page-title">🇩🇪 Steuerbericht 2025</p>', unsafe_allow_html=True)
+st.markdown('<p class="page-title">🇩🇪 IBKR Steuerbericht</p>', unsafe_allow_html=True)
 st.markdown('<p class="page-sub">Anlage KAP · Interactive Brokers Flex Query</p>', unsafe_allow_html=True)
 
 st.markdown("""
@@ -311,7 +311,7 @@ st.markdown("""
     <strong style="color: #60a5fa; font-size: 0.9rem;">1. Flex Query XML (Pflicht)</strong><br>
     Die Hauptdatenquelle. Enthält alle Trades, Dividenden, Zinsen, Quellensteuer und Stillhalter-Details.
     Daraus werden die Anlage KAP Zeilen berechnet (Topf 1 Aktien, Topf 2 Sonstiges, Stillhalterprämien-Separation).<br>
-    <span style="color: #64748b;">IBKR &rarr; Performance &amp; Berichte &rarr; Flex-Abfragen &rarr; XML exportieren (Zeitraum: 01.01.&ndash;31.12.2025)</span>
+    <span style="color: #64748b;">IBKR &rarr; Performance &amp; Berichte &rarr; Flex-Abfragen &rarr; XML exportieren (gewünschter Zeitraum)</span>
 </div>
 """, unsafe_allow_html=True)
 
@@ -392,6 +392,7 @@ with st.spinner("Berechne Steuerreport…"):
             st.stop()
 
 # Derived values
+steuerjahr = d.get('tax_year', 2025)
 topf_1        = d.get('topf_1_aktien_netto', d.get('stocks_net_eur', 0))
 topf_2        = d.get('topf_2_sonstiges_netto',
                       d.get('dividends_eur', 0) + d.get('interest_eur', 0) +
@@ -658,7 +659,7 @@ if csv_cats:
 
 # ── Anlage KAP Zeilen ────────────────────────────────────────────────────────
 
-section_title("Anlage KAP · Eintragungen")
+section_title(f"Anlage KAP {steuerjahr} · Eintragungen")
 
 st.markdown(
     kap_row("Z. 19", "Ausländische Kapitalerträge (Netto)", adj_zeile_19, highlight=True)
@@ -785,7 +786,7 @@ Ausländische Quellensteuern auf Dividenden und Zinsen (z.B. 15% US-Quellensteue
 
 ---
 
-### Zeilen-Zuordnung Anlage KAP 2025
+### Zeilen-Zuordnung Anlage KAP
 
 Da Interactive Brokers ein **ausländischer Broker ohne inländischen Steuerabzug** ist, werden die Einkünfte in der Sektion "Kapitalerträge, die **nicht** dem inländischen Steuerabzug unterlegen haben" (Zeilen 18-23) eingetragen:
 
@@ -810,7 +811,7 @@ Da Interactive Brokers ein **ausländischer Broker ohne inländischen Steuerabzu
 - **§20 EStG** - Einkünfte aus Kapitalvermögen
 - **BMF-Schreiben vom 14.05.2025** - "Einzelfragen zur Abgeltungsteuer" (IV C 1 - S 2252/00075/016/070)
 - **Jahressteuergesetz 2024** - Abschaffung des €20.000-Caps für Termingeschäfteverluste (§20 Abs. 6 Satz 5 EStG), rückwirkend für alle offenen Fälle
-- **Anlage KAP 2025** - Zeilen 9/14 (Termingeschäfte) existieren nur in der Sektion mit inländischem Steuerabzug und sind für IBKR nicht relevant
+- **Anlage KAP** - Zeilen 9/14 (Termingeschäfte) existieren nur in der Sektion mit inländischem Steuerabzug und sind für IBKR nicht relevant
 """)
 
 # ── Export ───────────────────────────────────────────────────────────────────
@@ -837,7 +838,7 @@ if sh_count > 0:
     sh_export += f"  Prämien umgebucht:     {fmt_de(sh_eur):>14} EUR\n"
     sh_export += f"  (Von Topf 1 nach Topf 2 verschoben)\n"
 
-report_text = f"""ANLAGE KAP 2025 - Steuerbericht
+report_text = f"""ANLAGE KAP {steuerjahr} - Steuerbericht
 Erstellt: {_dt.now().strftime('%d.%m.%Y %H:%M')}
 Basiswährung: {d.get('base_currency', 'USD')}
 
@@ -869,7 +870,7 @@ ANLAGE KAP EINTRAGUNGEN
 st.download_button(
     label="Textreport herunterladen",
     data=report_text,
-    file_name="steuerbericht_2025.txt",
+    file_name=f"steuerbericht_{steuerjahr}.txt",
     mime="text/plain",
     use_container_width=True
 )
