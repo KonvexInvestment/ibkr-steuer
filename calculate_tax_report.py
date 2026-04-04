@@ -607,6 +607,140 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
               f"Ohne diesen kann die Stillhalterprämie nicht berechnet und von Topf 1 (Aktien) "
               f"nach Topf 2 (Sonstiges) verschoben werden. Vorjahres-XMLs per --history laden.")
 
+    # --- Cross-Year Put-Assignment Korrektur (BMF Rn. 33) ---
+    # When a put was assigned in a PRIOR year, the stock was acquired at Strike.
+    # IBKR reduced the cost basis by the premium (Strike - Premium).
+    # The premium was already taxed in the assignment year as §20 Abs.1 Nr.11.
+    # When the stock is sold in the CURRENT year, we must correct IBKR's PnL
+    # by removing the premium effect (making the stock loss bigger / gain smaller).
+    # Unlike same-year assignments, we do NOT add to options_gain (already taxed).
+
+    prior_put_assignments = [t for t in trades
+                             if t.get('assetCategory') in ('OPT', 'FOP', 'FSFOP')
+                             and t.get('transactionType') == 'BookTrade'
+                             and t.get('buySell') == 'BUY'
+                             and t.get('putCall') == 'P'
+                             and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01
+                             and (d := parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))) is not None
+                             and d.year < tax_year]
+
+    # Build FIFO lots per underlying symbol from prior-year put assignments
+    from collections import deque
+    put_assignment_lots = {}  # {symbol: deque of (date, shares_remaining, premium_per_share_eur)}
+    cross_year_put_corrections = []
+    cross_year_put_total = 0.0
+
+    for a in prior_put_assignments:
+        strike = a.get('strike')
+        expiry = a.get('expiry')
+        a_cat = a.get('assetCategory')
+        a_qty = abs(int(safe_float(a.get('quantity'))))
+        mult = int(safe_float(a.get('multiplier'), 100))
+        underlying = a.get('underlyingSymbol', '')
+        if not strike or not underlying or a_qty == 0:
+            continue
+
+        # Find original put SELL
+        originals = [t for t in trades
+                     if t.get('assetCategory') == a_cat
+                     and t.get('transactionType') == 'ExchTrade'
+                     and t.get('strike') == strike
+                     and t.get('expiry') == expiry
+                     and t.get('putCall') == 'P'
+                     and t.get('buySell') == 'SELL']
+
+        if not originals:
+            continue
+
+        total_premium_raw = 0.0
+        total_orig_qty = 0
+        for orig in originals:
+            price = safe_float(orig.get('tradePrice')) or safe_float(orig.get('closePrice'))
+            qty = abs(int(safe_float(orig.get('quantity'))))
+            if qty > 0 and price > 0:
+                total_premium_raw += price * mult * qty
+                total_orig_qty += qty
+
+        if total_orig_qty == 0 or total_premium_raw == 0:
+            continue
+
+        premium_raw = total_premium_raw * a_qty / total_orig_qty
+        shares = a_qty * mult
+
+        fx_weighted = sum(safe_float(o.get('fxRateToBase'), 1.0) * abs(int(safe_float(o.get('quantity'))))
+                         for o in originals if safe_float(o.get('quantity')) != 0)
+        fx_to_base = fx_weighted / total_orig_qty if total_orig_qty else 1.0
+
+        if base_currency == 'EUR':
+            premium_eur = premium_raw * fx_to_base
+        else:
+            date = parse_date(a.get('dateTime') or a.get('tradeDate'))
+            rate_eur = get_rate_for_date(date, usd_to_eur_rates)
+            premium_eur = premium_raw * fx_to_base * rate_eur
+
+        premium_per_share_eur = premium_eur / shares if shares else 0
+        a_date = parse_date(a.get('reportDate') or a.get('dateTime') or a.get('tradeDate'))
+
+        if underlying not in put_assignment_lots:
+            put_assignment_lots[underlying] = deque()
+        put_assignment_lots[underlying].append({
+            'date': a_date,
+            'shares_remaining': shares,
+            'premium_per_share_eur': premium_per_share_eur,
+            'strike': strike,
+            'year': a_date.year if a_date else 0,
+        })
+
+    # Apply corrections to STK sells in tax_year
+    if put_assignment_lots:
+        # Sort lots FIFO per symbol
+        for sym in put_assignment_lots:
+            put_assignment_lots[sym] = deque(sorted(put_assignment_lots[sym], key=lambda x: x['date'] or ''))
+
+        cross_year_put_total = 0.0
+        for t in trades:
+            report_date = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
+            if not report_date or report_date.year != tax_year:
+                continue
+            if t.get('assetCategory') != 'STK':
+                continue
+            if t.get('buySell') not in ('SELL',):
+                continue
+            pnl_str = t.get('fifoPnlRealized')
+            if not pnl_str or float(pnl_str) == 0:
+                continue
+
+            sym = t.get('underlyingSymbol') or t.get('symbol', '').split()[0]
+            if sym not in put_assignment_lots:
+                continue
+
+            sell_qty = abs(int(safe_float(t.get('quantity'))))
+            remaining = sell_qty
+
+            while remaining > 0 and put_assignment_lots[sym]:
+                lot = put_assignment_lots[sym][0]
+                consumed = min(remaining, lot['shares_remaining'])
+                correction = consumed * lot['premium_per_share_eur']
+                cross_year_put_total += correction
+                cross_year_put_corrections.append({
+                    'symbol': sym,
+                    'shares': consumed,
+                    'premium_per_share': lot['premium_per_share_eur'],
+                    'correction_eur': correction,
+                    'assignment_year': lot['year'],
+                    'strike': lot['strike'],
+                })
+                lot['shares_remaining'] -= consumed
+                remaining -= consumed
+                if lot['shares_remaining'] <= 0:
+                    put_assignment_lots[sym].popleft()
+
+        if cross_year_put_total > 0:
+            stocks_gain -= cross_year_put_total
+            # NOT options_gain += ... (premium was already taxed in the assignment year)
+            print(f"Cross-Year Put-Korrektur: {len(cross_year_put_corrections)} Positionen, "
+                  f"{cross_year_put_total:,.2f} EUR von Aktien-PnL abgezogen (Prämie bereits in Vorjahr versteuert).")
+
     # Zuflussprinzip: cross-year premium aggregation
     cross_year_premium_eur = sum(d['premium_eur'] for d in stillhalter_details if d['is_cross_year'])
     cross_year_by_year = {}
@@ -934,7 +1068,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             "stillhalter_unmatched": stillhalter_unmatched,
             "stillhalter_details": stillhalter_details,
             "cross_year_premium_eur": cross_year_premium_eur,
-            "cross_year_by_year": cross_year_by_year
+            "cross_year_by_year": cross_year_by_year,
+            "cross_year_put_corrections": cross_year_put_corrections,
+            "cross_year_put_total": cross_year_put_total
         }
     }
 
