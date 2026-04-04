@@ -324,14 +324,14 @@ uploaded_file = st.file_uploader("IBKR Flex Query hochladen - Steuerjahr (XML)",
 st.markdown("""
 <div style="background: rgba(168,85,247,0.06); border-left: 3px solid #a855f7; border-radius: 8px; padding: 0.8rem 1rem; margin-bottom: 0.5rem; font-size: 0.82rem; color: #cbd5e1; line-height: 1.6;">
     <strong style="color: #c084fc; font-size: 0.9rem;">2. Vorjahres-XMLs (Optional)</strong><br>
-    Nur nötig wenn Covered Calls über den Jahreswechsel gehalten wurden. Beispiel: Call-Option 2024 verkauft,
-    2025 durch Assignment geschlossen. Die Stillhalterprämie muss per Zuflussprinzip (BMF Rn. 25, 33)
+    Nur nötig wenn Optionen (Calls oder Puts) über den Jahreswechsel gehalten wurden. Beispiel: Option 2024 verkauft,
+    2025 durch Assignment geschlossen. Die Stillhalterprämie muss per Zuflussprinzip (BMF Rn. 25)
     dem Verkaufsjahr zugeordnet werden. Dafür wird der Original-Trade aus der Vorjahres-XML benötigt.
 </div>
 """, unsafe_allow_html=True)
 
 fx_history_files = st.file_uploader(
-    "Optional: Vorjahres-XMLs für exakte Stillhalter-Berechnung",
+    "Optional: Vorjahres-XMLs für Stillhalter-Matching & FX-FIFO",
     type="xml", accept_multiple_files=True,
     label_visibility="visible")
 
