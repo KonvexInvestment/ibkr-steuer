@@ -821,14 +821,14 @@ with st.expander("Berechnungsdetails — So werden die XML-Daten verarbeitet"):
 
 Die IBKR Flex Query XML wird in einzelne CSV-Dateien zerlegt. Jede XML-Sektion enthält spezifische Daten:
 
-| XML-Sektion | Inhalt | Wichtige Felder | Filter |
-|---|---|---|---|
-| `<Trades>` | Alle Trades (Aktien, Optionen, Futures, Anleihen) | `assetCategory`, `fifoPnlRealized`, `fxRateToBase`, `dateTime`, `reportDate`, `buySell`, `transactionType` | Nur `levelOfDetail=EXECUTION` |
-| `<StmtFunds>` | Cash-Bewegungen (Dividenden, Zinsen, Steuern, Gebühren) | `activityCode`, `amount`, `currency`, `fxRateToBase`, `date`, `reportDate`, `transactionID` | Alle Einträge; Duplikate per `transactionID` entfernt |
-| `<FIFOPerformanceSummaryInBase>` | Aggregierter PnL pro Instrument | `assetCategory`, `isin`, `totalRealizedPnl` | Fallback wenn Trade in Trades-Sektion fehlt (z.B. T-Bill/Bond Maturity) |
-| `<FxTransactions>` | FX-Gewinne/-Verluste (IBKR-internes FIFO) | `fxCurrency`, `realizedPL`, `proceeds`, `cost`, `reportDate` | Nur `levelOfDetail=TRANSACTION` mit `realizedPL` ≠ 0 |
-| `<AccountInformation>` | Kontodaten | `currency` (Basiswährung) | Einzelner Eintrag |
-| `<FlexStatement>` | Berichtszeitraum | `fromDate`, `toDate` | Steuerjahr = `toDate[:4]` |
+| XML-Sektion | Inhalt | Filter |
+|---|---|---|
+| `<Trades>` | Alle Trades — Felder: `assetCategory`, `fifoPnlRealized`, `fxRateToBase`, `reportDate`, `buySell`, `transactionType` | Nur `levelOfDetail=EXECUTION` |
+| `<StmtFunds>` | Dividenden, Zinsen, Steuern, Gebühren — Felder: `activityCode`, `amount`, `fxRateToBase`, `reportDate`, `transactionID` | Duplikate per `transactionID` entfernt |
+| `<FIFOPerformanceSummaryInBase>` | Aggregierter PnL pro Instrument — Felder: `assetCategory`, `isin`, `totalRealizedPnl` | Fallback für fehlende Trades (z.B. T-Bill Maturity) |
+| `<FxTransactions>` | FX-Gewinne/-Verluste — Felder: `fxCurrency`, `realizedPL`, `reportDate` | Nur `levelOfDetail=TRANSACTION` |
+| `<AccountInformation>` | Basiswährung (`currency`), Kontotyp | Einzelner Eintrag |
+| `<FlexStatement>` | Berichtszeitraum → Steuerjahr aus `toDate` | Automatisch erkannt |
 
 **Multi-XML (Vorjahre):** Trades aus allen XMLs werden in eine gemeinsame `trades.csv` zusammengeführt (für Stillhalter-Matching über Jahresgrenzen). FX-Transaktionen werden chronologisch gemergt mit Deduplizierung per `transactionID`.
 
