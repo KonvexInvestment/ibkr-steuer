@@ -793,6 +793,14 @@ if csv_cats:
     cross_put = d['audit'].get('cross_year_put_total', 0)
     our_stk_gain = d['stocks_gain_eur'] + d['audit'].get('stillhalter_premium_eur', 0) + cross_put
     our_stk_loss = d['stocks_loss_eur']
+
+    # If InvStG active: add ETF values back for IBKR comparison (IBKR counts ETFs as Aktien)
+    # Note: stillhalter_premium_eur already includes the ETF portion — don't add etf_stillhalter again
+    kap_inv_data = d.get('kap_inv', {})
+    if has_etf_data and invstg_aktiv:
+        our_stk_gain += kap_inv_data.get('etf_gain_raw_eur', 0)
+        our_stk_loss += kap_inv_data.get('etf_loss_raw_eur', 0)
+
     ibkr_topf2_cats = ["Aktien- und Indexoptionen", "Futures", "Optionen auf Futures (Future-Style)",
                         "Optionen auf Futures", "Anleihen", "Treasury Bills"]
     our_topf2_gain = d['options_gain_eur'] - d['audit'].get('stillhalter_premium_eur', 0) - d.get('fx_total_gain', 0)
@@ -803,6 +811,13 @@ if csv_cats:
     ibkr_stk = csv_cats.get('Aktien', {})
     ibkr_fx = csv_cats.get('Devisen', {})
 
+    # Dividenden/Quellensteuer: ETF-Werte für IBKR-Vergleich zurückaddieren
+    our_div = d['dividends_eur']
+    our_wht = d['withholding_tax_eur']
+    if has_etf_data and invstg_aktiv:
+        our_div += kap_inv_data.get('etf_dividends_raw_eur', 0)
+        our_wht += kap_inv_data.get('etf_wht_eur', 0)
+
     rows = [
         ("Aktien (Topf 1) Netto", ibkr_stk.get('net', 0), our_stk_gain + our_stk_loss),
         ("Sonstiges (Topf 2) Netto", ibkr_topf2_gain + ibkr_topf2_loss, our_topf2_gain + our_topf2_loss),
@@ -812,11 +827,11 @@ if csv_cats:
     # Dividenden, Zinsen, Quellensteuer aus CSV
     csv_income = d.get('csv_income_totals', {})
     if 'dividends_eur' in csv_income:
-        rows.append(("Dividenden", csv_income['dividends_eur'], d['dividends_eur']))
+        rows.append(("Dividenden", csv_income['dividends_eur'], our_div))
     if 'interest_eur' in csv_income:
         rows.append(("Zinsen", csv_income['interest_eur'], d['interest_eur']))
     if 'withholding_tax_eur' in csv_income:
-        rows.append(("Quellensteuer", abs(csv_income['withholding_tax_eur']), d['withholding_tax_eur']))
+        rows.append(("Quellensteuer", abs(csv_income['withholding_tax_eur']), our_wht))
 
     check_table = "| Kategorie | IBKR-Bericht | Unsere Berechnung | Differenz |\n|-----------|-------------|-------------------|----------|\n"
     all_match = True
@@ -839,6 +854,11 @@ if csv_cats:
                    "(IBKR konvertiert Fremdwährungs-Anleiheposten im CSV-Bericht mit anderen Kursen als in der XML-BaseCurrency-Ansicht).")
     else:
         st.info("Kleine Abweichungen sind normal (FX-Rundung, Steuerkorrekturen aus Vorjahren).")
+    if has_etf_data and invstg_aktiv:
+        st.caption("InvStG aktiv: ETF-Werte wurden für diesen Vergleich zurückaddiert, da der IBKR-Bericht keine InvStG-Trennung kennt.")
+    if tageskurs_aktiv:
+        corr_sign = "+" if fx_corr_total >= 0 else ""
+        st.caption(f"Tageskurs-Methode aktiv: Die FX-Korrektur ({corr_sign}{fmt_de(fx_corr_total)} EUR) ist im Plausibilitätscheck NICHT enthalten — er vergleicht immer gegen IBKRs Netto-Methode.")
 
 # ── Anlage KAP Zeilen ────────────────────────────────────────────────────────
 
