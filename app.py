@@ -1011,7 +1011,7 @@ Die IBKR Flex Query XML wird in einzelne CSV-Dateien zerlegt. Jede XML-Sektion e
 
 | XML-Sektion | Inhalt | Filter |
 |---|---|---|
-| `<Trades>` | Alle Trades — Felder: `assetCategory`, `fifoPnlRealized`, `fxRateToBase`, `reportDate`, `buySell`, `transactionType` | Nur `levelOfDetail=EXECUTION` |
+| `<Trades>` | Alle Trades — Felder: `assetCategory`, `fifoPnlRealized`, `fxRateToBase`, `reportDate`, `buySell`, `transactionType` | `EXECUTION` → trades.csv, `CLOSED_LOT` → closed_lots.csv (für Tageskurs-Korrektur) |
 | `<StmtFunds>` | Dividenden, Zinsen, Steuern, Gebühren — Felder: `activityCode`, `amount`, `fxRateToBase`, `reportDate`, `transactionID` | Duplikate per `transactionID` entfernt |
 | `<FIFOPerformanceSummaryInBase>` | Aggregierter PnL pro Instrument — Felder: `assetCategory`, `isin`, `totalRealizedPnl` | Fallback für fehlende Trades (z.B. T-Bill Maturity) |
 | `<FxTransactions>` | FX-Gewinne/-Verluste — Felder: `fxCurrency`, `realizedPL`, `reportDate` | Nur `levelOfDetail=TRANSACTION` |
@@ -1038,26 +1038,36 @@ IBKR liefert in einigen Sektionen Duplikate:
 Für jeden Trade im Steuerjahr (`reportDate.year == Steuerjahr`):
 
 ```
-PnL (EUR) = fifoPnlRealized × fxRateToBase
+IBKR-Methode:     PnL (EUR) = fifoPnlRealized × fxRateToBase
+Tageskurs-Methode: PnL (EUR) = Erlös × FX_Verkaufstag − AK × FX_Kauftag
 ```
+
+**IBKR-Methode (Standard):** Rechnet den Netto-PnL komplett zum Schlusskurs um.
+
+**Tageskurs-Methode (§20 Abs. 4 S. 1 EStG, optional):** *"Bei nicht in Euro getätigten Geschäften sind die Einnahmen im Zeitpunkt der Veräußerung und die Anschaffungskosten im Zeitpunkt der Anschaffung in Euro umzurechnen."* — Verwendet CLOSED_LOT Daten aus Extended Flex Queries. Futures werden ausgeschlossen (Kostenbasis = Notional, kein realer Cashflow). Korrektur: `|AK| × (FX_Schlusskurs − FX_Kaufkurs)` pro Lot.
 
 | Feld | Bedeutung |
 |---|---|
 | `fifoPnlRealized` | IBKR's FIFO-basierter realisierter Gewinn/Verlust in **Trade-Währung** |
-| `fxRateToBase` | Umrechnungskurs Trade-Währung → Basiswährung (EUR) |
+| `fxRateToBase` | Umrechnungskurs Trade-Währung → Basiswährung (EUR) am **Schlusstag** |
 | `reportDate` | Buchungsdatum (bestimmt das Steuerjahr — Zuflussprinzip) |
-| `assetCategory` | Topf-Zuordnung: `STK` → Topf 1, alles andere → Topf 2 |
+| `assetCategory` | Topf-Zuordnung: `STK` → Topf 1 oder KAP-INV, alles andere → Topf 2 |
+| `subCategory` | ETF-Erkennung: `ETF` → InvStG-Prüfung, `COMMON` → Einzelaktie |
 
 **Topf-Zuordnung:**
 
-| `assetCategory` | Steuerliche Einordnung | Topf |
-|---|---|---|
-| `STK` | Aktienveräußerung (§20 Abs. 2 Nr. 1) | **Topf 1** |
-| `OPT` | Termingeschäft — Option (§20 Abs. 2 Nr. 3) | Topf 2 |
-| `FUT` | Termingeschäft — Future (§20 Abs. 2 Nr. 3) | Topf 2 |
-| `FOP` / `FSFOP` | Termingeschäft — Future-Option (§20 Abs. 2 Nr. 3) | Topf 2 |
-| `BILL` | Kapitalforderung — T-Bill (§20 Abs. 2 Nr. 7) | Topf 2 |
-| `BOND` | Kapitalforderung — Anleihe (§20 Abs. 2 Nr. 7) | Topf 2 |
+| `assetCategory` | `subCategory` | Steuerliche Einordnung | Topf |
+|---|---|---|---|
+| `STK` | `COMMON` / `REIT` / `ADR` | Aktienveräußerung (§20 Abs. 2 Nr. 1) | **Topf 1** |
+| `STK` | `ETF` (InvStG-Fonds) | Investmentfonds (InvStG §2) | **KAP-INV** (optional) |
+| `STK` | `ETF` (no\_invstg, z.B. IBIT) | Wie Einzelaktie | **Topf 1** |
+| `OPT` | — | Termingeschäft — Option (§20 Abs. 2 Nr. 3) | Topf 2 |
+| `FUT` | — | Termingeschäft — Future (§20 Abs. 2 Nr. 3) | Topf 2 |
+| `FOP` / `FSFOP` | — | Termingeschäft — Future-Option (§20 Abs. 2 Nr. 3) | Topf 2 |
+| `BILL` | — | Kapitalforderung — T-Bill (§20 Abs. 2 Nr. 7) | Topf 2 |
+| `BOND` | — | Kapitalforderung — Anleihe (§20 Abs. 2 Nr. 7) | Topf 2 |
+
+**InvStG-Klassifizierung (optional):** ETFs mit `subCategory="ETF"` werden gegen eine Lookup-Tabelle (139 US-ETFs) geprüft. Aktienfonds (≥51% Aktienquote) erhalten 30% Teilfreistellung, sonstige Fonds 0%. Crypto/Commodity-ETPs (IBIT, GLD etc.) bleiben in Topf 1. Optionen auf ETFs bleiben in Topf 2.
 
 **Jahresfilter:** Es wird `reportDate` verwendet, nicht `dateTime`. Grund: Trades am Jahresende (z.B. `dateTime=2024-12-29`, Settlement `reportDate=2025-01-02`) gehören steuerlich zum Settlement-Jahr (Zuflussprinzip §11 EStG).
 
@@ -1145,10 +1155,11 @@ FX-Gewinne/-Verluste fließen in **Topf 2**.
 
 ---
 
-### Schritt 8: Anlage KAP Berechnung
+### Schritt 8: Anlage KAP + KAP-INV Berechnung
 
 ```
 Topf 1 = Aktiengewinne + Aktienverluste (nach Stillhalter-Separation)
+         (ohne InvStG-ETFs, wenn aktiviert)
 Topf 2 = Dividenden + Zinsen + Optionsgewinne + Optionsverluste
          (inkl. Stillhalterprämien + FX-Gewinne/-Verluste)
 
@@ -1157,6 +1168,26 @@ Zeile 20 = Aktiengewinne (brutto, ohne Verluste)
 Zeile 22 = |Verluste ohne Aktien| (positiver Betrag)
 Zeile 23 = |Aktienverluste| (positiver Betrag)
 Zeile 41 = |Quellensteuer| (anrechenbar, positiver Betrag)
+```
+
+**Anlage KAP-INV (wenn InvStG aktiviert):**
+
+```
+ETF-Gewinne/-Verluste und ETF-Dividenden werden auf KAP-INV gemeldet.
+Teilfreistellung wird pro ISIN angewendet:
+  Aktienfonds (≥51% Aktienquote): 30% steuerfrei
+  Sonstiger Fonds:                 0% steuerfrei
+
+KAP-INV Netto = (ETF-G/V × (1 − TFS)) + (ETF-Div × (1 − TFS))
+ETF-Quellensteuer wird separat auf KAP-INV angerechnet.
+```
+
+**Tageskurs-Korrektur (wenn aktiviert):**
+
+```
+Korrektur = Σ |Anschaffungskosten| × (FX_Verkauf − FX_Kauf) pro CLOSED_LOT
+Futures ausgeschlossen (Kostenbasis = Notional, kein realer Cashflow).
+Wird auf Topf 1, Topf 2 und KAP-INV aufgeteilt.
 ```
 """)
 
