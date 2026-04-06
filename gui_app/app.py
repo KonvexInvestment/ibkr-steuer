@@ -513,6 +513,8 @@ if has_etf_data:
 
 fx_corr_total = d.get('fx_correction_total', 0)
 fx_corr_by_topf = d.get('fx_correction_by_topf', {})
+tk_gain_adj = d.get('fx_corr_gain_adj', {})
+tk_loss_adj = d.get('fx_corr_loss_adj', {})
 tageskurs_aktiv = False
 
 if abs(fx_corr_total) > 0.01:
@@ -531,10 +533,6 @@ if abs(fx_corr_total) > 0.01:
         help="Rechnet Veräußerungserlöse und Anschaffungskosten jeweils zum FX-Kurs ihres eigenen Datums um, "
              "statt den gesamten Netto-PnL zum Schlusskurs. Gesetzlich korrekt, aber Abweichung zur IBKR-Methode. "
              "Nur verfügbar mit Extended Flex Query (CLOSED_LOT Daten).")
-
-    # Per-Lot gain/loss adjustments für Tageskurs-Korrektur
-    tk_gain_adj = d.get('fx_corr_gain_adj', {})
-    tk_loss_adj = d.get('fx_corr_loss_adj', {})
 
     if tageskurs_aktiv:
         corr_topf1 = fx_corr_by_topf.get('Topf1', 0)
