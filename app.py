@@ -528,6 +528,9 @@ if abs(fx_corr_total) > 0.01:
              "statt den gesamten Netto-PnL zum Schlusskurs. Gesetzlich korrekt, aber Abweichung zur IBKR-Methode. "
              "Nur verfügbar mit Extended Flex Query (CLOSED_LOT Daten).")
 
+    tk_gain_adj = d.get('fx_corr_gain_adj', {})
+    tk_loss_adj = d.get('fx_corr_loss_adj', {})
+
     if tageskurs_aktiv:
         corr_topf1 = fx_corr_by_topf.get('Topf1', 0)
         corr_topf2 = fx_corr_by_topf.get('Topf2', 0)
@@ -541,11 +544,9 @@ if abs(fx_corr_total) > 0.01:
             adj_zeile_19 += fx_corr_total
             zeile_19 += fx_corr_total
         # Zeilen 20/22/23 per-Lot gain/loss adjustments
-        gain_adj = d.get('fx_corr_gain_adj', {})
-        loss_adj = d.get('fx_corr_loss_adj', {})
-        zeile_20 += gain_adj.get('Topf1', 0)
-        zeile_23 -= loss_adj.get('Topf1', 0)
-        zeile_22 -= loss_adj.get('Topf2', 0)
+        zeile_20 += tk_gain_adj.get('Topf1', 0)
+        zeile_23 -= tk_loss_adj.get('Topf1', 0)
+        zeile_22 -= tk_loss_adj.get('Topf2', 0)
     else:
         tageskurs_kapinv_corr = 0
 
@@ -605,8 +606,8 @@ section_title(topf_1_label)
 
 st.markdown(
     '<div class="metric-grid">'
-    + metric_card("Aktiengewinne", d['stocks_gain_eur'], "gain")
-    + metric_card("Aktienverluste", d['stocks_loss_eur'], "loss")
+    + metric_card("Aktiengewinne", d['stocks_gain_eur'] + (tk_gain_adj.get('Topf1', 0) if tageskurs_aktiv else 0), "gain")
+    + metric_card("Aktienverluste", d['stocks_loss_eur'] + (tk_loss_adj.get('Topf1', 0) if tageskurs_aktiv else 0), "loss")
     + metric_card("Saldo Aktien", topf_1, "saldo")
     + '</div>',
     unsafe_allow_html=True
@@ -641,8 +642,8 @@ st.markdown(
     + metric_card("Dividenden", d['dividends_eur'])
     + metric_card("Zinsen (netto)", d['interest_eur'])
     + (metric_card("Sollzinsen (n. abzf.)", d.get('debit_interest_eur', 0), "info") if abs(d.get('debit_interest_eur', 0)) > 0.01 else '')
-    + metric_card("Optionsgewinne", d['options_gain_eur'] - adj_cross, "gain")
-    + metric_card("Optionsverluste", d['options_loss_eur'], "loss")
+    + metric_card("Optionsgewinne", d['options_gain_eur'] - adj_cross + (tk_gain_adj.get('Topf2', 0) if tageskurs_aktiv else 0), "gain")
+    + metric_card("Optionsverluste", d['options_loss_eur'] + (tk_loss_adj.get('Topf2', 0) if tageskurs_aktiv else 0), "loss")
     + metric_card("Saldo Sonstiges", adj_topf_2, "saldo")
     + '</div>',
     unsafe_allow_html=True
