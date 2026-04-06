@@ -230,12 +230,13 @@ st.markdown("""
     /* hide streamlit branding */
     #MainMenu, footer { visibility: hidden; }
 
-    /* ── Checkbox Styling ── */
-    /* Stylt den Text neben der Checkbox */
+    /* ── Widget & Checkbox Label Styling ── */
+    /* Erzwingt eine hellere Farbe für alle Streamlit-Labels (Checkboxen, Dropdowns etc.) für besseren Kontrast */
+    [data-testid="stWidgetLabel"] p, 
     [data-testid="stCheckbox"] label p {
         color: #94a3b8 !important;
         font-size: 0.85rem !important;
-        font-weight: 500;
+        font-weight: 500 !important;
     }
 </style>
 """, unsafe_allow_html=True)
