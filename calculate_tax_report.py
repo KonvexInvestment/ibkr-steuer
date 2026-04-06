@@ -930,7 +930,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
 
     # 4. Dividends, Interest, and Withholding Tax
     dividends_eur = 0.0
-    interest_eur = 0.0  # Bond coupons, credit interest
+    interest_eur = 0.0  # Bond coupons, credit interest, Stückzinsen (abzugsfähig)
+    debit_interest_eur = 0.0  # Margin-Sollzinsen, Leihgebühren (NICHT abzugsfähig, §20 Abs. 9 EStG)
     withholding_tax_eur = 0.0
 
     funds_processed = 0
@@ -1007,10 +1008,13 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                 etf_by_isin[fund_isin]['div'] += amount_eur
             else:
                 dividends_eur += amount_eur
-        elif code in ['INTR', 'CINT', 'INTP', 'DINT']:
-            # Interest income (bond coupons, credit interest)
-            # INTP = Accrued interest paid (deductible Stückzinsen)
-            # DINT = Debit interest (margin interest, borrow fees, SYEP — negative)
+        elif code == 'DINT':
+            # Margin-Sollzinsen, Leihgebühren, SYEP — NICHT abzugsfähig (§20 Abs. 9 EStG)
+            # Werbungskosten bei Kapitalerträgen → nur Sparer-Pauschbetrag erlaubt
+            debit_interest_eur += amount_eur
+        elif code in ['INTR', 'CINT', 'INTP']:
+            # INTR = Bond Coupon/Interest, CINT = Credit Interest
+            # INTP = Accrued interest paid (Stückzinsen — negative Einnahme, abzugsfähig)
             interest_eur += amount_eur
         elif code in ['FRTAX', 'WHT']:
             # Tax is usually negative. We want the absolute value of the NET tax paid.
@@ -1393,6 +1397,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         # Keep old keys for backward compatibility
         "dividends_eur": dividends_eur,
         "interest_eur": interest_eur,
+        "debit_interest_eur": debit_interest_eur,
         "stocks_gain_eur": stocks_gain,
         "stocks_loss_eur": stocks_loss,
         "stocks_net_eur": stocks_gain + stocks_loss,
@@ -1469,6 +1474,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
     print("TOPF 2: SONSTIGES (inkl. Termingeschäfte)")
     print(f"    Dividenden (netto):    {dividends_eur:>12,.2f} EUR")
     print(f"    Zinsen:                {interest_eur:>12,.2f} EUR")
+    if abs(debit_interest_eur) > 0.01:
+        print(f"    Sollzinsen (n. abzf.): {debit_interest_eur:>12,.2f} EUR  (§20 Abs. 9 EStG, nicht in Berechnung)")
     if stillhalter_premium_eur > 0:
         print(f"    Stillhalterprämien:    {stillhalter_premium_eur:>12,.2f} EUR  ({stillhalter_count} Assignments)")
     print(f"    Optionsgewinne:        {options_gain:>12,.2f} EUR")

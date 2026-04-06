@@ -639,6 +639,7 @@ st.markdown(
     '<div class="metric-grid">'
     + metric_card("Dividenden", d['dividends_eur'])
     + metric_card("Zinsen (netto)", d['interest_eur'])
+    + (metric_card("Sollzinsen (n. abzf.)", d.get('debit_interest_eur', 0), "info") if abs(d.get('debit_interest_eur', 0)) > 0.01 else '')
     + metric_card("Optionsgewinne", d['options_gain_eur'] - adj_cross, "gain")
     + metric_card("Optionsverluste", d['options_loss_eur'], "loss")
     + metric_card("Saldo Sonstiges", adj_topf_2, "saldo")
@@ -840,7 +841,9 @@ if csv_cats:
     if 'dividends_eur' in csv_income:
         rows.append(("Dividenden", csv_income['dividends_eur'], our_div))
     if 'interest_eur' in csv_income:
-        rows.append(("Zinsen", csv_income['interest_eur'], d['interest_eur']))
+        # IBKR-Bericht enthält Sollzinsen (DINT) — für Vergleich zurückaddieren
+        our_interest_for_comparison = d['interest_eur'] + d.get('debit_interest_eur', 0)
+        rows.append(("Zinsen", csv_income['interest_eur'], our_interest_for_comparison))
     if 'withholding_tax_eur' in csv_income:
         rows.append(("Quellensteuer", abs(csv_income['withholding_tax_eur']), our_wht))
 
