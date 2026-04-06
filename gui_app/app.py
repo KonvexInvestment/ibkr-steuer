@@ -227,6 +227,13 @@ st.markdown("""
         background: rgba(96,165,250,0.2);
     }
 
+    /* ── Widget labels (checkbox, selectbox) readable ── */
+    [data-testid="stCheckbox"] label p,
+    [data-testid="stSelectbox"] label p,
+    .stSelectbox label, .stCheckbox label {
+        color: #cbd5e1 !important;
+    }
+
     /* hide streamlit branding */
     #MainMenu, footer { visibility: hidden; }
 </style>
