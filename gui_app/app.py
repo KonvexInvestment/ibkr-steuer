@@ -452,6 +452,7 @@ def merge_report_data(reports):
         'zufluss_details': [],
         'prior_zufluss_correction_eur': sum(r.get('audit', {}).get('prior_zufluss_correction_eur', 0) for r in reports),
         'prior_zufluss_details': [],
+        'zufluss_unmatched': [],
     }
     for r in reports:
         a = r.get('audit', {})
@@ -460,6 +461,7 @@ def merge_report_data(reports):
         merged_audit['cross_year_put_corrections'].extend(a.get('cross_year_put_corrections', []))
         merged_audit['zufluss_details'].extend(a.get('zufluss_details', []))
         merged_audit['prior_zufluss_details'].extend(a.get('prior_zufluss_details', []))
+        merged_audit['zufluss_unmatched'].extend(a.get('zufluss_unmatched', []))
         for year, val in a.get('cross_year_by_year', {}).items():
             merged_audit['cross_year_by_year'][year] = merged_audit['cross_year_by_year'].get(year, 0) + val
     merged['audit'] = merged_audit
@@ -713,6 +715,17 @@ if unmatched:
     <strong style="color: #fb923c;">Stillhalter-Warnung:</strong> Für {len(unmatched)} Assignment(s) wurde der ursprüngliche Optionsverkauf nicht gefunden: <strong>{details}</strong>.
     Die Option wurde vermutlich in einem Vorjahr verkauft (Prämie kassiert) und erst im Steuerjahr assigned. Ohne den Original-Trade kann die Prämie nicht berechnet und verbleibt in Topf 1 (Aktien) statt Topf 2 (Sonstiges).
     <br><em>Lösung:</em> Das Vorjahres-XML, in dem die Option verkauft wurde, oben als "Vorjahres-XML" hochladen.
+</div>
+""", unsafe_allow_html=True)
+
+zufluss_unmatched = d.get('audit', {}).get('zufluss_unmatched', [])
+if zufluss_unmatched:
+    z_details = ", ".join(f"{u['symbol']}" for u in zufluss_unmatched)
+    st.markdown(f"""
+<div style="background: rgba(251,146,60,0.08); border: 1px solid rgba(251,146,60,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
+    <strong style="color: #fb923c;">Zufluss-Warnung:</strong> {len(zufluss_unmatched)} Glattstellung(en) ohne Eröffnungs-SELL: <strong>{z_details}</strong>.
+    Die Option wurde in einem Vorjahr verkauft (Prämie kassiert) und im Steuerjahr geschlossen. Ohne das Vorjahres-XML wird die Prämie doppelt versteuert (einmal im Verkaufsjahr, einmal hier im Schließungsjahr).
+    <br><em>Lösung:</em> Das Vorjahres-XML hochladen, damit die Zufluss-Korrektur greifen kann.
 </div>
 """, unsafe_allow_html=True)
 

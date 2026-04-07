@@ -1002,6 +1002,40 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         print(f"Vorjahres-Stillhalter-Korrektur: {len(prior_zufluss_details)} Position(en), "
               f"-{prior_zufluss_correction_eur:,.2f} EUR (Prämie bereits im Verkaufsjahr versteuert).")
 
+    # --- Fehlende Vorjahres-XMLs erkennen ---
+    # BUY-close (Glattstellung/Verfall) ohne matching SELL-to-open = Vorjahr fehlt
+    # Collect all SELL-to-open keys (current year + prior years from history)
+    all_sell_open_keys = set(instr_sells.keys()) | set(prior_sell_opens.keys())
+
+    zufluss_unmatched = []
+    for t in trades:
+        if t.get('assetCategory') not in ('OPT', 'FOP', 'FSFOP'):
+            continue
+        if t.get('buySell') != 'BUY' or t.get('transactionType') != 'ExchTrade':
+            continue
+        if abs(safe_float(t.get('fifoPnlRealized'))) < 0.01:
+            continue  # Opening BUY, not a close
+        rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
+        if not rd or rd.year != tax_year:
+            continue
+        key = (t.get('assetCategory'), t.get('strike'), t.get('expiry'), t.get('putCall'))
+        if key not in all_sell_open_keys:
+            symbol = t.get('symbol') or t.get('description') or f"{key[1]} {key[2]} {key[3]}"
+            # Avoid duplicate warnings for same instrument
+            if not any(u['strike'] == key[1] and u['expiry'] == key[2] and u['putCall'] == key[3] for u in zufluss_unmatched):
+                zufluss_unmatched.append({
+                    'symbol': symbol,
+                    'strike': key[1],
+                    'expiry': key[2],
+                    'putCall': key[3],
+                    'quantity': abs(int(safe_float(t.get('quantity')))),
+                })
+
+    if zufluss_unmatched:
+        print(f"  (!) WARNUNG: {len(zufluss_unmatched)} Glattstellung(en) ohne Eröffnungs-SELL. "
+              f"Die Option wurde in einem Vorjahr verkauft (Prämie kassiert). Ohne das Vorjahres-XML "
+              f"kann die Zufluss-Korrektur nicht angewendet werden (Prämie wird doppelt versteuert).")
+
     # --- Cross-Year Put-Assignment Korrektur (BMF Rn. 33) ---
     # When a put was assigned in a PRIOR year, the stock was acquired at Strike.
     # IBKR reduced the cost basis by the premium (Strike - Premium).
@@ -1737,6 +1771,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             "zufluss_details": zufluss_details,
             "prior_zufluss_correction_eur": prior_zufluss_correction_eur,
             "prior_zufluss_details": prior_zufluss_details,
+            "zufluss_unmatched": zufluss_unmatched,
         }
     }
 
