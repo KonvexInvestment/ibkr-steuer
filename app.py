@@ -902,12 +902,23 @@ st.markdown(
     + metric_card("Dividenden", d['dividends_eur'])
     + metric_card("Zinsen (netto)", d['interest_eur'])
     + (metric_card("Sollzinsen (n. abzf.)", d.get('debit_interest_eur', 0), "info") if abs(d.get('debit_interest_eur', 0)) > 0.01 else '')
-    + metric_card("Optionsgewinne", d['options_gain_eur'] - adj_cross + (tk_gain_adj.get('Topf2', 0) if tageskurs_aktiv else 0), "gain")
-    + metric_card("Optionsverluste", d['options_loss_eur'] + (tk_loss_adj.get('Topf2', 0) if tageskurs_aktiv else 0), "loss")
+    + metric_card("Sonstige Gewinne", d['options_gain_eur'] - adj_cross + (tk_gain_adj.get('Topf2', 0) if tageskurs_aktiv else 0), "gain")
+    + metric_card("Sonstige Verluste", d['options_loss_eur'] + (tk_loss_adj.get('Topf2', 0) if tageskurs_aktiv else 0), "loss")
     + metric_card("Saldo Sonstiges", adj_topf_2, "saldo")
     + '</div>',
     unsafe_allow_html=True
 )
+
+topf2_cats = d.get('topf2_by_category', {})
+if topf2_cats:
+    with st.expander("Aufschlüsselung Termingeschäfte / Sonstiges"):
+        cat_table = "| Gattung | Gewinne | Verluste | Netto |\n|---------|--------:|---------:|------:|\n"
+        for cat, vals in sorted(topf2_cats.items()):
+            net = vals['gain'] + vals['loss']
+            cat_table += f"| {cat} | {fmt_de(vals['gain'])} EUR | {fmt_de(vals['loss'])} EUR | {fmt_de(net)} EUR |\n"
+        cat_table += f"| **Gesamt** | **{fmt_de(sum(v['gain'] for v in topf2_cats.values()))} EUR** | **{fmt_de(sum(v['loss'] for v in topf2_cats.values()))} EUR** | **{fmt_de(sum(v['gain'] + v['loss'] for v in topf2_cats.values()))} EUR** |\n"
+        st.markdown(cat_table)
+        st.caption("Alle Positionen fließen in die Sonstigen Gewinne/Verluste (Topf 2) ein.")
 
 # ── Fremdwährungs-Gewinne/Verluste ──────────────────────────────────────────
 
@@ -1540,6 +1551,13 @@ if has_etf_data and invstg_aktiv:
         gv_tax = info.get('gain_taxable', 0) + info.get('loss_taxable', 0)
         inv_export += f"    {info.get('ticker', isin):8s} TFS {info.get('tfs_rate', 0)*100:.0f}%  G/V stpfl. {fmt_de(gv_tax):>10} EUR\n"
 
+topf2_detail_export = ""
+if topf2_cats:
+    topf2_detail_export = "\nAUFSCHLÜSSELUNG TERMINGESCHÄFTE / SONSTIGES\n"
+    for cat, vals in sorted(topf2_cats.items()):
+        net = vals['gain'] + vals['loss']
+        topf2_detail_export += f"  {cat:24s} G {fmt_de(vals['gain']):>10} V {fmt_de(vals['loss']):>10} N {fmt_de(net):>10} EUR\n"
+
 multi_acct_export = ""
 if n_accounts > 1:
     multi_acct_export = f"Konten: {n_accounts} (separat berechnet, Ergebnisse addiert)\n"
@@ -1558,11 +1576,11 @@ TOPF 1: AKTIEN (ohne ETF-Fonds)
 TOPF 2: SONSTIGES (inkl. Termingeschäfte)
   Dividenden:            {fmt_de(d.get('dividends_eur', 0)):>14} EUR
   Zinsen (netto):        {fmt_de(d.get('interest_eur', 0)):>14} EUR
-  Optionsgewinne:        {fmt_de(d.get('options_gain_eur', 0)):>14} EUR
-  Optionsverluste:       {fmt_de(d.get('options_loss_eur', 0)):>14} EUR
+  Sonstige Gewinne:     {fmt_de(d.get('options_gain_eur', 0)):>14} EUR
+  Sonstige Verluste:    {fmt_de(d.get('options_loss_eur', 0)):>14} EUR
   ─────────────────────────────────────────────────
   Saldo Sonstiges:       {fmt_de(topf_2):>14} EUR
-{fx_export}{sh_export}{inv_export}
+{topf2_detail_export}{fx_export}{sh_export}{inv_export}
 ═══════════════════════════════════════════════════
 ANLAGE KAP EINTRAGUNGEN
   Zeile 19 (Netto):      {fmt_de(zeile_19):>14} EUR

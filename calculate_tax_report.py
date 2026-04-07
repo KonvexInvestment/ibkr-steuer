@@ -503,6 +503,21 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
     options_gain = 0.0
     options_loss = 0.0
 
+    # Topf 2 breakdown by instrument category (for detailed reporting)
+    TOPF2_CAT_LABELS = {
+        'OPT': 'Optionen', 'FOP': 'Optionen', 'FSFOP': 'Optionen',
+        'FUT': 'Futures', 'BILL': 'T-Bills', 'BOND': 'Anleihen',
+    }
+    topf2_by_category = {}  # {label: {'gain': float, 'loss': float}}
+
+    def add_topf2_detail(cat_label, amount):
+        if cat_label not in topf2_by_category:
+            topf2_by_category[cat_label] = {'gain': 0.0, 'loss': 0.0}
+        if amount > 0:
+            topf2_by_category[cat_label]['gain'] += amount
+        else:
+            topf2_by_category[cat_label]['loss'] += amount
+
     # no_invstg ETP tracking (for plausibility check — IBKR counts these as STK/Aktien)
     no_invstg_gain = 0.0
     no_invstg_loss = 0.0
@@ -556,6 +571,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                     else:
                         options_loss += pnl_eur
                         no_invstg_loss += pnl_eur
+                    add_topf2_detail('Crypto/Commodity ETPs', pnl_eur)
                 else:
                     # InvStG fund → KAP-INV (not Topf 1)
                     if pnl_eur > 0:
@@ -582,6 +598,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                 options_gain += pnl_eur
             else:
                 options_loss += pnl_eur
+            add_topf2_detail(TOPF2_CAT_LABELS.get(category, category), pnl_eur)
 
         # Collect debug row
         sub = t.get('subCategory', '')
@@ -758,6 +775,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         etf_invstg_gain -= etf_premium
         etf_stillhalter_premium_eur = etf_premium
         options_gain += stillhalter_premium_eur  # total premium always to Topf 2
+        add_topf2_detail('Stillhalterprämien', stillhalter_premium_eur)
         price_source = "tradePrice" if has_trade_price else "closePrice (Näherung)"
         parts = []
         if stk_premium > 0:
@@ -1100,6 +1118,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                         options_gain += diff_eur
                     else:
                         options_loss += diff_eur
+                    add_topf2_detail(TOPF2_CAT_LABELS.get(asset, asset), diff_eur)
                     added_from_summary += 1
             else:
                 # For STK and OPT: skip if trades.csv already has non-zero PnL
@@ -1127,12 +1146,16 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                             options_loss += loss_eur
                             no_invstg_gain += gain_eur
                             no_invstg_loss += loss_eur
+                            add_topf2_detail('Crypto/Commodity ETPs', gain_eur)
+                            add_topf2_detail('Crypto/Commodity ETPs', loss_eur)
                     else:
                         stocks_gain += gain_eur
                         stocks_loss += loss_eur
                 elif asset in ['OPT', 'FUT', 'FOP', 'FSFOP']:
                     options_gain += gain_eur
                     options_loss += loss_eur
+                    add_topf2_detail(TOPF2_CAT_LABELS.get(asset, asset), gain_eur)
+                    add_topf2_detail(TOPF2_CAT_LABELS.get(asset, asset), loss_eur)
                 added_from_summary += 1
         
         if added_from_summary > 0:
@@ -1213,6 +1236,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         # FX gains/losses go into Topf 2 (verzinsliches Fremdwährungsguthaben → §20 Abs. 2 S. 1 Nr. 7)
         options_gain += fx_total_gain
         options_loss += fx_total_loss
+        if fx_total_gain > 0:
+            add_topf2_detail('Devisengewinne', fx_total_gain)
+        if fx_total_loss < 0:
+            add_topf2_detail('Devisengewinne', fx_total_loss)
         print(f"FX Währungsgewinne: {fx_total_gain:,.2f} EUR, Währungsverluste: {fx_total_loss:,.2f} EUR")
         for curr, data in sorted(fx_results.items()):
             print(f"  {curr}: Gewinn {data['gain']:,.2f}, Verlust {data['loss']:,.2f}, Netto {data['net']:,.2f} EUR ({data['disposals_count']} Veräußerungen)")
@@ -1429,6 +1456,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         "options_gain_eur": options_gain,
         "options_loss_eur": options_loss,
         "options_net_eur": options_gain + options_loss,
+        "topf2_by_category": topf2_by_category,
         "withholding_tax_eur": withholding_tax_eur,
         "base_currency": base_currency,
         "tax_year": tax_year,
@@ -1505,8 +1533,13 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         print(f"    Sollzinsen (n. abzf.): {debit_interest_eur:>12,.2f} EUR  (§20 Abs. 9 EStG, nicht in Berechnung)")
     if stillhalter_premium_eur > 0:
         print(f"    Stillhalterprämien:    {stillhalter_premium_eur:>12,.2f} EUR  ({stillhalter_count} Assignments)")
-    print(f"    Optionsgewinne:        {options_gain:>12,.2f} EUR")
-    print(f"    Optionsverluste:       {options_loss:>12,.2f} EUR")
+    print(f"    Sonstige Gewinne:      {options_gain:>12,.2f} EUR")
+    print(f"    Sonstige Verluste:     {options_loss:>12,.2f} EUR")
+    if topf2_by_category:
+        print(f"      Aufschlüsselung:")
+        for cat, vals in sorted(topf2_by_category.items()):
+            net = vals['gain'] + vals['loss']
+            print(f"        {cat:24s} G {vals['gain']:>10,.2f}  V {vals['loss']:>10,.2f}  N {net:>10,.2f}")
     print(f"    ─────────────────────────────────────")
     print(f"    Saldo Sonstiges:       {topf_2_sonstiges:>12,.2f} EUR")
     
