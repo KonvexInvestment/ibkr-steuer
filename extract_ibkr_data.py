@@ -56,9 +56,19 @@ def extract_fx_multi_xml(xml_files, output_dir):
     if not xml_files:
         return
 
-    # Sort by filename to ensure chronological order
-    xml_files = sorted(xml_files)
-    main_xml = xml_files[-1]  # Last file = tax year
+    # Detect tax year from XML content (FlexStatement toDate) to find the main XML
+    def get_xml_end_date(path):
+        try:
+            t = ET.parse(path)
+            stmt = t.getroot().find('.//FlexStatement')
+            if stmt is not None:
+                return stmt.attrib.get('toDate', '')
+        except Exception:
+            pass
+        return ''
+
+    xml_files = sorted(xml_files, key=lambda p: get_xml_end_date(p))
+    main_xml = xml_files[-1]  # Latest end date = tax year
     history_xmls = xml_files[:-1]
 
     print(f"Multi-XML: {len(xml_files)} Dateien, Haupt-XML: {os.path.basename(main_xml)}")
