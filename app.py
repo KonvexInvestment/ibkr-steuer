@@ -926,8 +926,14 @@ if topf2_cats:
         for cat, vals in sorted(topf2_cats.items()):
             net = vals['gain'] + vals['loss']
             cat_table += f"| {cat} | {fmt_de(vals['gain'])} EUR | {fmt_de(vals['loss'])} EUR | {fmt_de(net)} EUR |\n"
-        total_gain = sum(v['gain'] for v in topf2_cats.values()) + max(div_eur, 0) + max(int_eur, 0)
-        total_loss = sum(v['loss'] for v in topf2_cats.values()) + min(div_eur, 0) + min(int_eur, 0)
+        tk_corr_topf2 = (tk_gain_adj.get('Topf2', 0) + tk_loss_adj.get('Topf2', 0)) if tageskurs_aktiv else 0
+        if tageskurs_aktiv and abs(tk_corr_topf2) > 0.01:
+            if tk_corr_topf2 >= 0:
+                cat_table += f"| Tageskurs-Korrektur | {fmt_de(tk_corr_topf2)} EUR | 0,00 EUR | {fmt_de(tk_corr_topf2)} EUR |\n"
+            else:
+                cat_table += f"| Tageskurs-Korrektur | 0,00 EUR | {fmt_de(tk_corr_topf2)} EUR | {fmt_de(tk_corr_topf2)} EUR |\n"
+        total_gain = sum(v['gain'] for v in topf2_cats.values()) + max(div_eur, 0) + max(int_eur, 0) + (tk_gain_adj.get('Topf2', 0) if tageskurs_aktiv else 0)
+        total_loss = sum(v['loss'] for v in topf2_cats.values()) + min(div_eur, 0) + min(int_eur, 0) + (tk_loss_adj.get('Topf2', 0) if tageskurs_aktiv else 0)
         cat_table += f"| **Saldo Topf 2** | **{fmt_de(total_gain)} EUR** | **{fmt_de(total_loss)} EUR** | **{fmt_de(total_gain + total_loss)} EUR** |\n"
         st.markdown(cat_table)
 
