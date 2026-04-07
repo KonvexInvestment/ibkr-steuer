@@ -1237,9 +1237,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         options_gain += fx_total_gain
         options_loss += fx_total_loss
         if fx_total_gain > 0:
-            add_topf2_detail('Devisengewinne', fx_total_gain)
+            add_topf2_detail('Devisen', fx_total_gain)
         if fx_total_loss < 0:
-            add_topf2_detail('Devisengewinne', fx_total_loss)
+            add_topf2_detail('Devisen', fx_total_loss)
         print(f"FX Währungsgewinne: {fx_total_gain:,.2f} EUR, Währungsverluste: {fx_total_loss:,.2f} EUR")
         for curr, data in sorted(fx_results.items()):
             print(f"  {curr}: Gewinn {data['gain']:,.2f}, Verlust {data['loss']:,.2f}, Netto {data['net']:,.2f} EUR ({data['disposals_count']} Veräußerungen)")

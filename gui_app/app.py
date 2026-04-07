@@ -916,14 +916,25 @@ st.markdown(
 
 topf2_cats = d.get('topf2_by_category', {})
 if topf2_cats:
-    with st.expander("Aufschlüsselung Termingeschäfte / Sonstiges"):
+    with st.expander("Aufschlüsselung Topf 2"):
+        div_eur = d.get('dividends_eur', 0)
+        int_eur = d.get('interest_eur', 0)
         cat_table = "| Gattung | Gewinne | Verluste | Netto |\n|---------|--------:|---------:|------:|\n"
+        if div_eur >= 0:
+            cat_table += f"| Dividenden | {fmt_de(div_eur)} EUR | 0,00 EUR | {fmt_de(div_eur)} EUR |\n"
+        else:
+            cat_table += f"| Dividenden | 0,00 EUR | {fmt_de(div_eur)} EUR | {fmt_de(div_eur)} EUR |\n"
+        if int_eur >= 0:
+            cat_table += f"| Zinsen | {fmt_de(int_eur)} EUR | 0,00 EUR | {fmt_de(int_eur)} EUR |\n"
+        else:
+            cat_table += f"| Zinsen | 0,00 EUR | {fmt_de(int_eur)} EUR | {fmt_de(int_eur)} EUR |\n"
         for cat, vals in sorted(topf2_cats.items()):
             net = vals['gain'] + vals['loss']
             cat_table += f"| {cat} | {fmt_de(vals['gain'])} EUR | {fmt_de(vals['loss'])} EUR | {fmt_de(net)} EUR |\n"
-        cat_table += f"| **Gesamt** | **{fmt_de(sum(v['gain'] for v in topf2_cats.values()))} EUR** | **{fmt_de(sum(v['loss'] for v in topf2_cats.values()))} EUR** | **{fmt_de(sum(v['gain'] + v['loss'] for v in topf2_cats.values()))} EUR** |\n"
+        total_gain = sum(v['gain'] for v in topf2_cats.values()) + max(div_eur, 0) + max(int_eur, 0)
+        total_loss = sum(v['loss'] for v in topf2_cats.values()) + min(div_eur, 0) + min(int_eur, 0)
+        cat_table += f"| **Saldo Topf 2** | **{fmt_de(total_gain)} EUR** | **{fmt_de(total_loss)} EUR** | **{fmt_de(total_gain + total_loss)} EUR** |\n"
         st.markdown(cat_table)
-        st.caption("Alle Positionen fließen in die Sonstigen Gewinne/Verluste (Topf 2) ein.")
 
 # ── Fremdwährungs-Gewinne/Verluste ──────────────────────────────────────────
 
@@ -1563,7 +1574,11 @@ if has_etf_data and invstg_aktiv:
 
 topf2_detail_export = ""
 if topf2_cats:
-    topf2_detail_export = "\nAUFSCHLÜSSELUNG TERMINGESCHÄFTE / SONSTIGES\n"
+    topf2_detail_export = "\nAUFSCHLÜSSELUNG TOPF 2\n"
+    div_eur = d.get('dividends_eur', 0)
+    int_eur = d.get('interest_eur', 0)
+    topf2_detail_export += f"  {'Dividenden':24s} G {fmt_de(max(div_eur, 0)):>10} V {fmt_de(min(div_eur, 0)):>10} N {fmt_de(div_eur):>10} EUR\n"
+    topf2_detail_export += f"  {'Zinsen':24s} G {fmt_de(max(int_eur, 0)):>10} V {fmt_de(min(int_eur, 0)):>10} N {fmt_de(int_eur):>10} EUR\n"
     for cat, vals in sorted(topf2_cats.items()):
         net = vals['gain'] + vals['loss']
         topf2_detail_export += f"  {cat:24s} G {fmt_de(vals['gain']):>10} V {fmt_de(vals['loss']):>10} N {fmt_de(net):>10} EUR\n"
