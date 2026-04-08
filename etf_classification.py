@@ -99,6 +99,10 @@ ETF_CLASSIFICATION = {
     'US46429B5984': ('INDA', 'iShares MSCI India ETF',                          'aktienfonds'),   # cbonds /etf/817/
     'US97717W4226': ('EPI',  'WisdomTree India Earnings Fund',                  'aktienfonds'),   # cbonds /etf/2813/
 
+    # --- Europaeische UCITS-ETFs (physische Aktienholdings, IE/LU-domiziliert) ---
+    'IE00BYVQ9F29': ('NQSE', 'iShares Nasdaq 100 UCITS ETF EUR Hedged Acc',    'aktienfonds'),
+    'IE00BYYW2V44': ('SPPE', 'SPDR S&P 500 UCITS ETF EUR Hedged Acc',          'aktienfonds'),
+
     # --- Gold/Silber/Rohstoff-Miner (physische Aktienholdings) ---
     'US92189F1066': ('GDX',  'VanEck Gold Miners ETF',                          'aktienfonds'),   # cbonds /etf/785/
     'US92189F7915': ('GDXJ', 'VanEck Junior Gold Miners ETF',                   'aktienfonds'),   # cbonds /etf/787/
@@ -148,7 +152,8 @@ ETF_CLASSIFICATION = {
     'US78464A7468': ('KIE',  'SPDR S&P Insurance ETF',                           'aktienfonds'),
     'US78464A7394': ('KRE',  'SPDR S&P Regional Banking ETF',                    'aktienfonds'),
     'US37954Y8559': ('LIT',  'Global X Lithium & Battery Tech ETF',              'aktienfonds'),   # alt. ISIN
-    'US46090E2017': ('PPA',  'Invesco Aerospace & Defense ETF',                  'aktienfonds'),
+    'US46090E2017': ('PPA',  'Invesco Aerospace & Defense ETF',                  'aktienfonds'),   # alt. ISIN
+    'US46137V1008': ('PPA',  'Invesco Aerospace & Defense ETF',                  'aktienfonds'),
     'US46137V1180': ('PSP',  'Invesco Global Listed Private Equity ETF',         'aktienfonds'),
     'US8085248694': ('SCHX', 'Schwab U.S. Large-Cap ETF',                        'aktienfonds'),
     'US8123501061': ('SHLD', 'Global X Defense Tech ETF',                        'aktienfonds'),
@@ -187,6 +192,7 @@ ETF_CLASSIFICATION = {
     'US25460G7815': ('NUGT', 'Direxion Daily Gold Miners Index Bull 2X Shares',  'sonstiger_fonds'),  # 2x leveraged, Swaps/Futures
     'US25461A4783': ('DUST', 'Direxion Daily Gold Miners Index Bear 2X Shares',  'sonstiger_fonds'),  # 2x inverse, Swaps/Futures
     'US25460G8318': ('JNUG', 'Direxion Daily Junior Gold Miners Index Bull 2X',  'sonstiger_fonds'),  # 2x leveraged, Swaps/Futures
+    'LU0411078552': ('XS2L', 'Xtrackers S&P 500 2x Leveraged Daily Swap UCITS ETF', 'sonstiger_fonds'),  # 2x leveraged, Swap-basiert
 
     # ═══════════════════════════════════════════════════════════════════════════
     # SONSTIGER FONDS (0% Teilfreistellung) — Anleihen, Volatilitaet, Derivate
@@ -265,13 +271,15 @@ ETF_CLASSIFICATION = {
 
     # --- Weitere Anleihen-ETFs (Björn-Audit) ---
     'US46138G8050': ('BAB',  'Invesco Taxable Municipal Bond ETF',               'sonstiger_fonds'),
-    'US78468R7068': ('CWB',  'SPDR Bloomberg Convertible Securities ETF',        'sonstiger_fonds'),
+    'US78468R7068': ('CWB',  'SPDR Bloomberg Convertible Securities ETF',        'sonstiger_fonds'),  # alt. ISIN
+    'US78464A3591': ('CWB',  'SPDR Bloomberg Convertible Securities ETF',        'sonstiger_fonds'),
     'US92189H4092': ('HYD',  'VanEck High-Yield Muni ETF',                       'sonstiger_fonds'),
     'US92189F3872': ('SHYD', 'VanEck Short High Yield Muni ETF',                 'sonstiger_fonds'),
     'US4642885133': ('HYG',  'iShares iBoxx $ High Yield Corporate Bond ETF',    'sonstiger_fonds'),  # alt. ISIN
     'US4642872429': ('LQD',  'iShares iBoxx $ Investment Grade Corporate Bond ETF', 'sonstiger_fonds'),  # alt. ISIN
     'US78468R8785': ('JNK',  'SPDR Bloomberg High Yield Bond ETF',               'sonstiger_fonds'),
-    'US46138G7896': ('PCY',  'Invesco Emerging Markets Sovereign Debt ETF',      'sonstiger_fonds'),
+    'US46138G7896': ('PCY',  'Invesco Emerging Markets Sovereign Debt ETF',      'sonstiger_fonds'),  # alt. ISIN
+    'US46138E7849': ('PCY',  'Invesco Emerging Markets Sovereign Debt ETF',      'sonstiger_fonds'),
     'US69347A5369': ('PICB', 'Invesco International Corporate Bond ETF',         'sonstiger_fonds'),
     'US4642871763': ('TIP',  'iShares TIPS Bond ETF',                            'sonstiger_fonds'),  # alt. ISIN
     'US97717Y5270': ('USFR', 'WisdomTree Floating Rate Treasury Fund',           'sonstiger_fonds'),
@@ -288,6 +296,8 @@ ETF_CLASSIFICATION = {
     'US4642878501': ('COMT', 'iShares GSCI Commodity Dynamic Roll Strategy ETF', 'sonstiger_fonds'),
     'US46138G1013': ('DBC',  'Invesco DB Commodity Index Tracking Fund',         'sonstiger_fonds'),  # alt. ISIN
     'US88107A1051': ('WEAT', 'Teucrium Wheat Fund',                              'sonstiger_fonds'),
+    'US88166A8707': ('WEAT', 'Teucrium Wheat Fund',                              'sonstiger_fonds'),  # Post-Reverse-Split ISIN
+    'US46140H7008': ('DBB',  'Invesco DB Base Metals Fund',                      'sonstiger_fonds'),  # Rohstoff-Futures (Aluminium, Kupfer, Zink)
     'US11410J2026': ('BDRY', 'Breakwave Dry Bulk Shipping ETF',                  'sonstiger_fonds'),
     'US97717W8281': ('GDE',  'WisdomTree Efficient Gold Plus Equity Strategy Fund', 'sonstiger_fonds'),
 
