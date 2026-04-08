@@ -7,8 +7,12 @@ fuer die Berechnung der Teilfreistellung:
   - mischfonds:       15% Teilfreistellung (25-50% Aktienquote)
   - sonstiger_fonds:   0% Teilfreistellung (Anleihen-ETFs, Derivate-Fonds)
   - no_invstg:        Kein Investmentfonds i.S.d. InvStG (physische Rohstoffe, Krypto-ETPs)
+  - anlage_so:        Privates Veraeusserungsgeschaeft (ss 23 Abs. 1 Nr. 2 EStG)
+                      Physische Gold-ETCs mit Lieferanspruch (BFH VIII R 4/15).
+                      Nach 1 Jahr Haltedauer steuerfrei (Spekulationsfrist).
 
 Rechtsgrundlage: ss 20 InvStG (Teilfreistellung), ss 2 InvStG (Investmentfonds-Definition)
+                 ss 23 Abs. 1 Nr. 2 EStG (private Veraeusserungsgeschaefte)
 
 ISINs verifiziert via cbonds.com (April 2026). Jede ISIN wurde einzeln geprueft.
 """
@@ -19,6 +23,7 @@ TEILFREISTELLUNG = {
     'mischfonds':      0.15,   # 15 % — ss 20 Abs. 1 S. 2 InvStG
     'sonstiger_fonds': 0.00,   # 0 %  — keine Teilfreistellung
     'no_invstg':       None,   # kein Investmentfonds → normale Besteuerung nach ss 20 EStG
+    'anlage_so':       None,   # privates Veräußerungsgeschäft → ss 23 EStG (nicht ss 20)
 }
 
 
@@ -333,10 +338,12 @@ ETF_CLASSIFICATION = {
     'US06742L4785': ('JJG',  'iPath Series B Bloomberg Grains Subindex Total Return ETN', 'no_invstg'),  # ETN
     'US06742W5R66': ('DLBR', 'Barclays ETN+ FI Enhanced Global High Yield ETN',  'no_invstg'),  # ETN
 
-    # --- Deutsche Gold-ETCs (physisch besichert, kein Investmentfonds) ---
-    'DE000EWG2LD7': ('EWG2',  'EUWAX Gold II',                                   'no_invstg'),  # physisches Gold-ETC
-    'DE000EWG0LD1': ('GOLD1', 'EUWAX Gold I',                                    'no_invstg'),  # physisches Gold-ETC
-    'DE000A0S9GB0': ('4GLD',  'Xetra-Gold',                                      'no_invstg'),  # physisches Gold-ETC
+    # --- Deutsche Gold-ETCs (physisch besichert, Lieferanspruch → Anlage SO) ---
+    # BFH VIII R 4/15: Xetra-Gold = privates Veräußerungsgeschäft (§23 EStG)
+    # Nach 1 Jahr Haltedauer steuerfrei (Spekulationsfrist)
+    'DE000EWG2LD7': ('EWG2',  'EUWAX Gold II',                                   'anlage_so'),  # physisches Gold-ETC, Lieferanspruch
+    'DE000EWG0LD1': ('GOLD1', 'EUWAX Gold I',                                    'anlage_so'),  # physisches Gold-ETC, Lieferanspruch
+    'DE000A0S9GB0': ('4GLD',  'Xetra-Gold',                                      'anlage_so'),  # physisches Gold-ETC, Lieferanspruch
 
     # --- Gehebelte/Inverse Rohstoff-ETPs (kein Investmentfonds) ---
     'IE00B6X4BP29': ('3GOS',  'WisdomTree Gold 3x Daily Short',                  'no_invstg'),  # gehebeltes ETP, Schuldverschreibung
@@ -410,11 +417,19 @@ def is_known_etf(isin: str) -> bool:
 
 
 def is_investment_fund(isin: str) -> bool:
-    """Check if ISIN is an Investmentfonds i.S.d. InvStG (not no_invstg, not unknown)."""
+    """Check if ISIN is an Investmentfonds i.S.d. InvStG (not no_invstg, not anlage_so, not unknown)."""
     entry = ETF_CLASSIFICATION.get(isin)
     if entry is None:
         return False
-    return entry[2] != 'no_invstg'
+    return entry[2] not in ('no_invstg', 'anlage_so')
+
+
+def is_anlage_so(isin: str) -> bool:
+    """Check if ISIN is a physical Gold-ETC with delivery claim (§23 EStG)."""
+    entry = ETF_CLASSIFICATION.get(isin)
+    if entry is None:
+        return False
+    return entry[2] == 'anlage_so'
 
 
 def get_classification(isin: str):
@@ -457,7 +472,7 @@ if __name__ == '__main__':
 
     # Stichproben pro Kategorie
     print()
-    for cls_name in ['aktienfonds', 'sonstiger_fonds', 'no_invstg']:
+    for cls_name in ['aktienfonds', 'sonstiger_fonds', 'no_invstg', 'anlage_so']:
         examples = [(t, n) for _, (t, n, c) in ETF_CLASSIFICATION.items() if c == cls_name][:3]
         print(f"  {cls_name}: z.B. {', '.join(t for t, n in examples)}")
 

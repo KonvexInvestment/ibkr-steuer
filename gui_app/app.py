@@ -205,6 +205,19 @@ st.markdown("""
         color: #4ade80;
     }
 
+    /* ── Anlage SO hero card (amber) ── */
+    .hero-card-so {
+        background: linear-gradient(135deg, #3a2f1a 0%, #2d2a1a 100%);
+        border: 1px solid rgba(251,191,36,0.25);
+        border-radius: 18px;
+        padding: 1.75rem 1.5rem;
+        margin: 1.5rem 0;
+        text-align: center;
+    }
+    .hero-card-so .hero-label {
+        color: #fbbf24;
+    }
+
     /* ── Audit expander ── */
     [data-testid="stExpander"] {
         border: 1px solid rgba(255,255,255,0.07) !important;
@@ -427,6 +440,29 @@ def merge_report_data(reports):
             if isin not in merged_kap['etf_unknown_isins']:
                 merged_kap['etf_unknown_isins'].append(isin)
     merged['kap_inv'] = merged_kap
+
+    # Anlage SO merge
+    merged_so = {
+        'total_gain': 0, 'total_loss': 0,
+        'taxable_gain': 0, 'taxable_loss': 0,
+        'tax_free_gain': 0, 'tax_free_loss': 0,
+        'unknown_gain': 0, 'unknown_loss': 0,
+        'details': [], 'by_isin': {},
+    }
+    for r in reports:
+        so = r.get('anlage_so', {})
+        for k in ['total_gain', 'total_loss', 'taxable_gain', 'taxable_loss',
+                   'tax_free_gain', 'tax_free_loss', 'unknown_gain', 'unknown_loss']:
+            merged_so[k] += so.get(k, 0)
+        merged_so['details'].extend(so.get('details', []))
+        for isin, data in so.get('by_isin', {}).items():
+            if isin not in merged_so['by_isin']:
+                merged_so['by_isin'][isin] = dict(data)
+            else:
+                existing = merged_so['by_isin'][isin]
+                for nk in ['taxable', 'tax_free', 'total']:
+                    existing[nk] = existing.get(nk, 0) + data.get(nk, 0)
+    merged['anlage_so'] = merged_so
 
     # Audit merge
     merged_audit = {
@@ -1123,6 +1159,79 @@ if has_etf_data and invstg_aktiv:
         st.markdown(etf_table)
 
 
+# ── Anlage SO · Private Veräußerungsgeschäfte (§23 EStG) ──────────────────────
+
+anlage_so = d.get('anlage_so', {})
+so_by_isin = anlage_so.get('by_isin', {})
+has_so_data = bool(so_by_isin)
+
+if has_so_data:
+    section_title("Anlage SO · Private Veräußerungsgeschäfte (§23 EStG)")
+
+    so_taxable = anlage_so.get('taxable_gain', 0) + anlage_so.get('taxable_loss', 0)
+    so_free = anlage_so.get('tax_free_gain', 0) + anlage_so.get('tax_free_loss', 0)
+    so_total = anlage_so.get('total_gain', 0) + anlage_so.get('total_loss', 0)
+
+    so_unknown = abs(anlage_so.get('unknown_gain', 0)) + abs(anlage_so.get('unknown_loss', 0))
+    so_has_unknown = so_unknown > 0.01
+
+    history_hint = ""
+    if so_has_unknown:
+        history_hint = (
+            '<br><br><strong style="color: #f87171;">Haltedauer nicht ermittelbar:</strong> '
+            'Ohne Vorjahres-XMLs oder CLOSED_LOT-Daten kann die Haltedauer nicht bestimmt werden. '
+            f'Betroffene Positionen ({fmt(so_unknown)}) werden konservativ als <strong>steuerpflichtig</strong> behandelt. '
+            'Laden Sie die XML des Kaufjahres als History-Datei hoch, um die Spekulationsfrist korrekt zu berechnen.'
+        )
+
+    st.markdown(f"""
+<div style="background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
+    <strong style="color: #fbbf24;">Physische Gold-ETCs mit Lieferanspruch</strong> werden nach
+    <strong>§23 Abs. 1 S. 1 Nr. 2 EStG</strong> als private Veräußerungsgeschäfte behandelt
+    (bestätigt durch <strong>BFH VIII R 4/15</strong> für Xetra-Gold).
+    Die Spekulationsfrist beträgt <strong>1 Jahr</strong> (§23 Abs. 1 S. 1 Nr. 2 S. 1 EStG) -
+    Veräußerungsgewinne nach Ablauf dieser Frist sind <strong style="color: #4ade80;">steuerfrei</strong>.
+    Innerhalb der Frist sind sie auf <strong>Anlage SO</strong> zu erklären (nicht auf Anlage KAP).{history_hint}
+</div>
+""", unsafe_allow_html=True)
+
+    so_hero_color = "#fbbf24" if so_taxable >= 0 else "#f87171"
+    st.markdown(f"""
+<div class="hero-card-so">
+    <div class="hero-label">Anlage SO · Steuerpflichtiger Gewinn/Verlust (Haltedauer ≤ 1 Jahr)</div>
+    <div class="hero-value" style="color:{so_hero_color}">{fmt(so_taxable)}</div>
+    <div class="hero-formula">Gesamt {fmt(so_total)} − Steuerfrei {fmt(so_free)} (Haltedauer > 1 Jahr)</div>
+</div>
+""", unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="metric-grid">'
+        + metric_card("Gesamt G/V", so_total, "saldo")
+        + metric_card("Steuerfrei (> 1J)", so_free, "gain")
+        + metric_card("Steuerpflichtig (≤ 1J)", so_taxable, "loss" if so_taxable < 0 else "info")
+        + '</div>',
+        unsafe_allow_html=True
+    )
+
+    with st.expander("Gold-ETC Details nach ISIN"):
+        so_table = "| Ticker | Gesamt | Steuerfrei (> 1J) | Steuerpflichtig (≤ 1J) |\n"
+        so_table += "|--------|-------:|------------------:|-----------------------:|\n"
+        for isin, info in sorted(so_by_isin.items(), key=lambda x: abs(x[1]['total']), reverse=True):
+            so_table += f"| {info.get('ticker', isin)} | {fmt_de(info['total'])} | {fmt_de(info.get('tax_free', 0))} | {fmt_de(info.get('taxable', 0))} |\n"
+        st.markdown(so_table)
+
+        so_details = anlage_so.get('details', [])
+        if so_details:
+            st.markdown("**Lot-Details (FIFO-Zuordnung):**")
+            lot_table = "| Ticker | Kauf | Verkauf | Stk. | G/V (EUR) | Status |\n"
+            lot_table += "|--------|------|---------|-----:|----------:|--------|\n"
+            for lot in so_details:
+                status = "steuerfrei" if lot.get('is_tax_free') else "steuerpflichtig"
+                qty = abs(lot.get('quantity', 0))
+                lot_table += f"| {lot['ticker']} | {lot.get('open_date', '?')} | {lot.get('close_date', '?')} | {qty:.0f} | {fmt_de(lot['pnl_eur'])} | {status} |\n"
+            st.markdown(lot_table)
+
+
 # ── Plausibilitätscheck (wenn CSV hochgeladen) ─────────────────────────────
 csv_cats = d.get('csv_category_totals', {})
 if csv_cats:
@@ -1133,7 +1242,10 @@ if csv_cats:
     cross_put = d['audit'].get('cross_year_put_total', 0)
     no_invstg_gain = d['audit'].get('no_invstg_gain', 0)
     no_invstg_loss = d['audit'].get('no_invstg_loss', 0)
-    our_stk_gain = d['stocks_gain_eur'] + d['audit'].get('stillhalter_premium_eur', 0) + cross_put + no_invstg_gain
+    # Add back premiums that WERE subtracted from stocks_gain, but NOT put premiums
+    # where the stock wasn't sold (those were never in stocks_gain to begin with)
+    stillhalter_addback = d['audit'].get('stillhalter_premium_eur', 0) - d['audit'].get('put_nosell_premium_eur', 0)
+    our_stk_gain = d['stocks_gain_eur'] + stillhalter_addback + cross_put + no_invstg_gain
     our_stk_loss = d['stocks_loss_eur'] + no_invstg_loss
 
     # If InvStG active: add ETF values back for IBKR comparison (IBKR counts ETFs as Aktien)
@@ -1142,6 +1254,11 @@ if csv_cats:
     if has_etf_data and invstg_aktiv:
         our_stk_gain += kap_inv_data.get('etf_gain_raw_eur', 0)
         our_stk_loss += kap_inv_data.get('etf_loss_raw_eur', 0)
+
+    # Add back Anlage SO Gold-ETC values for IBKR comparison (IBKR counts them as STK)
+    if has_so_data:
+        our_stk_gain += anlage_so.get('total_gain', 0)
+        our_stk_loss += anlage_so.get('total_loss', 0)
 
     ibkr_topf2_cats = ["Aktien- und Indexoptionen", "Futures", "Optionen auf Futures (Future-Style)",
                         "Optionen auf Futures", "Anleihen", "Treasury Bills"]
@@ -1202,6 +1319,8 @@ if csv_cats:
         st.info("Kleine Abweichungen sind normal (FX-Rundung, Steuerkorrekturen aus Vorjahren).")
     if has_etf_data and invstg_aktiv:
         st.caption("InvStG aktiv: ETF-Werte wurden für diesen Vergleich zurückaddiert, da der IBKR-Bericht keine InvStG-Trennung kennt.")
+    if has_so_data:
+        st.caption("Anlage SO aktiv: Gold-ETC-Werte wurden für diesen Vergleich zurückaddiert, da IBKR sie als Aktien zählt.")
     if tageskurs_aktiv or zufluss_adj != 0:
         notes = []
         if tageskurs_aktiv:
@@ -1233,6 +1352,14 @@ if has_etf_data and invstg_aktiv:
     kap_rows_html += '<div class="section-title" style="margin-top:1.5rem;">Anlage KAP-INV</div>'
     kap_rows_html += kap_row("KAP-INV", "Erträge nach Teilfreistellung", etf_net_taxable, highlight=True)
     kap_rows_html += kap_row("KAP-INV", "Anrechenbare Quellensteuer (ETF)", etf_wht)
+
+if has_so_data:
+    so_taxable_for_row = anlage_so.get('taxable_gain', 0) + anlage_so.get('taxable_loss', 0)
+    so_free_for_row = anlage_so.get('tax_free_gain', 0) + anlage_so.get('tax_free_loss', 0)
+    kap_rows_html += '<div class="section-title" style="margin-top:1.5rem;">Anlage SO (§23 EStG)</div>'
+    kap_rows_html += kap_row("SO", "Steuerpflichtiger Gewinn/Verlust (≤ 1 Jahr)", so_taxable_for_row, highlight=True)
+    if abs(so_free_for_row) > 0.01:
+        kap_rows_html += kap_row("SO", "Steuerfrei (> 1 Jahr Haltedauer)", so_free_for_row)
 
 st.markdown(kap_rows_html, unsafe_allow_html=True)
 
@@ -1698,7 +1825,7 @@ ANLAGE KAP EINTRAGUNGEN
   Zeile 22 (Verluste o. Aktien): {fmt_de(zeile_22):>8} EUR
   Zeile 23 (Aktienverluste): {fmt_de(zeile_23):>11} EUR
   Zeile 41 (Quellensteuer): {fmt_de(quellensteuer):>11} EUR
-{"" if not (has_etf_data and invstg_aktiv) else chr(10) + "ANLAGE KAP-INV EINTRAGUNGEN" + chr(10) + f"  KAP-INV Erträge (nach TFS): {fmt_de(etf_net_taxable):>8} EUR" + chr(10) + f"  KAP-INV Quellensteuer: {fmt_de(etf_wht):>13} EUR" + chr(10)}═══════════════════════════════════════════════════
+{"" if not (has_etf_data and invstg_aktiv) else chr(10) + "ANLAGE KAP-INV EINTRAGUNGEN" + chr(10) + f"  KAP-INV Erträge (nach TFS): {fmt_de(etf_net_taxable):>8} EUR" + chr(10) + f"  KAP-INV Quellensteuer: {fmt_de(etf_wht):>13} EUR" + chr(10)}{"" if not has_so_data else chr(10) + "ANLAGE SO (§23 EStG) — PRIVATE VERÄUSSERUNGSGESCHÄFTE" + chr(10) + f"  Physische Gold-ETCs (BFH VIII R 4/15)" + chr(10) + f"  Steuerpflichtig (≤ 1J): {fmt_de(so_taxable_for_row):>12} EUR  → Anlage SO" + chr(10) + f"  Steuerfrei (> 1J):      {fmt_de(so_free_for_row):>12} EUR" + chr(10)}═══════════════════════════════════════════════════
 """
 
 st.download_button(

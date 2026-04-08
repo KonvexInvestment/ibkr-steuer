@@ -522,6 +522,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
     no_invstg_gain = 0.0
     no_invstg_loss = 0.0
 
+    # Anlage SO tracking (§23 EStG — physische Gold-ETCs mit Lieferanspruch)
+    # Trades are collected for holding period analysis; gains/losses excluded from KAP entirely
+    anlage_so_trades = []  # list of dicts with trade details for holding period check
+
     # InvStG ETF tracking (KAP-INV)
     etf_invstg_gain = 0.0       # InvStG fund gains (before Teilfreistellung)
     etf_invstg_loss = 0.0       # InvStG fund losses (before Teilfreistellung)
@@ -563,7 +567,21 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             sub = t.get('subCategory', '')
             if sub == 'ETF' and isin:
                 cls = get_classification(isin)
-                if cls == 'no_invstg':
+                if cls == 'anlage_so':
+                    # Physical Gold-ETC with delivery claim → §23 EStG (not §20)
+                    # Excluded from KAP entirely; holding period determines taxability
+                    info = get_etf_info(isin)
+                    anlage_so_trades.append({
+                        'isin': isin,
+                        'ticker': info['ticker'] if info else isin[:12],
+                        'name': info['name'] if info else '',
+                        'pnl_eur': pnl_eur,
+                        'quantity': safe_float(t.get('quantity'), 0),
+                        'dateTime': t.get('dateTime', ''),
+                        'reportDate': t.get('reportDate', ''),
+                        'buySell': t.get('buySell', ''),
+                    })
+                elif cls == 'no_invstg':
                     # Crypto/Commodity ETPs: NOT a stock → Topf 2 (§20 Abs. 2 S. 1 Nr. 7 EStG)
                     if pnl_eur > 0:
                         options_gain += pnl_eur
@@ -743,6 +761,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             'symbol': a.get('symbol') or a.get('description') or f"{strike} {expiry} {pc}",
             'strike': strike,
             'expiry': expiry,
+            'putCall': pc,
             'quantity': a_qty,
             'premium_eur': premium_eur,
             'assignment_date': str(assignment_date) if assignment_date else '',
@@ -752,14 +771,40 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         })
 
     # Move premiums from Topf 1 (stocks) / KAP-INV to Topf 2 (sonstiges)
+    # For CALL assignments: IBKR embeds premium in stock SELL PnL → subtract from stocks_gain
+    # For PUT assignments: premium is in stock cost basis → only subtract if stock was sold
+    #   in the same tax year (otherwise premium is NOT in stocks_gain yet)
     etf_stillhalter_premium_eur = 0.0
+    put_nosell_premium_eur = 0.0
     if stillhalter_premium_eur > 0:
+        # Build set of underlying symbols that have stock SELL PnL in tax_year
+        stk_sold_symbols = set()
+        for t in trades:
+            if t.get('assetCategory') != 'STK':
+                continue
+            rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
+            if not rd or rd.year != tax_year:
+                continue
+            if abs(safe_float(t.get('fifoPnlRealized'))) < 0.01:
+                continue
+            sym_parts = (t.get('underlyingSymbol') or t.get('symbol', '')).split()
+            if sym_parts:
+                stk_sold_symbols.add(sym_parts[0])
+
         # Split: check if underlying is an InvStG ETF
         stk_premium = 0.0
         etf_premium = 0.0
+        put_nosell_premium = 0.0  # put assignment premiums where stock was NOT sold
         for det in stillhalter_details:
             underlying = det['symbol'].split()[0] if det['symbol'] else ''
             underlying_isin = symbol_to_isin.get(underlying, '')
+
+            # Put assignment: only subtract from stocks/ETF if stock was sold in tax_year
+            # (if not sold, premium is in cost basis only — not yet in stocks_gain)
+            if det['putCall'] == 'P' and underlying not in stk_sold_symbols:
+                put_nosell_premium += det['premium_eur']
+                continue
+
             if underlying_isin and underlying_isin in etf_isins:
                 cls = get_classification(underlying_isin)
                 if cls != 'no_invstg':
@@ -774,6 +819,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         stocks_gain -= stk_premium
         etf_invstg_gain -= etf_premium
         etf_stillhalter_premium_eur = etf_premium
+        put_nosell_premium_eur = put_nosell_premium
         options_gain += stillhalter_premium_eur  # total premium always to Topf 2
         add_topf2_detail('Stillhalterprämien', stillhalter_premium_eur)
         price_source = "tradePrice" if has_trade_price else "closePrice (Näherung)"
@@ -782,6 +828,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             parts.append(f"{stk_premium:,.2f} von Aktien")
         if etf_premium > 0:
             parts.append(f"{etf_premium:,.2f} von ETF/KAP-INV")
+        if put_nosell_premium > 0:
+            parts.append(f"{put_nosell_premium:,.2f} Put-Andienung (Aktie nicht verkauft)")
         print(f"Stillhalterprämien: {stillhalter_count} Assignments, {stillhalter_premium_eur:,.2f} EUR → Topf 2 ({', '.join(parts)}) (Quelle: {price_source}).")
     if stillhalter_unmatched:
         print(f"  (!) WARNUNG: {len(stillhalter_unmatched)} Assignment(s) — der ursprüngliche Optionsverkauf "
@@ -1329,6 +1377,27 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             fx = safe_float(t.get('fxRateToBase'), 1.0)
             pnl_base = pnl_raw * fx
             pnl_by_isin[isin] = pnl_by_isin.get(isin, 0) + pnl_base
+
+        # Build set of stock symbols/ISINs received via put assignment
+        # Needed to skip phantom PnL entries in pnl_summary when the stock
+        # BookTrade is absent from trades.csv (varies by Flex Query config)
+        put_assign_syms = set()   # underlying ticker symbols
+        put_assign_isins = set()  # underlying ISINs
+        all_put_assigns = [a for a in opt_assignments if a.get('putCall') == 'P']
+        all_put_assigns.extend(prior_put_assignments)
+        for a in all_put_assigns:
+            underlying = a.get('underlyingSymbol', '').strip()
+            if not underlying:
+                sym = a.get('symbol', '')
+                if sym:
+                    underlying = sym.split()[0]
+            if underlying:
+                put_assign_syms.add(underlying)
+                if underlying in symbol_to_isin:
+                    put_assign_isins.add(symbol_to_isin[underlying])
+            uid = a.get('underlyingSecurityID', '').strip()
+            if uid:
+                put_assign_isins.add(uid)
             
         # FX rate for summary fallback (pnl_summary is "InBase" = base currency)
         if base_currency == 'EUR':
@@ -1383,6 +1452,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                 # double-count or add phantom gains/losses)
                 if isin in pnl_by_isin:
                     continue
+
+                # Also skip phantom PnL for stocks received only via put assignment.
+                # Some Flex Query configs omit the stock BookTrade from trades.csv,
+                # but pnl_summary still shows a phantom realized loss (IBKR data quirk).
+                if asset == 'STK':
+                    summary_sym = s_row.get('symbol', '').strip()
+                    if summary_sym in put_assign_syms or isin in put_assign_isins:
+                        continue
                     
                 gain_eur = summary_gain_usd * default_fallback_rate
                 loss_eur = summary_loss_usd * default_fallback_rate
@@ -1391,7 +1468,21 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                     sub_cat = s_row.get('subCategory', '')
                     if sub_cat == 'ETF':
                         cls = get_classification(isin)
-                        if cls != 'no_invstg':
+                        if cls == 'anlage_so':
+                            # Physical Gold-ETC → §23 EStG, not KAP
+                            info = get_etf_info(isin)
+                            total_pnl = gain_eur + loss_eur
+                            anlage_so_trades.append({
+                                'isin': isin,
+                                'ticker': info['ticker'] if info else isin[:12],
+                                'name': info['name'] if info else '',
+                                'pnl_eur': total_pnl,
+                                'quantity': 0,
+                                'dateTime': '',
+                                'reportDate': '',
+                                'buySell': '',
+                            })
+                        elif cls not in ('no_invstg', None):
                             etf_invstg_gain += gain_eur
                             etf_invstg_loss += loss_eur
                             if isin not in etf_by_isin:
@@ -1637,7 +1728,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             isin = lot.get('isin', '').strip()
             if category == 'STK' and sub == 'ETF' and isin:
                 cls = get_classification(isin)
-                topf = 'KAP-INV' if cls != 'no_invstg' else 'Topf2'
+                if cls == 'anlage_so':
+                    continue  # Gold-ETCs excluded from KAP entirely
+                topf = 'KAP-INV' if cls not in ('no_invstg', None) else 'Topf2'
             elif category == 'STK':
                 topf = 'Topf1'
             else:
@@ -1666,6 +1759,208 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             for topf, val in sorted(fx_corr_by_topf.items()):
                 if abs(val) > 0.01:
                     print(f"    {topf}: {val:>+12,.2f} EUR")
+
+    # --- Anlage SO: Holding period analysis for Gold-ETCs (§23 EStG) ---
+    anlage_so_result = {
+        'total_gain': 0.0,
+        'total_loss': 0.0,
+        'taxable_gain': 0.0,     # holding period <= 1 year
+        'taxable_loss': 0.0,     # holding period <= 1 year
+        'tax_free_gain': 0.0,    # holding period > 1 year
+        'tax_free_loss': 0.0,    # holding period > 1 year
+        'unknown_gain': 0.0,     # no lot data → conservatively taxable
+        'unknown_loss': 0.0,
+        'details': [],           # per-lot details
+        'by_isin': {},           # per-ISIN summary
+    }
+
+    if anlage_so_trades:
+        # Try CLOSED_LOT data first (has openDateTime for exact holding period)
+        closed_lots_for_so = []
+        if os.path.exists(os.path.join(ib_tax_dir, 'closed_lots.csv')):
+            all_closed = load_csv(os.path.join(ib_tax_dir, 'closed_lots.csv'))
+            so_isins = {t['isin'] for t in anlage_so_trades}
+            closed_lots_for_so = [
+                lot for lot in all_closed
+                if lot.get('isin', '').strip() in so_isins
+                and lot.get('assetCategory') == 'STK'
+            ]
+
+        if closed_lots_for_so:
+            # Use CLOSED_LOT data for exact per-lot holding period
+            for lot in closed_lots_for_so:
+                report_date = parse_date(lot.get('reportDate') or lot.get('dateTime'))
+                if not report_date or report_date.year != tax_year:
+                    continue
+
+                isin = lot.get('isin', '').strip()
+                open_dt = parse_date(lot.get('openDateTime', ''))
+                close_dt = report_date
+
+                pnl_raw = safe_float(lot.get('fifoPnlRealized'), 0)
+                fx = safe_float(lot.get('fxRateToBase'), 1.0)
+                if base_currency == 'EUR':
+                    pnl_eur = pnl_raw * fx
+                else:
+                    rate = get_rate_for_date(close_dt, usd_to_eur_rates)
+                    pnl_eur = pnl_raw * fx * rate
+
+                qty = safe_float(lot.get('quantity'), 0)
+                info = get_etf_info(isin)
+                ticker = info['ticker'] if info else isin[:12]
+
+                if open_dt:
+                    # §23 EStG: > 1 year holding = tax free
+                    try:
+                        one_year_later = open_dt.replace(year=open_dt.year + 1)
+                    except ValueError:
+                        # Feb 29 → Mar 1 fallback
+                        one_year_later = open_dt.replace(year=open_dt.year + 1, day=28) + timedelta(days=1)
+                    is_tax_free = close_dt > one_year_later
+                else:
+                    is_tax_free = False  # conservative: taxable if unknown
+
+                detail = {
+                    'isin': isin, 'ticker': ticker,
+                    'open_date': str(open_dt) if open_dt else '?',
+                    'close_date': str(close_dt),
+                    'quantity': qty,
+                    'pnl_eur': pnl_eur,
+                    'is_tax_free': is_tax_free,
+                }
+                anlage_so_result['details'].append(detail)
+                anlage_so_result['total_gain'] += max(pnl_eur, 0)
+                anlage_so_result['total_loss'] += min(pnl_eur, 0)
+
+                if is_tax_free:
+                    anlage_so_result['tax_free_gain'] += max(pnl_eur, 0)
+                    anlage_so_result['tax_free_loss'] += min(pnl_eur, 0)
+                else:
+                    anlage_so_result['taxable_gain'] += max(pnl_eur, 0)
+                    anlage_so_result['taxable_loss'] += min(pnl_eur, 0)
+
+                if isin not in anlage_so_result['by_isin']:
+                    anlage_so_result['by_isin'][isin] = {
+                        'ticker': ticker, 'name': info['name'] if info else '',
+                        'taxable': 0.0, 'tax_free': 0.0, 'total': 0.0,
+                    }
+                anlage_so_result['by_isin'][isin]['total'] += pnl_eur
+                if is_tax_free:
+                    anlage_so_result['by_isin'][isin]['tax_free'] += pnl_eur
+                else:
+                    anlage_so_result['by_isin'][isin]['taxable'] += pnl_eur
+
+            print(f"\nAnlage SO (§23 EStG): {len(anlage_so_result['details'])} Gold-ETC-Lots analysiert.")
+        else:
+            # Fallback: own FIFO from trades for holding period
+            # Build buy lots per ISIN from all trades (including history)
+            so_isins = {t['isin'] for t in anlage_so_trades}
+            buy_lots = defaultdict(list)  # isin -> list of (date, qty_remaining, qty_original)
+
+            for t in trades:
+                isin = t.get('isin', '').strip()
+                if isin not in so_isins:
+                    continue
+                sub = t.get('subCategory', '')
+                if sub != 'ETF':
+                    continue
+                qty = safe_float(t.get('quantity'), 0)
+                buy_sell = t.get('buySell', '')
+                dt = parse_date(t.get('dateTime') or t.get('tradeDate'))
+                if not dt:
+                    continue
+                if buy_sell == 'BUY' and qty > 0:
+                    buy_lots[isin].append({'date': dt, 'remaining': qty, 'original': qty})
+
+            # Sort buy lots FIFO (oldest first)
+            for isin in buy_lots:
+                buy_lots[isin].sort(key=lambda x: x['date'])
+
+            # Process sales (only tax-year) with FIFO matching
+            for t in anlage_so_trades:
+                isin = t['isin']
+                pnl_eur = t['pnl_eur']
+                sell_qty = abs(t['quantity'])
+                sell_date = parse_date(t['reportDate'] or t['dateTime'])
+
+                info = get_etf_info(isin)
+                ticker = info['ticker'] if info else isin[:12]
+
+                if isin not in anlage_so_result['by_isin']:
+                    anlage_so_result['by_isin'][isin] = {
+                        'ticker': ticker, 'name': info['name'] if info else '',
+                        'taxable': 0.0, 'tax_free': 0.0, 'total': 0.0,
+                    }
+
+                anlage_so_result['total_gain'] += max(pnl_eur, 0)
+                anlage_so_result['total_loss'] += min(pnl_eur, 0)
+                anlage_so_result['by_isin'][isin]['total'] += pnl_eur
+
+                lots = buy_lots.get(isin, [])
+                if sell_qty > 0 and lots and sell_date:
+                    # FIFO matching
+                    remaining_sell = sell_qty
+                    matched_tax_free = 0.0
+                    matched_taxable = 0.0
+                    for lot in lots:
+                        if lot['remaining'] <= 0:
+                            continue
+                        match = min(lot['remaining'], remaining_sell)
+                        try:
+                            one_year_later = lot['date'].replace(year=lot['date'].year + 1)
+                        except ValueError:
+                            one_year_later = lot['date'].replace(year=lot['date'].year + 1, day=28)
+                        if sell_date > one_year_later:
+                            matched_tax_free += match
+                        else:
+                            matched_taxable += match
+                        lot['remaining'] -= match
+                        remaining_sell -= match
+                        if remaining_sell <= 0:
+                            break
+
+                    total_matched = matched_tax_free + matched_taxable + remaining_sell
+                    if total_matched > 0:
+                        free_ratio = matched_tax_free / total_matched
+                        taxable_ratio = 1.0 - free_ratio
+                    else:
+                        free_ratio = 0.0
+                        taxable_ratio = 1.0
+
+                    pnl_free = pnl_eur * free_ratio
+                    pnl_taxable = pnl_eur * taxable_ratio
+
+                    anlage_so_result['tax_free_gain'] += max(pnl_free, 0)
+                    anlage_so_result['tax_free_loss'] += min(pnl_free, 0)
+                    anlage_so_result['taxable_gain'] += max(pnl_taxable, 0)
+                    anlage_so_result['taxable_loss'] += min(pnl_taxable, 0)
+                    anlage_so_result['by_isin'][isin]['tax_free'] += pnl_free
+                    anlage_so_result['by_isin'][isin]['taxable'] += pnl_taxable
+
+                    detail = {
+                        'isin': isin, 'ticker': ticker,
+                        'open_date': 'FIFO',
+                        'close_date': str(sell_date) if sell_date else '?',
+                        'quantity': sell_qty,
+                        'pnl_eur': pnl_eur,
+                        'is_tax_free': free_ratio > 0.99,
+                        'free_ratio': free_ratio,
+                    }
+                    anlage_so_result['details'].append(detail)
+                else:
+                    # No buy lots found → conservatively taxable
+                    anlage_so_result['unknown_gain'] += max(pnl_eur, 0)
+                    anlage_so_result['unknown_loss'] += min(pnl_eur, 0)
+                    anlage_so_result['taxable_gain'] += max(pnl_eur, 0)
+                    anlage_so_result['taxable_loss'] += min(pnl_eur, 0)
+                    anlage_so_result['by_isin'][isin]['taxable'] += pnl_eur
+
+            print(f"\nAnlage SO (§23 EStG): {len(anlage_so_trades)} Gold-ETC-Verkäufe, FIFO-Haltedauer berechnet.")
+
+        so_taxable_net = anlage_so_result['taxable_gain'] + anlage_so_result['taxable_loss']
+        so_free_net = anlage_so_result['tax_free_gain'] + anlage_so_result['tax_free_loss']
+        print(f"  Steuerpflichtig (≤ 1 Jahr): {so_taxable_net:>+12,.2f} EUR")
+        print(f"  Steuerfrei (> 1 Jahr):      {so_free_net:>+12,.2f} EUR")
 
     # Correct Anlage KAP Structure (2025):
     # Two separate "pots" (Töpfe) for loss offsetting:
@@ -1749,6 +2044,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             "etf_unknown_isins": etf_unknown_isins,
             "etf_stillhalter_premium_eur": etf_stillhalter_premium_eur,
         },
+        # Anlage SO (§23 EStG — physische Gold-ETCs)
+        "anlage_so": anlage_so_result,
         # Plausibility Metadata
         "has_trade_price": has_trade_price,
         "audit": {
@@ -1761,6 +2058,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             "ecb_rates_used": ecb_rates_used,
             "stillhalter_count": stillhalter_count,
             "stillhalter_premium_eur": stillhalter_premium_eur,
+            "put_nosell_premium_eur": put_nosell_premium_eur,
             "stillhalter_unmatched": stillhalter_unmatched,
             "stillhalter_details": stillhalter_details,
             "cross_year_premium_eur": cross_year_premium_eur,
@@ -1844,6 +2142,19 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             print(f"    Teilfreistellung:      {-tfs_reduction:>12,.2f} EUR")
         print(f"    ETF-Netto (stpfl.):    {etf_net_taxable:>12,.2f} EUR")
         print(f"    ETF-Quellensteuer:     {etf_wht_abs:>12,.2f} EUR")
+
+    if anlage_so_result['details'] or anlage_so_result['total_gain'] != 0 or anlage_so_result['total_loss'] != 0:
+        print("-" * 60)
+        print("ANLAGE SO (§23 EStG — Private Veräußerungsgeschäfte)")
+        print("    Physische Gold-ETCs mit Lieferanspruch (BFH VIII R 4/15)")
+        for isin, data in sorted(anlage_so_result['by_isin'].items(), key=lambda x: abs(x[1]['total']), reverse=True):
+            print(f"    {data['ticker']:6s}  Gesamt: {data['total']:>10,.2f}  Stpfl.: {data['taxable']:>10,.2f}  Frei: {data['tax_free']:>10,.2f}")
+        so_taxable = anlage_so_result['taxable_gain'] + anlage_so_result['taxable_loss']
+        so_free = anlage_so_result['tax_free_gain'] + anlage_so_result['tax_free_loss']
+        print(f"    ─────────────────────────────────────")
+        print(f"    Steuerpflichtig (≤1J): {so_taxable:>12,.2f} EUR  → Anlage SO")
+        print(f"    Steuerfrei (>1J):      {so_free:>12,.2f} EUR")
+        print(f"    (NICHT auf Anlage KAP)")
 
     print("-" * 60)
     print("ZEILE 19 (Ausländische Kapitalerträge - NETTO):")
