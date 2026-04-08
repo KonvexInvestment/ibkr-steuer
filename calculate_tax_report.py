@@ -433,10 +433,12 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
     funds_duplicates = 0
     
     for f in all_funds:
-        # Use transactionID if available, otherwise full tuple
+        # Use (transactionID, activityDescription) — IBKR bundles multiple items
+        # (e.g. Borrow Fees + SYEP Interest) under the same transactionID.
+        # Using only transactionID would drop legitimate entries.
         tid = f.get('transactionID')
         if tid:
-            key = tid
+            key = (tid, f.get('activityDescription', ''))
         else:
             key = tuple(f.items())
             
