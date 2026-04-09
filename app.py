@@ -499,6 +499,12 @@ def merge_report_data(reports):
             merged_audit['cross_year_by_year'][year] = merged_audit['cross_year_by_year'].get(year, 0) + val
     merged['audit'] = merged_audit
 
+    # Trade details merge (concatenate lists from all accounts)
+    merged['trade_details'] = []
+    for r in reports:
+        merged['trade_details'].extend(r.get('trade_details', []))
+    merged['trade_details'].sort(key=lambda r: r.get('dateTime', '') or r.get('reportDate', '') or 'zzzz')
+
     return merged
 
 # inline color vars for kap_row values
@@ -1224,6 +1230,134 @@ if has_so_data:
                 qty = abs(lot.get('quantity', 0))
                 lot_table += f"| {lot['ticker']} | {lot.get('open_date', '?')} | {lot.get('close_date', '?')} | {qty:.0f} | {fmt_de(lot['pnl_eur'])} | {status} |\n"
             st.markdown(lot_table)
+
+
+# ── Einzelnachweise - Trade-Level-Reporting ──────────────────────────────────
+trade_details = d.get('trade_details', [])
+if trade_details:
+    section_title("Einzelnachweise - Trade-Details (CSV)")
+
+    def format_instrument_csv(row):
+        sym = row.get('symbol', '') or ''
+        desc = row.get('description', '') or ''
+        pc = row.get('putCall', '') or ''
+        strike = row.get('strike', '') or ''
+        expiry = row.get('expiry', '') or ''
+        if pc and strike and expiry:
+            pc_label = 'Call' if pc == 'C' else 'Put'
+            if len(expiry) == 8:
+                exp_fmt = f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:]}"
+            else:
+                exp_fmt = expiry[:10]
+            return f"{sym} ({pc_label} {strike} exp. {exp_fmt})"
+        if desc and sym:
+            return f"{sym} ({desc})"
+        return sym or desc or ''
+
+    topf_readable = {
+        'Topf1': 'Topf 1 (Aktien)',
+        'Topf2': 'Topf 2 (Sonstiges)',
+        'KAP-INV': 'Anlage KAP-INV (InvStG)',
+        'Anlage SO': 'Anlage SO (Paragraf 23 EStG)',
+    }
+
+    from collections import defaultdict
+    trades_by_topf = defaultdict(list)
+    for row in trade_details:
+        trades_by_topf[row.get('topf', 'Topf2')].append(row)
+
+    # Kurzuebersicht im UI
+    summary_parts = []
+    for topf_key in ['Topf1', 'Topf2', 'KAP-INV', 'Anlage SO']:
+        rows = trades_by_topf.get(topf_key, [])
+        if rows:
+            s = sum(r.get('pnl_eur', 0) for r in rows)
+            label = topf_readable.get(topf_key, topf_key)
+            summary_parts.append(f"**{label}:** {len(rows)} Trades, {fmt_de(s)} EUR")
+
+    st.markdown(" · ".join(summary_parts))
+
+    # CSV bauen -- detailliert
+    import csv as csv_mod
+    import io
+    csv_buffer = io.StringIO()
+    fieldnames = [
+        'Verrechnungstopf', 'Datum', 'Handelsdatum',
+        'Wertpapier', 'Beschreibung', 'ISIN', 'Kategorie',
+        'Kauf/Verkauf', 'Stueck', 'Kurs',
+        'Kostenbasis (Orig.)', 'Erloese (Orig.)', 'G/V (Orig.)', 'Waehrung',
+        'Wechselkurs', 'G/V (EUR)',
+        'Transaktionstyp', 'Multiplikator', 'Quelle', 'Anmerkung',
+    ]
+    writer = csv_mod.DictWriter(csv_buffer, fieldnames=fieldnames, delimiter=';')
+    writer.writeheader()
+
+    cat_labels = {
+        'STK': 'Aktie', 'OPT': 'Option', 'FUT': 'Future',
+        'FOP': 'Futures-Option', 'FSFOP': 'Flex-Option',
+        'BILL': 'T-Bill', 'BOND': 'Anleihe',
+    }
+
+    for row in trade_details:
+        source = row.get('source', '')
+        anmerkung = ''
+        if source == 'pnl_summary':
+            anmerkung = 'Aus IBKR PnL-Summary (kein Einzeltrade)'
+        elif source == 'stillhalter_korrektur':
+            anmerkung = row.get('description', 'Stillhalter-Korrektur')
+
+        pnl_orig = row.get('fifoPnlRealized', 0)
+        fx = row.get('fxRateToBase', 0)
+        cost = row.get('cost', 0)
+        proceeds = row.get('proceeds', 0)
+        price = row.get('tradePrice', 0)
+        mult = row.get('multiplier', '')
+
+        writer.writerow({
+            'Verrechnungstopf': topf_readable.get(row.get('topf', ''), row.get('topf', '')),
+            'Datum': (row.get('reportDate', '') or '')[:10],
+            'Handelsdatum': (row.get('dateTime', '') or '')[:10],
+            'Wertpapier': format_instrument_csv(row),
+            'Beschreibung': row.get('description', ''),
+            'ISIN': row.get('isin', ''),
+            'Kategorie': cat_labels.get(row.get('assetCategory', ''), row.get('assetCategory', '')),
+            'Kauf/Verkauf': row.get('buySell', ''),
+            'Stueck': row.get('quantity', ''),
+            'Kurs': f"{price:.4f}" if price else '',
+            'Kostenbasis (Orig.)': f"{cost:.2f}" if cost else '',
+            'Erloese (Orig.)': f"{proceeds:.2f}" if proceeds else '',
+            'G/V (Orig.)': f"{pnl_orig:.2f}" if pnl_orig else '',
+            'Waehrung': row.get('currency', ''),
+            'Wechselkurs': f"{fx:.4f}" if fx else '',
+            'G/V (EUR)': f"{row.get('pnl_eur', 0):.2f}",
+            'Transaktionstyp': row.get('transactionType', ''),
+            'Multiplikator': mult if mult and str(mult) != '1' else '',
+            'Quelle': source,
+            'Anmerkung': anmerkung,
+        })
+
+    # Summenzeilen pro Topf am Ende
+    writer.writerow({f: '' for f in fieldnames})
+    writer.writerow({'Verrechnungstopf': '--- SUMMEN ---', **{f: '' for f in fieldnames if f != 'Verrechnungstopf'}})
+    for topf_key in ['Topf1', 'Topf2', 'KAP-INV', 'Anlage SO']:
+        rows = trades_by_topf.get(topf_key, [])
+        if rows:
+            s = sum(r.get('pnl_eur', 0) for r in rows)
+            writer.writerow({
+                'Verrechnungstopf': topf_readable.get(topf_key, topf_key),
+                'Stueck': str(len(rows)),
+                'G/V (EUR)': f"{s:.2f}",
+                'Anmerkung': f"{len(rows)} Positionen",
+                **{f: '' for f in fieldnames if f not in ('Verrechnungstopf', 'Stueck', 'G/V (EUR)', 'Anmerkung')},
+            })
+
+    st.download_button(
+        label=f"Trade-Details als CSV herunterladen ({len(trade_details)} Positionen)",
+        data=csv_buffer.getvalue(),
+        file_name=f"trade_details_{steuerjahr}.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
 
 
 # ── Plausibilitätscheck (wenn CSV hochgeladen) ─────────────────────────────

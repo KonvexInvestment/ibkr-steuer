@@ -625,7 +625,12 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         isin = t.get('isin', '').strip()
         if category == 'STK' and sub == 'ETF' and isin:
             cls = get_classification(isin)
-            topf = 'KAP-INV' if cls != 'no_invstg' else 'Topf2'
+            if cls == 'anlage_so':
+                topf = 'Anlage SO'
+            elif cls == 'no_invstg':
+                topf = 'Topf2'
+            else:
+                topf = 'KAP-INV'
         elif category == 'STK':
             topf = 'Topf1'
         else:
@@ -634,17 +639,28 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             'dateTime': t.get('dateTime', ''),
             'reportDate': t.get('reportDate', ''),
             'symbol': t.get('symbol', ''),
+            'description': t.get('description', ''),
             'isin': isin,
             'assetCategory': category,
             'subCategory': sub,
             'buySell': t.get('buySell', ''),
+            'openClose': t.get('openCloseIndicator', ''),
             'quantity': t.get('quantity', ''),
             'transactionType': t.get('transactionType', ''),
             'currency': t.get('currency', ''),
+            'tradePrice': safe_float(t.get('tradePrice'), 0),
+            'cost': safe_float(t.get('cost'), 0),
+            'proceeds': safe_float(t.get('proceeds'), 0),
             'fifoPnlRealized': pnl_raw,
             'fxRateToBase': fx_to_base,
             'pnl_eur': round(pnl_eur, 2),
             'topf': topf,
+            'strike': t.get('strike', ''),
+            'expiry': t.get('expiry', ''),
+            'putCall': t.get('putCall', ''),
+            'multiplier': t.get('multiplier', ''),
+            'underlyingSymbol': t.get('underlyingSymbol', ''),
+            'source': 'trades',
         })
 
     # Write debug CSV
@@ -824,6 +840,52 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         put_nosell_premium_eur = put_nosell_premium
         options_gain += stillhalter_premium_eur  # total premium always to Topf 2
         add_topf2_detail('Stillhalterprämien', stillhalter_premium_eur)
+
+        # Stillhalter adjustment rows for trade-level reporting
+        for det in stillhalter_details:
+            underlying = det['symbol'].split()[0] if det['symbol'] else ''
+            u_isin = symbol_to_isin.get(underlying, '')
+            pc_label = 'Call' if det['putCall'] == 'C' else 'Put'
+            # Determine source topf
+            if det['putCall'] == 'P' and underlying not in stk_sold_symbols:
+                source_topf = 'Topf2'  # put_nosell: premium only in Topf 2, no subtraction
+            elif u_isin and u_isin in etf_isins and get_classification(u_isin) != 'no_invstg':
+                source_topf = 'KAP-INV'
+            else:
+                source_topf = 'Topf1'
+            # Only show subtraction row if premium was actually subtracted from a pool
+            if source_topf != 'Topf2':
+                debug_rows.append({
+                    'dateTime': det['assignment_date'], 'reportDate': det['assignment_date'],
+                    'symbol': det['symbol'], 'description': f'Stillhalter-Korrektur ({pc_label})',
+                    'isin': u_isin, 'assetCategory': 'OPT', 'subCategory': '',
+                    'buySell': '', 'quantity': str(det['quantity']),
+                    'transactionType': 'Korrektur', 'currency': '',
+                    'tradePrice': 0, 'cost': 0, 'proceeds': 0,
+                    'fifoPnlRealized': 0, 'fxRateToBase': 0,
+                    'pnl_eur': round(-det['premium_eur'], 2),
+                    'topf': source_topf,
+                    'strike': det['strike'], 'expiry': det['expiry'],
+                    'putCall': det['putCall'], 'multiplier': '',
+                    'underlyingSymbol': underlying,
+                    'source': 'stillhalter_korrektur',
+                })
+            debug_rows.append({
+                'dateTime': det['assignment_date'], 'reportDate': det['assignment_date'],
+                'symbol': det['symbol'], 'description': f'Stillhalterprämie ({pc_label}, BMF Rn. {"26" if det["putCall"] == "C" else "33"})',
+                'isin': u_isin, 'assetCategory': 'OPT', 'subCategory': '',
+                'buySell': '', 'quantity': str(det['quantity']),
+                'transactionType': 'Stillhalter', 'currency': '',
+                'tradePrice': 0, 'cost': 0, 'proceeds': 0,
+                'fifoPnlRealized': 0, 'fxRateToBase': 0,
+                'pnl_eur': round(det['premium_eur'], 2),
+                'topf': 'Topf2',
+                'strike': det['strike'], 'expiry': det['expiry'],
+                'putCall': det['putCall'], 'multiplier': '',
+                'underlyingSymbol': underlying,
+                'source': 'stillhalter_korrektur',
+            })
+
         price_source = "tradePrice" if has_trade_price else "closePrice (Näherung)"
         parts = []
         if stk_premium > 0:
@@ -950,6 +1012,28 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         print(f"Stillhalter-Zufluss: {zufluss_count} offene Position(en), "
               f"{zufluss_premium_eur:,.2f} EUR Prämien → Topf 2 (§11 EStG).")
 
+        # Add zufluss premiums to trade details
+        for det in zufluss_details:
+            pc_label = 'Call' if det['putCall'] == 'C' else 'Put'
+            underlying = det['symbol'].split()[0] if det['symbol'] else ''
+            debug_rows.append({
+                'dateTime': det.get('sell_date', ''), 'reportDate': det.get('sell_date', ''),
+                'symbol': det['symbol'],
+                'description': f'Zufluss-Prämie ({pc_label}, §11 EStG, offene Position)',
+                'isin': '', 'assetCategory': 'OPT', 'subCategory': '',
+                'buySell': 'STO', 'openClose': 'O',
+                'quantity': str(det['quantity']),
+                'transactionType': 'Zufluss', 'currency': '',
+                'tradePrice': 0, 'cost': 0, 'proceeds': 0,
+                'fifoPnlRealized': 0, 'fxRateToBase': 0,
+                'pnl_eur': round(det['premium_eur'], 2),
+                'topf': 'Topf2',
+                'strike': det['strike'], 'expiry': det['expiry'],
+                'putCall': det['putCall'], 'multiplier': '',
+                'underlyingSymbol': underlying,
+                'source': 'zufluss',
+            })
+
     # --- Vorjahres-Stillhalter-Korrektur (Zuflussprinzip) ---
     # When --history XMLs are loaded, we find SELL-to-open from prior years that were
     # closed in the current tax year. IBKR's fifoPnlRealized on the close includes the
@@ -1051,6 +1135,27 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         add_topf2_detail('Stillhalterprämien', -prior_zufluss_correction_eur)
         print(f"Vorjahres-Stillhalter-Korrektur: {len(prior_zufluss_details)} Position(en), "
               f"-{prior_zufluss_correction_eur:,.2f} EUR (Prämie bereits im Verkaufsjahr versteuert).")
+
+        for det in prior_zufluss_details:
+            pc_label = 'Call' if det['putCall'] == 'C' else 'Put'
+            underlying = det['symbol'].split()[0] if det['symbol'] else ''
+            debug_rows.append({
+                'dateTime': det.get('sell_date', ''), 'reportDate': det.get('sell_date', ''),
+                'symbol': det['symbol'],
+                'description': f'Vorjahres-Zufluss-Korrektur ({pc_label}, Prämie {det["sell_year"]} bereits versteuert)',
+                'isin': '', 'assetCategory': 'OPT', 'subCategory': '',
+                'buySell': '', 'openClose': '',
+                'quantity': str(det['quantity']),
+                'transactionType': 'Zufluss-Korrektur', 'currency': '',
+                'tradePrice': 0, 'cost': 0, 'proceeds': 0,
+                'fifoPnlRealized': 0, 'fxRateToBase': 0,
+                'pnl_eur': round(-det['premium_eur'], 2),
+                'topf': 'Topf2',
+                'strike': det['strike'], 'expiry': det['expiry'],
+                'putCall': det['putCall'], 'multiplier': '',
+                'underlyingSymbol': underlying,
+                'source': 'zufluss_korrektur',
+            })
 
     # --- Fehlende Vorjahres-XMLs erkennen ---
     # BUY-close (Glattstellung/Verfall) ohne matching SELL-to-open = Vorjahr fehlt
@@ -1447,6 +1552,25 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                         options_loss += diff_eur
                     add_topf2_detail(TOPF2_CAT_LABELS.get(asset, asset), diff_eur)
                     added_from_summary += 1
+                    debug_rows.append({
+                        'dateTime': '', 'reportDate': '',
+                        'symbol': s_row.get('symbol', ''),
+                        'description': s_row.get('description', ''),
+                        'isin': isin,
+                        'assetCategory': asset,
+                        'subCategory': s_row.get('subCategory', ''),
+                        'buySell': '', 'quantity': '',
+                        'transactionType': '',
+                        'currency': base_currency,
+                        'tradePrice': 0, 'cost': 0, 'proceeds': 0,
+                        'fifoPnlRealized': diff_usd,
+                        'fxRateToBase': default_fallback_rate if base_currency != 'EUR' else 1.0,
+                        'pnl_eur': round(diff_eur, 2),
+                        'topf': 'Topf2',
+                        'strike': '', 'expiry': '', 'putCall': '', 'multiplier': '',
+                        'underlyingSymbol': s_row.get('symbol', '').split()[0] if s_row.get('symbol') else '',
+                        'source': 'pnl_summary',
+                    })
             else:
                 # For STK and OPT: skip if ISIN appears in trades.csv at all
                 # (even with PnL=0, e.g. assignment BookTrades — those are correctly
@@ -1465,13 +1589,15 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                     
                 gain_eur = summary_gain_usd * default_fallback_rate
                 loss_eur = summary_loss_usd * default_fallback_rate
-                
+                summary_topf = 'Topf2'  # default
+
                 if asset == 'STK':
                     sub_cat = s_row.get('subCategory', '')
                     if sub_cat == 'ETF':
                         cls = get_classification(isin)
                         if cls == 'anlage_so':
                             # Physical Gold-ETC → §23 EStG, not KAP
+                            summary_topf = 'Anlage SO'
                             info = get_etf_info(isin)
                             total_pnl = gain_eur + loss_eur
                             anlage_so_trades.append({
@@ -1485,6 +1611,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                                 'buySell': '',
                             })
                         elif cls not in ('no_invstg', None):
+                            summary_topf = 'KAP-INV'
                             etf_invstg_gain += gain_eur
                             etf_invstg_loss += loss_eur
                             if isin not in etf_by_isin:
@@ -1501,6 +1628,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                             add_topf2_detail('Crypto/Commodity ETPs', gain_eur)
                             add_topf2_detail('Crypto/Commodity ETPs', loss_eur)
                     else:
+                        summary_topf = 'Topf1'
                         stocks_gain += gain_eur
                         stocks_loss += loss_eur
                 elif asset in ['OPT', 'FUT', 'FOP', 'FSFOP']:
@@ -1509,6 +1637,26 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                     add_topf2_detail(TOPF2_CAT_LABELS.get(asset, asset), gain_eur)
                     add_topf2_detail(TOPF2_CAT_LABELS.get(asset, asset), loss_eur)
                 added_from_summary += 1
+                net_eur = gain_eur + loss_eur
+                debug_rows.append({
+                    'dateTime': '', 'reportDate': '',
+                    'symbol': s_row.get('symbol', ''),
+                    'description': s_row.get('description', ''),
+                    'isin': isin,
+                    'assetCategory': asset,
+                    'subCategory': s_row.get('subCategory', ''),
+                    'buySell': '', 'quantity': '',
+                    'transactionType': '',
+                    'currency': base_currency,
+                    'tradePrice': 0, 'cost': 0, 'proceeds': 0,
+                    'fifoPnlRealized': summary_gain_usd + summary_loss_usd,
+                    'fxRateToBase': default_fallback_rate if base_currency != 'EUR' else 1.0,
+                    'pnl_eur': round(net_eur, 2),
+                    'topf': summary_topf,
+                    'strike': '', 'expiry': '', 'putCall': '', 'multiplier': '',
+                    'underlyingSymbol': s_row.get('symbol', '').split()[0] if s_row.get('symbol') else '',
+                    'source': 'pnl_summary',
+                })
         
         if added_from_summary > 0:
             print(f"Added {added_from_summary} instruments from PnL Summary fallback (ISIN-based).")
@@ -1738,6 +1886,24 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             else:
                 topf = 'Topf2'
             fx_corr_by_topf[topf] += delta
+
+            fx_correction_details.append({
+                'symbol': lot.get('symbol', ''),
+                'description': lot.get('description', ''),
+                'isin': isin,
+                'assetCategory': category,
+                'subCategory': sub,
+                'openDateTime': open_dt,
+                'reportDate': (lot.get('reportDate') or lot.get('dateTime') or '')[:10],
+                'quantity': lot.get('quantity', ''),
+                'cost': cost_raw,
+                'currency': lot.get('currency', ''),
+                'fx_open': fx_open,
+                'fx_close': fx_close,
+                'delta_eur': round(delta, 2),
+                'topf': topf,
+                'underlyingSymbol': lot.get('underlyingSymbol', ''),
+            })
 
             # Track gain/loss shift per lot for consistent Zeilen 20/22/23
             pnl_raw = safe_float(lot.get('fifoPnlRealized'), 0)
@@ -1989,10 +2155,13 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
     
     # Zeile 22 - "Verluste ohne Aktien" (absolute value, positive number for form)
     zeile_22_other_losses = abs(options_loss)
-    
+
     # Zeile 23 - "Aktienverluste" (absolute value, positive number for form)
     zeile_23_stock_losses = abs(stocks_loss)
-    
+
+    # Sort trade details chronologically for reporting
+    debug_rows.sort(key=lambda r: r.get('dateTime', '') or r.get('reportDate', '') or 'zzzz')
+
     report_data = {
         "zeile_19_netto_eur": zeile_19_netto,
         "zeile_20_stock_gains_eur": zeile_20_stock_gains,
@@ -2030,6 +2199,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         # Per-lot FX correction (Tageskurs-Methode)
         "fx_correction_total": fx_correction_total,
         "fx_correction_by_topf": fx_corr_by_topf,
+        "fx_correction_details": fx_correction_details,
         "fx_corr_gain_adj": fx_corr_gain_adj,
         "fx_corr_loss_adj": fx_corr_loss_adj,
         # InvStG / Anlage KAP-INV
@@ -2048,6 +2218,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         },
         # Anlage SO (§23 EStG — physische Gold-ETCs)
         "anlage_so": anlage_so_result,
+        # Trade-level details for FA reporting (Issue #17)
+        "trade_details": debug_rows,
         # Plausibility Metadata
         "has_trade_price": has_trade_price,
         "audit": {

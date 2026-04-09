@@ -397,6 +397,11 @@ def merge_report_data(reports):
                 merged_dict[k] = merged_dict.get(k, 0) + v
         merged[dict_field] = merged_dict
 
+    # FX correction details (list concat)
+    merged['fx_correction_details'] = []
+    for r in reports:
+        merged['fx_correction_details'].extend(r.get('fx_correction_details', []))
+
     # csv_category_totals (nested dict)
     merged_csv = {}
     for r in reports:
@@ -501,6 +506,12 @@ def merge_report_data(reports):
         for year, val in a.get('cross_year_by_year', {}).items():
             merged_audit['cross_year_by_year'][year] = merged_audit['cross_year_by_year'].get(year, 0) + val
     merged['audit'] = merged_audit
+
+    # Trade details merge (concatenate lists from all accounts)
+    merged['trade_details'] = []
+    for r in reports:
+        merged['trade_details'].extend(r.get('trade_details', []))
+    merged['trade_details'].sort(key=lambda r: r.get('dateTime', '') or r.get('reportDate', '') or 'zzzz')
 
     return merged
 
@@ -1230,6 +1241,329 @@ if has_so_data:
                 qty = abs(lot.get('quantity', 0))
                 lot_table += f"| {lot['ticker']} | {lot.get('open_date', '?')} | {lot.get('close_date', '?')} | {qty:.0f} | {fmt_de(lot['pnl_eur'])} | {status} |\n"
             st.markdown(lot_table)
+
+
+# ── Einzelnachweise · Trade-Level-Reporting ──────────────────────────────────
+trade_details = list(d.get('trade_details', []))  # copy to avoid mutating report_data
+
+# Inject per-lot FX corrections when Tageskurs is active
+if trade_details and tageskurs_aktiv:
+    for lot in d.get('fx_correction_details', []):
+        if abs(lot.get('delta_eur', 0)) < 0.005:
+            continue
+        underlying = (lot.get('underlyingSymbol', '') or lot.get('symbol', '') or '').split()[0]
+        open_dt = (lot.get('openDateTime', '') or '')[:10]
+        close_dt = lot.get('reportDate', '')
+        trade_details.append({
+            'dateTime': close_dt, 'reportDate': close_dt,
+            'symbol': lot.get('symbol', ''),
+            'description': f'Tageskurs-Korrektur (Kauf {open_dt}, Kurs {lot["fx_open"]:.4f} → {lot["fx_close"]:.4f})',
+            'isin': lot.get('isin', ''),
+            'assetCategory': lot.get('assetCategory', ''),
+            'subCategory': lot.get('subCategory', ''),
+            'buySell': '', 'openClose': '',
+            'quantity': lot.get('quantity', ''),
+            'transactionType': 'FX-Korrektur', 'currency': lot.get('currency', ''),
+            'tradePrice': 0, 'cost': lot.get('cost', 0), 'proceeds': 0,
+            'fifoPnlRealized': 0, 'fxRateToBase': 0,
+            'pnl_eur': lot['delta_eur'],
+            'topf': lot.get('topf', 'Topf2'),
+            'strike': '', 'expiry': '', 'putCall': '', 'multiplier': '',
+            'underlyingSymbol': underlying,
+            'source': 'tageskurs_korrektur',
+        })
+    trade_details.sort(key=lambda r: r.get('dateTime', '') or r.get('reportDate', '') or 'zzzz')
+
+if trade_details:
+    section_title('Einzelnachweise - Trade-Details (Excel)')
+    st.markdown('<div style="margin-top:-18px;margin-bottom:12px"><span style="background:linear-gradient(135deg,#f59e0b,#ef4444);color:#fff;padding:5px 16px;border-radius:6px;font-size:0.85em;font-weight:700;letter-spacing:1px;box-shadow:0 2px 8px rgba(239,68,68,0.3)">NEUE FUNKTION &middot; BETA</span></div>', unsafe_allow_html=True)
+
+    from collections import defaultdict
+
+    topf_readable = {
+        'Topf1': 'Topf 1 - Aktien (§20 Abs. 2 Nr. 1 EStG)',
+        'Topf2': 'Topf 2 - Sonstiges (Termingeschäfte, Stillhalter, FX)',
+        'KAP-INV': 'Anlage KAP-INV (InvStG)',
+        'Anlage SO': 'Anlage SO (§23 EStG)',
+    }
+    cat_labels = {
+        'STK': 'Aktie', 'OPT': 'Option', 'FUT': 'Future',
+        'FOP': 'Futures-Option', 'FSFOP': 'Flex-Option',
+        'BILL': 'T-Bill', 'BOND': 'Anleihe',
+    }
+
+    trades_by_topf = defaultdict(list)
+    for row in trade_details:
+        trades_by_topf[row.get('topf', 'Topf2')].append(row)
+
+    # Kurzübersicht
+    n_trades = sum(1 for r in trade_details if r.get('source') == 'trades')
+    n_korr = len(trade_details) - n_trades
+    n_underlyings = len(set(
+        (r.get('underlyingSymbol', '') or r.get('symbol', '') or '?').split()[0]
+        for r in trade_details if r.get('source') == 'trades'
+    ))
+    header = f"**{n_trades} Trades, {n_underlyings} Wertpapiere"
+    if n_korr > 0:
+        header += f" (+ {n_korr} Korrekturen/Zuflüsse)"
+    header += "**"
+    summary_lines = [header]
+    for topf_key in ['Topf1', 'Topf2', 'KAP-INV', 'Anlage SO']:
+        rows = trades_by_topf.get(topf_key, [])
+        if rows:
+            s = sum(r.get('pnl_eur', 0) for r in rows)
+            label = topf_readable.get(topf_key, topf_key).split(' - ')[0]
+            summary_lines.append(f"{label}: {fmt_de(s)} EUR")
+    st.markdown(" | ".join(summary_lines))
+    st.caption("Enthält Trades, Optionsverläufe, Stillhalter-Korrekturen und Zuflüsse. Dividenden, Zinsen und Quellensteuer sind nicht enthalten (siehe IBKR-Kontoauszug).")
+
+    def _format_instrument(row):
+        sym = row.get('symbol', '') or ''
+        desc = row.get('description', '') or ''
+        pc = row.get('putCall', '') or ''
+        strike = row.get('strike', '') or ''
+        expiry = row.get('expiry', '') or ''
+        if pc and strike and expiry:
+            pc_label = 'Call' if pc == 'C' else 'Put'
+            if len(expiry) == 8:
+                exp_fmt = f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:]}"
+            else:
+                exp_fmt = expiry[:10]
+            return f"{sym} ({pc_label} {strike} exp. {exp_fmt})"
+        if desc and sym:
+            return f"{sym} ({desc})"
+        return sym or desc or ''
+
+    def _get_group_key(row):
+        us = (row.get('underlyingSymbol', '') or '').strip()
+        if us:
+            return us.split()[0]
+        sym = (row.get('symbol', '') or '').strip()
+        return sym.split()[0] if sym else '?'
+
+    def _build_excel(trade_details, trades_by_topf):
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+        import io
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = f"Trade-Details {steuerjahr}"
+
+        # Styles
+        hdr_font = Font(bold=True, color="FFFFFF", size=11)
+        hdr_fill = PatternFill("solid", fgColor="1e3a5f")
+        grp_font = Font(bold=True, size=10)
+        grp_fill = PatternFill("solid", fgColor="d6e4f0")
+        gain_font = Font(color="006100", size=9)
+        gain_fill = PatternFill("solid", fgColor="e2efda")
+        loss_font = Font(color="9c0006", size=9)
+        loss_fill = PatternFill("solid", fgColor="fce4ec")
+        korr_font = Font(italic=True, size=9)
+        korr_fill = PatternFill("solid", fgColor="fff9c4")
+        sub_font = Font(bold=True, size=9)
+        sub_fill = PatternFill("solid", fgColor="f2f2f2")
+        total_font = Font(bold=True, size=10, color="FFFFFF")
+        total_fill = PatternFill("solid", fgColor="4a4a4a")
+        normal_font = Font(size=9)
+        thin_border = Border(bottom=Side(style='thin', color='cccccc'))
+        num_fmt_eur = '#.##0,00'
+        num_fmt_4d = '#.##0,0000'
+
+        cols = ['Datum', 'Handelsdatum', 'Wertpapier', 'ISIN', 'Kategorie',
+                'K/V', 'Stk.', 'Kurs', 'Kostenbasis', 'Erlöse',
+                'G/V (Orig.)', 'Währung', 'Wechselkurs', 'G/V (EUR)', 'Anmerkung']
+        col_widths = [12, 12, 42, 15, 10, 6, 8, 11, 13, 13, 13, 6, 11, 14, 40]
+        eur_col = 14  # 1-based: column N = G/V (EUR)
+
+        for i, w in enumerate(col_widths, 1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+
+        row_num = 1
+        grand_total = 0.0
+
+        for topf_key in ['Topf1', 'Topf2', 'KAP-INV', 'Anlage SO']:
+            topf_rows = trades_by_topf.get(topf_key, [])
+            if not topf_rows:
+                continue
+
+            # Topf Header
+            ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=len(cols))
+            cell = ws.cell(row=row_num, column=1, value=topf_readable.get(topf_key, topf_key))
+            cell.font = hdr_font
+            cell.fill = hdr_fill
+            cell.alignment = Alignment(horizontal='left')
+            row_num += 1
+
+            # Column headers
+            for ci, col_name in enumerate(cols, 1):
+                cell = ws.cell(row=row_num, column=ci, value=col_name)
+                cell.font = Font(bold=True, size=9)
+                cell.fill = PatternFill("solid", fgColor="e8e8e8")
+                cell.border = thin_border
+            row_num += 1
+
+            # Group by underlying
+            groups = defaultdict(list)
+            for r in topf_rows:
+                groups[_get_group_key(r)].append(r)
+
+            topf_total = 0.0
+            for grp_key in sorted(groups.keys()):
+                grp_rows = groups[grp_key]
+                grp_rows.sort(key=lambda r: r.get('dateTime', '') or r.get('reportDate', '') or '')
+
+                # Find description for group header
+                grp_desc = ''
+                grp_isin = ''
+                for r in grp_rows:
+                    if r.get('description') and r.get('source') != 'stillhalter_korrektur':
+                        grp_desc = r['description']
+                    if r.get('isin'):
+                        grp_isin = r['isin']
+                    if grp_desc and grp_isin:
+                        break
+                grp_label = f"{grp_key}"
+                if grp_desc:
+                    grp_label += f" - {grp_desc}"
+                if grp_isin:
+                    grp_label += f" ({grp_isin})"
+
+                # Group header row
+                ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=len(cols))
+                cell = ws.cell(row=row_num, column=1, value=grp_label)
+                cell.font = grp_font
+                cell.fill = grp_fill
+                row_num += 1
+
+                grp_total = 0.0
+                for r in grp_rows:
+                    source = r.get('source', '')
+                    pnl_eur = r.get('pnl_eur', 0)
+                    pnl_orig = r.get('fifoPnlRealized', 0)
+                    fx = r.get('fxRateToBase', 0)
+                    cost = r.get('cost', 0)
+                    proceeds = r.get('proceeds', 0)
+                    price = r.get('tradePrice', 0)
+                    mult = r.get('multiplier', '')
+
+                    anmerkung = ''
+                    if source == 'pnl_summary':
+                        anmerkung = 'Aus IBKR PnL-Summary'
+                    elif source == 'stillhalter_korrektur':
+                        anmerkung = r.get('description', 'Korrektur')
+                    elif source == 'zufluss':
+                        anmerkung = r.get('description', 'Zufluss §11 EStG')
+                    elif source == 'zufluss_korrektur':
+                        anmerkung = r.get('description', 'Vorjahres-Korrektur')
+                    elif source == 'tageskurs_korrektur':
+                        anmerkung = r.get('description', 'Tageskurs §20 Abs. 4')
+
+                    # Readable open/close label
+                    bs = r.get('buySell', '')
+                    oc = r.get('openClose', '')
+                    if bs == 'SELL' and oc == 'O':
+                        bs_label = 'STO'
+                    elif bs == 'BUY' and oc == 'C':
+                        bs_label = 'BTC'
+                    elif bs == 'BUY' and oc == 'O':
+                        bs_label = 'BTO'
+                    elif bs == 'SELL' and oc == 'C':
+                        bs_label = 'STC'
+                    else:
+                        bs_label = bs
+
+                    values = [
+                        (r.get('reportDate', '') or '')[:10],
+                        (r.get('dateTime', '') or '')[:10],
+                        _format_instrument(r),
+                        r.get('isin', ''),
+                        cat_labels.get(r.get('assetCategory', ''), r.get('assetCategory', '')),
+                        bs_label,
+                        r.get('quantity', ''),
+                        price if price else None,
+                        cost if cost else None,
+                        proceeds if proceeds else None,
+                        pnl_orig if pnl_orig else None,
+                        r.get('currency', ''),
+                        fx if fx else None,
+                        pnl_eur,
+                        anmerkung,
+                    ]
+
+                    for ci, val in enumerate(values, 1):
+                        cell = ws.cell(row=row_num, column=ci, value=val)
+                        cell.font = normal_font
+                        # Number formats
+                        if ci in (8, 9, 10, 11, 14) and isinstance(val, (int, float)):
+                            cell.number_format = num_fmt_eur
+                        elif ci == 13 and isinstance(val, (int, float)):
+                            cell.number_format = num_fmt_4d
+
+                    # Row coloring
+                    if source in ('stillhalter_korrektur', 'zufluss', 'zufluss_korrektur', 'tageskurs_korrektur'):
+                        for ci in range(1, len(cols) + 1):
+                            ws.cell(row=row_num, column=ci).fill = korr_fill
+                            ws.cell(row=row_num, column=ci).font = korr_font
+                    elif pnl_eur > 0.005:
+                        for ci in range(1, len(cols) + 1):
+                            ws.cell(row=row_num, column=ci).fill = gain_fill
+                            ws.cell(row=row_num, column=ci).font = gain_font
+                    elif pnl_eur < -0.005:
+                        for ci in range(1, len(cols) + 1):
+                            ws.cell(row=row_num, column=ci).fill = loss_fill
+                            ws.cell(row=row_num, column=ci).font = loss_font
+
+                    grp_total += pnl_eur
+                    row_num += 1
+
+                # Group subtotal
+                ws.cell(row=row_num, column=1, value=f"Zwischensumme {grp_key}")
+                for ci in range(1, len(cols) + 1):
+                    ws.cell(row=row_num, column=ci).font = sub_font
+                    ws.cell(row=row_num, column=ci).fill = sub_fill
+                    ws.cell(row=row_num, column=ci).border = thin_border
+                cell = ws.cell(row=row_num, column=eur_col, value=grp_total)
+                cell.number_format = num_fmt_eur
+                cell.font = sub_font
+                cell.fill = sub_fill
+                topf_total += grp_total
+                row_num += 1
+
+            # Topf total
+            topf_label = topf_readable.get(topf_key, topf_key).split(' - ')[0]
+            ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=eur_col - 1)
+            cell = ws.cell(row=row_num, column=1, value=f"SUMME {topf_label}")
+            cell.font = total_font
+            cell.fill = total_fill
+            cell.alignment = Alignment(horizontal='right')
+            for ci in range(1, len(cols) + 1):
+                ws.cell(row=row_num, column=ci).fill = total_fill
+            cell = ws.cell(row=row_num, column=eur_col, value=topf_total)
+            cell.number_format = num_fmt_eur
+            cell.font = total_font
+            cell.fill = total_fill
+            grand_total += topf_total
+            row_num += 2  # blank row between topf sections
+
+        # Freeze header: first 2 rows are topf header + column headers,
+        # but since they repeat, freeze after row 1
+        ws.freeze_panes = 'A2'
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    xlsx_data = _build_excel(trade_details, trades_by_topf)
+
+    st.download_button(
+        label=f"Trade-Details als Excel herunterladen ({len(trade_details)} Positionen)",
+        data=xlsx_data,
+        file_name=f"trade_details_{steuerjahr}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
 
 
 # ── Plausibilitätscheck (wenn CSV hochgeladen) ─────────────────────────────
