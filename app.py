@@ -1740,7 +1740,7 @@ Da Interactive Brokers ein **ausländischer Broker ohne inländischen Steuerabzu
 - **Anlage KAP** - Zeilen 9/14 (Termingeschäfte) existieren nur in der Sektion mit inländischem Steuerabzug und sind für IBKR nicht relevant
 """)
 
-with st.expander("Berechnungsdetails — So werden die XML-Daten verarbeitet"):
+with st.expander("Berechnungsdetails - So werden die XML-Daten verarbeitet"):
     st.markdown(f"""
 ### Schritt 1: XML-Extraktion
 
@@ -1748,10 +1748,10 @@ Die IBKR Flex Query XML wird in einzelne CSV-Dateien zerlegt. Jede XML-Sektion e
 
 | XML-Sektion | Inhalt | Filter |
 |---|---|---|
-| `<Trades>` | Alle Trades — Felder: `assetCategory`, `fifoPnlRealized`, `fxRateToBase`, `reportDate`, `buySell`, `transactionType` | `EXECUTION` → trades.csv, `CLOSED_LOT` → closed_lots.csv (für Tageskurs-Korrektur) |
-| `<StmtFunds>` | Dividenden, Zinsen, Steuern, Gebühren — Felder: `activityCode`, `amount`, `fxRateToBase`, `reportDate`, `transactionID` | Duplikate per `transactionID` entfernt |
-| `<FIFOPerformanceSummaryInBase>` | Aggregierter PnL pro Instrument — Felder: `assetCategory`, `isin`, `totalRealizedPnl` | Fallback für fehlende Trades (z.B. T-Bill Maturity) |
-| `<FxTransactions>` | FX-Gewinne/-Verluste — Felder: `fxCurrency`, `realizedPL`, `reportDate` | Nur `levelOfDetail=TRANSACTION` |
+| `<Trades>` | Alle Trades. Felder: `assetCategory`, `fifoPnlRealized`, `fxRateToBase`, `reportDate`, `buySell`, `transactionType` | `EXECUTION` → trades.csv, `CLOSED_LOT` → closed_lots.csv (für Tageskurs-Korrektur) |
+| `<StmtFunds>` | Dividenden, Zinsen, Steuern, Gebühren. Felder: `activityCode`, `amount`, `fxRateToBase`, `reportDate`, `transactionID` | Duplikate per `transactionID` entfernt |
+| `<FIFOPerformanceSummaryInBase>` | Aggregierter PnL pro Instrument. Felder: `assetCategory`, `isin`, `totalRealizedPnl` | Fallback für fehlende Trades (z.B. T-Bill Maturity) |
+| `<FxTransactions>` | FX-Gewinne/-Verluste. Felder: `fxCurrency`, `realizedPL`, `reportDate` | Nur `levelOfDetail=TRANSACTION` |
 | `<AccountInformation>` | Basiswährung (`currency`), Kontotyp | Einzelner Eintrag |
 | `<FlexStatement>` | Berichtszeitraum → Steuerjahr aus `toDate` | Automatisch erkannt |
 
@@ -1766,7 +1766,7 @@ IBKR liefert in einigen Sektionen Duplikate:
 | Quelle | Duplikat-Ursache | Deduplizierungs-Schlüssel |
 |---|---|---|
 | **Trades** | Erweiterte Flex Queries enthalten ORDER + EXECUTION für denselben Trade | `tradeID` (wenn vorhanden) oder `(dateTime, isin, buySell, quantity, closePrice, fifoPnlRealized)` |
-| **StmtFunds** | IBKR bucht EUR-Transaktionen doppelt (Original-Währung + BaseCurrency-Ansicht) | `transactionID` — erster Eintrag hat korrekten `fxRateToBase`, Duplikat hat `fxRateToBase=1` |
+| **StmtFunds** | IBKR bucht EUR-Transaktionen doppelt (Original-Währung + BaseCurrency-Ansicht) | `transactionID`. Erster Eintrag hat korrekten `fxRateToBase`, Duplikat hat `fxRateToBase=1` |
 
 ---
 
@@ -1781,13 +1781,13 @@ Tageskurs-Methode: PnL (EUR) = Erlös × FX_Verkaufstag − AK × FX_Kauftag
 
 **IBKR-Methode (Standard):** Rechnet den Netto-PnL komplett zum Schlusskurs um.
 
-**Tageskurs-Methode (§20 Abs. 4 S. 1 EStG, optional):** *"Bei nicht in Euro getätigten Geschäften sind die Einnahmen im Zeitpunkt der Veräußerung und die Anschaffungskosten im Zeitpunkt der Anschaffung in Euro umzurechnen."* — Verwendet CLOSED_LOT Daten aus Extended Flex Queries. Futures werden ausgeschlossen (Kostenbasis = Notional, kein realer Cashflow). Korrektur: `|AK| × (FX_Schlusskurs − FX_Kaufkurs)` pro Lot.
+**Tageskurs-Methode (§20 Abs. 4 S. 1 EStG, optional):** *"Bei nicht in Euro getätigten Geschäften sind die Einnahmen im Zeitpunkt der Veräußerung und die Anschaffungskosten im Zeitpunkt der Anschaffung in Euro umzurechnen."* Verwendet CLOSED_LOT Daten aus Extended Flex Queries. Futures werden ausgeschlossen (Kostenbasis = Notional, kein realer Cashflow). Korrektur: `|AK| × (FX_Schlusskurs - FX_Kaufkurs)` pro Lot. IBKR vergibt pro Tag zwei `fxRateToBase`-Kurse: einen Intraday-Kurs (ExchTrades) und einen Settlement-Kurs (BookTrades, 16:20). Für den Kaufkurs wird der ExchTrade-Kurs bevorzugt; an reinen Verfall-/Andienungstagen der BookTrade-Kurs als Fallback.
 
 | Feld | Bedeutung |
 |---|---|
 | `fifoPnlRealized` | IBKR's FIFO-basierter realisierter Gewinn/Verlust in **Trade-Währung** |
 | `fxRateToBase` | Umrechnungskurs Trade-Währung → Basiswährung (EUR) am **Schlusstag** |
-| `reportDate` | Buchungsdatum (bestimmt das Steuerjahr — Zuflussprinzip) |
+| `reportDate` | Buchungsdatum (bestimmt das Steuerjahr, Zuflussprinzip) |
 | `assetCategory` | Topf-Zuordnung: `STK` → Topf 1 oder KAP-INV, alles andere → Topf 2 |
 | `subCategory` | ETF-Erkennung: `ETF` → InvStG-Prüfung, `COMMON` → Einzelaktie |
 
@@ -1798,11 +1798,11 @@ Tageskurs-Methode: PnL (EUR) = Erlös × FX_Verkaufstag − AK × FX_Kauftag
 | `STK` | `COMMON` / `REIT` / `ADR` | Aktienveräußerung (§20 Abs. 2 Nr. 1) | **Topf 1** |
 | `STK` | `ETF` (InvStG-Fonds) | Investmentfonds (InvStG §2) | **KAP-INV** (optional) |
 | `STK` | `ETF` (no\_invstg, z.B. IBIT) | Wie Einzelaktie | **Topf 1** |
-| `OPT` | — | Termingeschäft — Option (§20 Abs. 2 Nr. 3) | Topf 2 |
-| `FUT` | — | Termingeschäft — Future (§20 Abs. 2 Nr. 3) | Topf 2 |
-| `FOP` / `FSFOP` | — | Termingeschäft — Future-Option (§20 Abs. 2 Nr. 3) | Topf 2 |
-| `BILL` | — | Kapitalforderung — T-Bill (§20 Abs. 2 Nr. 7) | Topf 2 |
-| `BOND` | — | Kapitalforderung — Anleihe (§20 Abs. 2 Nr. 7) | Topf 2 |
+| `OPT` | | Termingeschäft, Option (§20 Abs. 2 Nr. 3) | Topf 2 |
+| `FUT` | | Termingeschäft, Future (§20 Abs. 2 Nr. 3) | Topf 2 |
+| `FOP` / `FSFOP` | | Termingeschäft, Future-Option (§20 Abs. 2 Nr. 3) | Topf 2 |
+| `BILL` | | Kapitalforderung, T-Bill (§20 Abs. 2 Nr. 7) | Topf 2 |
+| `BOND` | | Kapitalforderung, Anleihe (§20 Abs. 2 Nr. 7) | Topf 2 |
 
 **InvStG-Klassifizierung (optional):** ETFs mit `subCategory="ETF"` werden gegen eine Lookup-Tabelle (139 US-ETFs) geprüft. Aktienfonds (≥51% Aktienquote) erhalten 30% Teilfreistellung, sonstige Fonds 0%. Crypto/Commodity-ETPs (IBIT, GLD etc.) bleiben in Topf 1. Optionen auf ETFs bleiben in Topf 2.
 
@@ -1818,7 +1818,7 @@ Bei Optionsassignments bündelt IBKR die Prämie in den Aktien-PnL. Das BMF verl
 - `assetCategory` ∈ (OPT, FOP, FSFOP)
 - `transactionType` = `BookTrade` (keine Börsentransaktion, sondern Ausbuchung)
 - `buySell` = `BUY` (Short-Position wird geschlossen)
-- `putCall` ∈ (C, P) — sowohl Calls als auch Puts
+- `putCall` ∈ (C, P), sowohl Calls als auch Puts
 - `fifoPnlRealized` ≈ 0 (IBKR zeigt keinen PnL auf der Option)
 
 **Original-Verkauf finden:**
@@ -1837,7 +1837,7 @@ Prämie (EUR) = Prämie × fxRateToBase (gewichtet über Teilfüllungen)
 
 **Cross-Year:** Wenn die Option in einem Vorjahr verkauft wurde und im Steuerjahr assigned wird, gehört die Prämie ins Vorjahr (Zuflussprinzip). Vorjahres-XMLs müssen hochgeladen werden, damit der Original-SELL gefunden wird.
 
-**Cross-Year Put-Korrektur:** Wenn Aktien aus Put-Assignments früherer Jahre im Steuerjahr verkauft werden, wird IBKR's PnL korrigiert — die Prämie war bereits im Assignment-Jahr versteuert und darf die Anschaffungskosten nicht mindern. FIFO-Lot-Matching per Symbol.
+**Cross-Year Put-Korrektur:** Wenn Aktien aus Put-Assignments früherer Jahre im Steuerjahr verkauft werden, wird IBKR's PnL korrigiert. Die Prämie war bereits im Assignment-Jahr versteuert und darf die Anschaffungskosten nicht mindern. FIFO-Lot-Matching per Symbol.
 
 ---
 
@@ -1857,7 +1857,7 @@ Aus `statement_of_funds.csv` werden Cash-Positionen nach `activityCode` zugeordn
 
 **Währungsumrechnung (EUR-Basis):** `amount` ist bereits in EUR (BaseCurrency-Ansicht). Keine weitere Umrechnung nötig.
 
-**Jahresfilter:** `reportDate.year == Steuerjahr` — Steuer-Rückforderungen (Tax Reclaims) aus Vorjahren, die im Steuerjahr gebucht werden, sind korrekt dem Buchungsjahr zugeordnet.
+**Jahresfilter:** `reportDate.year == Steuerjahr`. Steuer-Rückforderungen (Tax Reclaims) aus Vorjahren, die im Steuerjahr gebucht werden, sind korrekt dem Buchungsjahr zugeordnet.
 
 ---
 
