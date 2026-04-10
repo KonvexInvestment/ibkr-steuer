@@ -994,6 +994,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                 sell_date = sd
 
         symbol = sells[0].get('symbol') or sells[0].get('description') or f"{key[1]} {key[2]} {key[3]}"
+        currency = sells[0].get('currency', '')
+        avg_price = total_premium_raw / (total_qty * mult) if (total_qty and mult) else 0
         zufluss_details.append({
             'symbol': symbol,
             'strike': key[1],
@@ -1001,6 +1003,11 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             'putCall': key[3],
             'quantity': unclosed_qty,
             'premium_eur': premium_eur,
+            'premium_raw': premium_raw,
+            'fx_to_base': fx_to_base,
+            'currency': currency,
+            'multiplier': mult,
+            'avg_price': avg_price,
             'sell_date': str(sell_date) if sell_date else '',
             'sell_year': sell_date.year if sell_date else tax_year,
             'type': 'sell_to_open',
@@ -1023,13 +1030,18 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                 'isin': '', 'assetCategory': 'OPT', 'subCategory': '',
                 'buySell': 'STO', 'openClose': 'O',
                 'quantity': str(det['quantity']),
-                'transactionType': 'Zufluss', 'currency': '',
-                'tradePrice': 0, 'cost': 0, 'proceeds': 0,
-                'fifoPnlRealized': 0, 'fxRateToBase': 0,
+                'transactionType': 'Zufluss',
+                'currency': det.get('currency', ''),
+                'tradePrice': det.get('avg_price', 0),
+                'cost': 0,
+                'proceeds': det.get('premium_raw', 0),
+                'fifoPnlRealized': det.get('premium_raw', 0),
+                'fxRateToBase': det.get('fx_to_base', 0),
                 'pnl_eur': round(det['premium_eur'], 2),
                 'topf': 'Topf2',
                 'strike': det['strike'], 'expiry': det['expiry'],
-                'putCall': det['putCall'], 'multiplier': '',
+                'putCall': det['putCall'],
+                'multiplier': str(det.get('multiplier', '')),
                 'underlyingSymbol': underlying,
                 'source': 'zufluss',
             })
@@ -1117,6 +1129,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
 
             prior_zufluss_correction_eur += correction_eur
             symbol = prior_sells[0].get('symbol') or prior_sells[0].get('description') or f"{key[1]} {key[2]} {key[3]}"
+            currency = prior_sells[0].get('currency', '')
+            avg_price = total_premium_raw / (total_qty * mult) if (total_qty and mult) else 0
             prior_zufluss_details.append({
                 'symbol': symbol,
                 'strike': key[1],
@@ -1124,6 +1138,11 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                 'putCall': key[3],
                 'quantity': matched_qty,
                 'premium_eur': correction_eur,
+                'premium_raw': premium_raw,
+                'fx_to_base': fx_to_base,
+                'currency': currency,
+                'multiplier': mult,
+                'avg_price': avg_price,
                 'sell_date': str(sell_date) if sell_date else '',
                 'sell_year': sell_date.year if sell_date else tax_year - 1,
                 'type': 'prior_year_correction',
@@ -1146,13 +1165,18 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                 'isin': '', 'assetCategory': 'OPT', 'subCategory': '',
                 'buySell': '', 'openClose': '',
                 'quantity': str(det['quantity']),
-                'transactionType': 'Zufluss-Korrektur', 'currency': '',
-                'tradePrice': 0, 'cost': 0, 'proceeds': 0,
-                'fifoPnlRealized': 0, 'fxRateToBase': 0,
+                'transactionType': 'Zufluss-Korrektur',
+                'currency': det.get('currency', ''),
+                'tradePrice': det.get('avg_price', 0),
+                'cost': 0,
+                'proceeds': -det.get('premium_raw', 0),
+                'fifoPnlRealized': -det.get('premium_raw', 0),
+                'fxRateToBase': det.get('fx_to_base', 0),
                 'pnl_eur': round(-det['premium_eur'], 2),
                 'topf': 'Topf2',
                 'strike': det['strike'], 'expiry': det['expiry'],
-                'putCall': det['putCall'], 'multiplier': '',
+                'putCall': det['putCall'],
+                'multiplier': str(det.get('multiplier', '')),
                 'underlyingSymbol': underlying,
                 'source': 'zufluss_korrektur',
             })
