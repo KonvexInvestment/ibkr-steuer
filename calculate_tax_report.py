@@ -737,14 +737,17 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         # Weighted average premium across all fills
         # Use tradePrice (actual fill price) if available, fall back to closePrice
         total_premium_raw = 0.0
+        total_commission = 0.0
         total_orig_qty = 0
         mult = int(safe_float(originals[0].get('multiplier'), 100))
 
         for orig in originals:
             price = safe_float(orig.get('tradePrice')) or safe_float(orig.get('closePrice'))
             qty = abs(int(safe_float(orig.get('quantity'))))
+            comm = safe_float(orig.get('ibCommission'), 0)
             if qty > 0 and price > 0:
                 total_premium_raw += price * mult * qty
+                total_commission += comm
                 total_orig_qty += qty
 
         if total_orig_qty == 0 or total_premium_raw == 0:
@@ -752,6 +755,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
 
         # Scale to assignment quantity (may be less than total originally sold)
         premium_raw = total_premium_raw * a_qty / total_orig_qty
+        commission_raw = total_commission * a_qty / total_orig_qty
 
         # Convert to EUR using the original trade's FX rate
         # Use weighted average rate from originals
@@ -759,12 +763,15 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                          for o in originals if safe_float(o.get('quantity')) != 0)
         fx_to_base = fx_weighted / total_orig_qty if total_orig_qty else 1.0
 
+        # Net premium = gross - commissions (ibCommission is negative for fees, positive for rebates)
+        net_premium_raw = premium_raw + commission_raw
+
         if base_currency == 'EUR':
-            premium_eur = premium_raw * fx_to_base
+            premium_eur = net_premium_raw * fx_to_base
         else:
             date = parse_date(a.get('dateTime') or a.get('tradeDate'))
             rate_eur = get_rate_for_date(date, usd_to_eur_rates)
-            premium_eur = premium_raw * fx_to_base * rate_eur
+            premium_eur = net_premium_raw * fx_to_base * rate_eur
 
         stillhalter_premium_eur += premium_eur
         stillhalter_count += 1
@@ -783,6 +790,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             'putCall': pc,
             'quantity': a_qty,
             'premium_eur': premium_eur,
+            'premium_raw': net_premium_raw,
+            'commission_raw': commission_raw,
             'assignment_date': str(assignment_date) if assignment_date else '',
             'orig_sell_date': str(orig_sell_date) if orig_sell_date else '',
             'orig_sell_year': orig_sell_date.year if orig_sell_date else tax_year,
@@ -958,6 +967,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
 
         # Weighted average premium across all SELL fills
         total_premium_raw = 0.0
+        total_commission = 0.0
         total_qty = 0
         mult = int(safe_float(sells[0].get('multiplier'), 100))
         fx_weighted = 0.0
@@ -966,24 +976,28 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             price = safe_float(s.get('tradePrice')) or safe_float(s.get('closePrice'))
             qty = abs(int(safe_float(s.get('quantity'))))
             fx = safe_float(s.get('fxRateToBase'), 1.0)
+            comm = safe_float(s.get('ibCommission'), 0)
             if qty > 0 and price > 0:
                 total_premium_raw += price * mult * qty
+                total_commission += comm
                 fx_weighted += fx * qty
                 total_qty += qty
 
         if total_qty == 0 or total_premium_raw == 0:
             continue
 
-        # Scale premium to unclosed quantity
+        # Scale premium and commission to unclosed quantity
         premium_raw = total_premium_raw * unclosed_qty / total_qty
+        commission_raw = total_commission * unclosed_qty / total_qty
+        net_premium_raw = premium_raw + commission_raw
         fx_to_base = fx_weighted / total_qty
 
         if base_currency == 'EUR':
-            premium_eur = premium_raw * fx_to_base
+            premium_eur = net_premium_raw * fx_to_base
         else:
             date = parse_date(sells[0].get('dateTime') or sells[0].get('tradeDate'))
             rate_eur = get_rate_for_date(date, usd_to_eur_rates)
-            premium_eur = premium_raw * fx_to_base * rate_eur
+            premium_eur = net_premium_raw * fx_to_base * rate_eur
 
         zufluss_premium_eur += premium_eur
         zufluss_count += 1
@@ -1004,7 +1018,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             'putCall': key[3],
             'quantity': unclosed_qty,
             'premium_eur': premium_eur,
-            'premium_raw': premium_raw,
+            'premium_raw': net_premium_raw,
+            'commission_raw': commission_raw,
             'fx_to_base': fx_to_base,
             'currency': currency,
             'multiplier': mult,
@@ -1036,6 +1051,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                 'tradePrice': det.get('avg_price', 0),
                 'cost': 0,
                 'proceeds': det.get('premium_raw', 0),
+                'ibCommission': det.get('commission_raw', 0),
                 'fifoPnlRealized': det.get('premium_raw', 0),
                 'fxRateToBase': det.get('fx_to_base', 0),
                 'pnl_eur': round(det['premium_eur'], 2),
@@ -1097,6 +1113,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
 
             # Calculate the prior-year premium for the closed quantity
             total_premium_raw = 0.0
+            total_commission = 0.0
             total_qty = 0
             mult = int(safe_float(prior_sells[0].get('multiplier'), 100))
             fx_weighted = 0.0
@@ -1106,8 +1123,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                 price = safe_float(s.get('tradePrice')) or safe_float(s.get('closePrice'))
                 qty = abs(int(safe_float(s.get('quantity'))))
                 fx = safe_float(s.get('fxRateToBase'), 1.0)
+                comm = safe_float(s.get('ibCommission'), 0)
                 if qty > 0 and price > 0:
                     total_premium_raw += price * mult * qty
+                    total_commission += comm
                     fx_weighted += fx * qty
                     total_qty += qty
                 sd = parse_date(s.get('dateTime') or s.get('tradeDate'))
@@ -1119,14 +1138,16 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
 
             matched_qty = min(close_qty, total_qty)
             premium_raw = total_premium_raw * matched_qty / total_qty
+            commission_raw = total_commission * matched_qty / total_qty
+            net_premium_raw = premium_raw + commission_raw
             fx_to_base = fx_weighted / total_qty
 
             if base_currency == 'EUR':
-                correction_eur = premium_raw * fx_to_base
+                correction_eur = net_premium_raw * fx_to_base
             else:
                 date = parse_date(prior_sells[0].get('dateTime') or prior_sells[0].get('tradeDate'))
                 rate_eur = get_rate_for_date(date, usd_to_eur_rates)
-                correction_eur = premium_raw * fx_to_base * rate_eur
+                correction_eur = net_premium_raw * fx_to_base * rate_eur
 
             prior_zufluss_correction_eur += correction_eur
             symbol = prior_sells[0].get('symbol') or prior_sells[0].get('description') or f"{key[1]} {key[2]} {key[3]}"
@@ -1139,7 +1160,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                 'putCall': key[3],
                 'quantity': matched_qty,
                 'premium_eur': correction_eur,
-                'premium_raw': premium_raw,
+                'premium_raw': net_premium_raw,
+                'commission_raw': commission_raw,
                 'fx_to_base': fx_to_base,
                 'currency': currency,
                 'multiplier': mult,
@@ -1171,6 +1193,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                 'tradePrice': det.get('avg_price', 0),
                 'cost': 0,
                 'proceeds': -det.get('premium_raw', 0),
+                'ibCommission': -det.get('commission_raw', 0),
                 'fifoPnlRealized': -det.get('premium_raw', 0),
                 'fxRateToBase': det.get('fx_to_base', 0),
                 'pnl_eur': round(-det['premium_eur'], 2),
@@ -1262,18 +1285,23 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             continue
 
         total_premium_raw = 0.0
+        total_commission = 0.0
         total_orig_qty = 0
         for orig in originals:
             price = safe_float(orig.get('tradePrice')) or safe_float(orig.get('closePrice'))
             qty = abs(int(safe_float(orig.get('quantity'))))
+            comm = safe_float(orig.get('ibCommission'), 0)
             if qty > 0 and price > 0:
                 total_premium_raw += price * mult * qty
+                total_commission += comm
                 total_orig_qty += qty
 
         if total_orig_qty == 0 or total_premium_raw == 0:
             continue
 
         premium_raw = total_premium_raw * a_qty / total_orig_qty
+        commission_raw = total_commission * a_qty / total_orig_qty
+        net_premium_raw = premium_raw + commission_raw
         shares = a_qty * mult
 
         fx_weighted = sum(safe_float(o.get('fxRateToBase'), 1.0) * abs(int(safe_float(o.get('quantity'))))
@@ -1281,11 +1309,11 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         fx_to_base = fx_weighted / total_orig_qty if total_orig_qty else 1.0
 
         if base_currency == 'EUR':
-            premium_eur = premium_raw * fx_to_base
+            premium_eur = net_premium_raw * fx_to_base
         else:
             date = parse_date(a.get('dateTime') or a.get('tradeDate'))
             rate_eur = get_rate_for_date(date, usd_to_eur_rates)
-            premium_eur = premium_raw * fx_to_base * rate_eur
+            premium_eur = net_premium_raw * fx_to_base * rate_eur
 
         premium_per_share_eur = premium_eur / shares if shares else 0
         a_date = parse_date(a.get('reportDate') or a.get('dateTime') or a.get('tradeDate'))
