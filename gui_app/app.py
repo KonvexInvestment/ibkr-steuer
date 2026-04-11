@@ -1437,11 +1437,6 @@ if trade_details:
                 cell.fill = grp_fill
                 row_num += 1
 
-                grp_has_stillhalter = any(
-                    r.get('source') in ('stillhalter_korrektur', 'cross_year_put_korrektur')
-                    for r in grp_rows
-                )
-
                 grp_total = 0.0
                 for r in grp_rows:
                     source = r.get('source', '')
@@ -1466,8 +1461,8 @@ if trade_details:
                         anmerkung = r.get('description', 'Tageskurs §20 Abs. 4')
                     elif source == 'cross_year_put_korrektur':
                         anmerkung = r.get('description', 'Cross-Year Put-Korrektur')
-                    elif source == 'trades' and grp_has_stillhalter and r.get('assetCategory') == 'STK':
-                        anmerkung = 'Kostenbasis enthält Stillhalterprämie (s. Korrekturzeile)'
+                    elif source == 'trades' and r.get('stillhalter_adjusted'):
+                        anmerkung = 'Korrigiert: Prämie separiert (s. Stillhalterprämie Topf 2)'
 
                     # Readable open/close label
                     bs = r.get('buySell', '')

@@ -789,6 +789,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             'expiry': expiry,
             'putCall': pc,
             'quantity': a_qty,
+            'multiplier': mult,
             'premium_eur': premium_eur,
             'premium_raw': net_premium_raw,
             'commission_raw': commission_raw,
@@ -851,7 +852,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         options_gain += stillhalter_premium_eur  # total premium always to Topf 2
         add_topf2_detail('Stillhalterprämien', stillhalter_premium_eur)
 
-        # Stillhalter adjustment rows for trade-level reporting
+        # Stillhalter: add premium rows to Topf 2 and correct stock trade debug_rows
+        # Instead of separate Korrektur rows, we directly fix the stock trade's
+        # cost/fifoPnlRealized/pnl_eur so the Excel shows the correct per-trade values.
+        pending_stk_corrections = {}  # underlying_symbol → list of corrections
         for det in stillhalter_details:
             underlying = det['symbol'].split()[0] if det['symbol'] else ''
             u_isin = symbol_to_isin.get(underlying, '')
@@ -863,23 +867,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                 source_topf = 'KAP-INV'
             else:
                 source_topf = 'Topf1'
-            # Only show subtraction row if premium was actually subtracted from a pool
-            if source_topf != 'Topf2':
-                debug_rows.append({
-                    'dateTime': det['assignment_date'], 'reportDate': det['assignment_date'],
-                    'symbol': det['symbol'], 'description': f'Stillhalter-Korrektur ({pc_label})',
-                    'isin': u_isin, 'assetCategory': 'OPT', 'subCategory': '',
-                    'buySell': '', 'quantity': str(det['quantity']),
-                    'transactionType': 'Korrektur', 'currency': '',
-                    'tradePrice': 0, 'cost': 0, 'proceeds': 0,
-                    'fifoPnlRealized': 0, 'fxRateToBase': 0,
-                    'pnl_eur': round(-det['premium_eur'], 5),
-                    'topf': source_topf,
-                    'strike': det['strike'], 'expiry': det['expiry'],
-                    'putCall': det['putCall'], 'multiplier': '',
-                    'underlyingSymbol': underlying,
-                    'source': 'stillhalter_korrektur',
-                })
+            # Stillhalterprämie row → always Topf 2
             debug_rows.append({
                 'dateTime': det['assignment_date'], 'reportDate': det['assignment_date'],
                 'symbol': det['symbol'], 'description': f'Stillhalterprämie ({pc_label}, BMF Rn. {"26" if det["putCall"] == "C" else "33"})',
@@ -895,6 +883,54 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                 'underlyingSymbol': underlying,
                 'source': 'stillhalter_korrektur',
             })
+            # Queue stock trade correction (skip put_nosell — no stock trade to fix)
+            if source_topf == 'Topf2':
+                continue
+            mult = det.get('multiplier', 100)
+            total_shares = det['quantity'] * mult
+            if total_shares > 0:
+                pending_stk_corrections.setdefault(underlying, []).append({
+                    'premium_per_share_raw': det['premium_raw'] / total_shares,
+                    'remaining_shares': total_shares,
+                })
+
+        # Apply pending corrections to stock trade debug_rows
+        # IBKR embeds the premium in the stock's cost basis → cost too low, G/V too high.
+        # We add the premium back to cost and subtract from fifoPnlRealized.
+        for row in debug_rows:
+            if row.get('source') != 'trades' or row.get('assetCategory') != 'STK':
+                continue
+            sym_parts = (row.get('symbol', '') or '').split()
+            row_symbol = sym_parts[0] if sym_parts else ''
+            if not row_symbol or row_symbol not in pending_stk_corrections:
+                continue
+            qty = abs(safe_float(row.get('quantity', '0'), 0))
+            if qty <= 0:
+                continue
+            total_correction_raw = 0.0
+            remaining_qty = qty
+            for corr in pending_stk_corrections[row_symbol]:
+                if corr['remaining_shares'] <= 0 or remaining_qty <= 0:
+                    continue
+                shares = min(remaining_qty, corr['remaining_shares'])
+                total_correction_raw += corr['premium_per_share_raw'] * shares
+                corr['remaining_shares'] -= shares
+                remaining_qty -= shares
+            if total_correction_raw > 0:
+                # IBKR reduced absolute cost by premium → restore it
+                if row['cost'] >= 0:
+                    row['cost'] += total_correction_raw
+                else:
+                    row['cost'] -= total_correction_raw
+                row['fifoPnlRealized'] -= total_correction_raw
+                fx = row.get('fxRateToBase', 1.0)
+                if base_currency == 'EUR':
+                    row['pnl_eur'] = round(row['fifoPnlRealized'] * fx, 5)
+                else:
+                    d = parse_date(row.get('dateTime', ''))
+                    r_eur = get_rate_for_date(d, usd_to_eur_rates)
+                    row['pnl_eur'] = round(row['fifoPnlRealized'] * fx * r_eur, 5)
+                row['stillhalter_adjusted'] = True
 
         price_source = "tradePrice" if has_trade_price else "closePrice (Näherung)"
         parts = []

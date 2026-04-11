@@ -1362,7 +1362,6 @@ if trade_details:
                 ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=len(cols))
                 cell = ws.cell(row=row_num, column=1, value=grp_label); cell.font = grp_font; cell.fill = grp_fill
                 row_num += 1; grp_total = 0.0
-                grp_has_stillhalter = any(r.get('source') in ('stillhalter_korrektur', 'cross_year_put_korrektur') for r in grp_rows)
                 for r in grp_rows:
                     source = r.get('source', ''); pnl_eur = r.get('pnl_eur', 0)
                     pnl_orig = r.get('fifoPnlRealized', 0); fx = r.get('fxRateToBase', 0)
@@ -1375,8 +1374,8 @@ if trade_details:
                     elif source == 'zufluss_korrektur': anmerkung = r.get('description', 'Vorjahres-Korrektur')
                     elif source == 'tageskurs_korrektur': anmerkung = r.get('description', 'Tageskurs')
                     elif source == 'cross_year_put_korrektur': anmerkung = r.get('description', 'Cross-Year Put-Korrektur')
-                    elif source == 'trades' and grp_has_stillhalter and r.get('assetCategory') == 'STK':
-                        anmerkung = 'Kostenbasis enthaelt Stillhalterpraemie (s. Korrekturzeile)'
+                    elif source == 'trades' and r.get('stillhalter_adjusted'):
+                        anmerkung = 'Korrigiert: Praemie separiert (s. Stillhalterpraemie Topf 2)'
                     bs = r.get('buySell', ''); oc = r.get('openClose', '')
                     if bs == 'SELL' and oc == 'O': bs_label = 'STO'
                     elif bs == 'BUY' and oc == 'C': bs_label = 'BTC'
