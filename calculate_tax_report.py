@@ -1031,8 +1031,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         if base_currency == 'EUR':
             premium_eur = net_premium_raw * fx_to_base
         else:
-            date = parse_date(sells[0].get('dateTime') or sells[0].get('tradeDate'))
-            rate_eur = get_rate_for_date(date, usd_to_eur_rates)
+            # Weighted average EUR rate across all SELL fills (analog zu Stillhalter Zeile 762)
+            eur_rate_weighted = 0.0
+            for s in sells:
+                sd = parse_date(s.get('dateTime') or s.get('tradeDate'))
+                sq = abs(int(safe_float(s.get('quantity'))))
+                if sd and sq > 0:
+                    eur_rate_weighted += get_rate_for_date(sd, usd_to_eur_rates) * sq
+            rate_eur = eur_rate_weighted / total_qty if total_qty else get_rate_for_date(parse_date(sells[0].get('dateTime') or sells[0].get('tradeDate')), usd_to_eur_rates)
             premium_eur = net_premium_raw * fx_to_base * rate_eur
 
         zufluss_premium_eur += premium_eur
@@ -1932,11 +1938,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         data['gain_taxable'] = data['gain'] * (1 - tfs_rate)
         data['loss_taxable'] = data['loss'] * (1 - tfs_rate)
         data['div_taxable'] = data['div'] * (1 - tfs_rate)
+        data['wht_anrechenbar'] = data['wht'] * (1 - tfs_rate)
         etf_gain_taxable += data['gain_taxable']
         etf_loss_taxable += data['loss_taxable']
         etf_div_taxable += data['div_taxable']
 
     etf_wht_abs = abs(etf_wht_eur)  # positive for reporting
+    # §56 Abs. 6 InvStG: anrechenbare QSt um Teilfreistellung kürzen
+    etf_wht_anrechenbar = sum(abs(data.get('wht_anrechenbar', data.get('wht', 0))) for data in etf_by_isin.values())
     etf_net_taxable = etf_gain_taxable + etf_loss_taxable + etf_div_taxable
 
     if etf_by_isin:
@@ -1951,7 +1960,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
     # --- Per-Lot FX Correction (CLOSED_LOT Tageskurs-Methode) ---
     # Compares IBKR method (net PnL × close rate) vs. correct method
     # (proceeds × close rate - cost × open rate) per FIFO lot.
-    # Delta per lot = |cost_trade_ccy| × (fxRate_close - fxRate_open)
+    # Delta per lot = cost_trade_ccy × (fxRate_open - fxRate_close)
     fx_correction_total = 0.0
     fx_correction_details = []
     fx_corr_by_topf = {'Topf1': 0.0, 'Topf2': 0.0, 'KAP-INV': 0.0}
@@ -2037,7 +2046,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             if fx_close <= 0 or fx_open <= 0:
                 continue
 
-            delta = cost_raw * (fx_close - fx_open)
+            delta = cost_raw * (fx_open - fx_close)
             fx_correction_total += delta
             lots_processed += 1
 
@@ -2379,6 +2388,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             "etf_dividends_raw_eur": etf_dividends_eur,
             "etf_dividends_taxable_eur": etf_div_taxable,
             "etf_wht_eur": etf_wht_abs,
+            "etf_wht_anrechenbar_eur": etf_wht_anrechenbar,
             "etf_net_taxable_eur": etf_net_taxable,
             "etf_by_isin": etf_by_isin,
             "etf_unknown_isins": etf_unknown_isins,
