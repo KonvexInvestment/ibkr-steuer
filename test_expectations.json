@@ -1,0 +1,46 @@
+{
+  "demo_eur_single": {
+    "description": "Demo EUR-base, single year",
+    "in_repo": true,
+    "expected": {
+      "zeile_19": 176053.09,
+      "zeile_20": 146881.32,
+      "zeile_22": 2097.6,
+      "zeile_23": 3977.5,
+      "zeile_41": 8.62
+    }
+  },
+  "demo_eur_multi": {
+    "description": "Demo EUR-base, multi-year FX FIFO",
+    "in_repo": true,
+    "expected": {
+      "zeile_19": 175156.59,
+      "zeile_20": 146881.32,
+      "zeile_22": 2131.29,
+      "zeile_23": 3977.5,
+      "zeile_41": 8.62
+    }
+  },
+  "demo_ext": {
+    "description": "Demo EUR-base, extended Flex Query",
+    "in_repo": true,
+    "expected": {
+      "zeile_19": 17806.35,
+      "zeile_20": 11200.68,
+      "zeile_22": 0.0,
+      "zeile_23": 0.0,
+      "zeile_41": 28.37
+    }
+  },
+  "demo_usd": {
+    "description": "Demo USD-base, EZB rates + Tageskurs",
+    "in_repo": true,
+    "expected": {
+      "zeile_19": 32092.66,
+      "zeile_20": 38688.58,
+      "zeile_22": 1093.93,
+      "zeile_23": 7649.16,
+      "zeile_41": 10.98
+    }
+  }
+}
