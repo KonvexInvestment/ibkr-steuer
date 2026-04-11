@@ -1249,7 +1249,7 @@ if trade_details and tageskurs_aktiv:
         trade_details.append({
             'dateTime': close_dt, 'reportDate': close_dt,
             'symbol': lot.get('symbol', ''),
-            'description': f'Tageskurs-Korrektur (Kauf {open_dt}, Kurs {lot["fx_open"]:.4f} -> {lot["fx_close"]:.4f})',
+            'description': f'Tageskurs-Korrektur (Kauf {open_dt}, Kurs {lot["fx_open"]:.5f} -> {lot["fx_close"]:.5f})',
             'isin': lot.get('isin', ''), 'assetCategory': lot.get('assetCategory', ''),
             'subCategory': lot.get('subCategory', ''), 'buySell': '', 'openClose': '',
             'quantity': lot.get('quantity', ''), 'transactionType': 'FX-Korrektur',
