@@ -1945,7 +1945,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
 
     etf_wht_abs = abs(etf_wht_eur)  # positive for reporting
     # §56 Abs. 6 InvStG: anrechenbare QSt um Teilfreistellung kürzen
-    etf_wht_anrechenbar = sum(abs(data.get('wht_anrechenbar', data.get('wht', 0))) for data in etf_by_isin.values())
+    etf_wht_anrechenbar = abs(sum(data.get('wht_anrechenbar', data.get('wht', 0)) for data in etf_by_isin.values()))
     etf_net_taxable = etf_gain_taxable + etf_loss_taxable + etf_div_taxable
 
     if etf_by_isin:
