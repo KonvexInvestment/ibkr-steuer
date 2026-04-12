@@ -10,6 +10,19 @@ FX_FIELDS = ['date', 'settleDate', 'currency', 'fxRateToBase', 'activityCode',
               'tradeCommission']
 
 
+def extract_conversion_rates(root):
+    """Extract ConversionRate elements (official IBKR daily rates) from XML."""
+    rows = []
+    for cr in root.findall('.//ConversionRate'):
+        rows.append({
+            'reportDate': cr.get('reportDate', ''),
+            'fromCurrency': cr.get('fromCurrency', ''),
+            'toCurrency': cr.get('toCurrency', ''),
+            'rate': cr.get('rate', ''),
+        })
+    return rows
+
+
 def extract_fx_from_root(root, base_curr, fx_fields=None):
     """Extract FX transactions from a parsed XML root element."""
     if fx_fields is None:
@@ -183,6 +196,32 @@ def extract_fx_multi_xml(xml_files, output_dir):
         writer.writerows(final_rows)
     print(f"Saved {len(final_rows)} merged FX transactions to {fx_path} (aus {len(xml_files)} XMLs)")
 
+    # 5. Merge ConversionRates from ALL XMLs (for Tageskurs-Korrektur across years)
+    all_conv = []
+    for xml_path in xml_files:
+        try:
+            t = ET.parse(xml_path)
+            r = t.getroot()
+            rows = extract_conversion_rates(r)
+            all_conv.extend(rows)
+        except Exception:
+            pass
+    # Deduplicate: keep first occurrence per (reportDate, fromCurrency, toCurrency)
+    seen_conv = set()
+    deduped_conv = []
+    for row in all_conv:
+        key = (row['reportDate'], row['fromCurrency'], row['toCurrency'])
+        if key not in seen_conv:
+            seen_conv.add(key)
+            deduped_conv.append(row)
+    if deduped_conv:
+        cr_path = os.path.join(output_dir, 'conversion_rates.csv')
+        with open(cr_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['reportDate', 'fromCurrency', 'toCurrency', 'rate'])
+            writer.writeheader()
+            writer.writerows(deduped_conv)
+        print(f"Saved {len(deduped_conv)} merged ConversionRates to {cr_path} (aus {len(xml_files)} XMLs)")
+
 
 def parse_ibkr_xml(xml_file_path, output_dir):
     print(f"Parsing {xml_file_path}...")
@@ -298,6 +337,18 @@ def parse_ibkr_xml(xml_file_path, output_dir):
             writer.writeheader()
             writer.writerows(closed_lot_rows)
         print(f"Saved {len(closed_lot_rows)} CLOSED_LOT rows to {cl_path}")
+
+    # Extract ConversionRates (official IBKR daily rates) — for accurate Tageskurs-Korrektur
+    # ConversionRate is IBKR's official daily exchange rate, distinct from the BookTrade
+    # settlement rate (16:20). BookTrade rates can differ by up to 1.7 cents.
+    conv_rates_rows = extract_conversion_rates(root)
+    if conv_rates_rows:
+        cr_path = os.path.join(output_dir, 'conversion_rates.csv')
+        with open(cr_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['reportDate', 'fromCurrency', 'toCurrency', 'rate'])
+            writer.writeheader()
+            writer.writerows(conv_rates_rows)
+        print(f"Saved {len(conv_rates_rows)} ConversionRates to {cr_path}")
 
     # Extract MTM Performance Summary for CASH (FX positions) — plausibility reference
     mtm_section = root.find('.//MTMPerformanceSummaryInBase')

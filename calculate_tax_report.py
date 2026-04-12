@@ -2137,34 +2137,51 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
 
         closed_lots = load_csv(closed_lots_path)
 
+        # Load ConversionRate data (primary FX source for Tageskurs, Issue #33)
+        conv_rate_map = {}
+        cr_path = os.path.join(ib_tax_dir, 'conversion_rates.csv')
+        if os.path.exists(cr_path):
+            for cr in load_csv(cr_path):
+                if cr.get('fromCurrency') == 'USD' and cr.get('toCurrency') == 'EUR':
+                    rate = safe_float(cr.get('rate'), 0)
+                    if rate > 0:
+                        conv_rate_map[cr['reportDate']] = rate
+
         if base_currency == 'EUR':
-            # EUR base: fxRateToBase on USD trades IS the USD→EUR rate directly.
-            # IBKR assigns two rates per day: an intraday rate (ExchTrades) and
-            # a settlement rate (BookTrades at 16:20). Prefer ExchTrade rates;
-            # fall back to BookTrade rate on days with only BookTrades (e.g.
-            # pure assignment/expiry days like OpEx Fridays).
-            daily_exch = defaultdict(list)
-            daily_book = defaultdict(list)
-            for t in trades:
-                curr = t.get('currency', '')
-                fx = safe_float(t.get('fxRateToBase'), 0)
-                dt = (t.get('dateTime') or '')[:10]
-                if curr == 'USD' and fx > 0 and dt:
-                    if t.get('transactionType') == 'BookTrade':
-                        daily_book[dt].append(fx)
+            if conv_rate_map:
+                # Primary: ConversionRate — IBKR's official daily rate (Issue #33)
+                # Full daily coverage, no ExchTrade/BookTrade distinction needed.
+                fx_map = dict(conv_rate_map)
+            else:
+                # Fallback: ExchTrade/BookTrade from trades (original logic)
+                daily_exch = defaultdict(list)
+                daily_book = defaultdict(list)
+                for t in trades:
+                    curr = t.get('currency', '')
+                    fx = safe_float(t.get('fxRateToBase'), 0)
+                    dt = (t.get('dateTime') or '')[:10]
+                    if curr == 'USD' and fx > 0 and dt:
+                        if t.get('transactionType') == 'BookTrade':
+                            daily_book[dt].append(fx)
+                        else:
+                            daily_exch[dt].append(fx)
+                fx_map = {}
+                for d in set(daily_exch) | set(daily_book):
+                    if d in daily_exch:
+                        fx_map[d] = sum(daily_exch[d]) / len(daily_exch[d])
                     else:
-                        daily_exch[dt].append(fx)
-            fx_map = {}
-            for d in set(daily_exch) | set(daily_book):
-                if d in daily_exch:
-                    fx_map[d] = sum(daily_exch[d]) / len(daily_exch[d])
-                else:
-                    fx_map[d] = sum(daily_book[d]) / len(daily_book[d])
+                        fx_map[d] = sum(daily_book[d]) / len(daily_book[d])
         else:
-            # USD base: fxRateToBase=1 for USD trades (useless), use usd_to_eur_rates map
+            # USD base: usd_to_eur_rates as baseline, ConversionRate overwrites
             fx_map = {d.strftime('%Y-%m-%d'): r for d, r in usd_to_eur_rates.items()}
+            if conv_rate_map:
+                fx_map.update(conv_rate_map)
 
         fx_dates = sorted(fx_map.keys())
+        if conv_rate_map:
+            print(f"  Tageskurs FX-Quelle: ConversionRate ({len(conv_rate_map)} Tageskurse)")
+        else:
+            print(f"  Tageskurs FX-Quelle: ExchTrade/BookTrade Fallback ({len(fx_map)} Tageskurse)")
 
         def lookup_fx(date_str):
             day = date_str[:10] if date_str else ''
@@ -2206,12 +2223,16 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
 
             cost_raw = safe_float(lot.get('cost'), 0)
 
-            if base_currency == 'EUR':
-                # fxRateToBase on lot = USD→EUR rate at close
+            # dateTime = actual trade date; reportDate = settlement/booking date.
+            # Use trade date for FX lookup (§20 Abs. 4 S. 1 EStG: "Veräußerungszeitpunkt").
+            # IBKR settles expiries/assignments on the next business day (e.g. Friday→Monday),
+            # but the steuerlich relevant rate is the trade date rate.
+            close_dt = (lot.get('dateTime') or lot.get('reportDate') or '')[:10]
+            if base_currency == 'EUR' and not conv_rate_map:
+                # Fallback: fxRateToBase on lot = USD→EUR rate at close
                 fx_close = safe_float(lot.get('fxRateToBase'), 0)
             else:
-                # USD base: look up USD→EUR rate at close date from our rate map
-                close_dt = (lot.get('reportDate') or lot.get('dateTime') or '')[:10]
+                # ConversionRate (EUR-base) or usd_to_eur_rates+ConversionRate (USD-base)
                 fx_close = lookup_fx(close_dt)
 
             open_dt = lot.get('openDateTime', '')
