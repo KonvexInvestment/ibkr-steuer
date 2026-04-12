@@ -1360,12 +1360,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         premium_per_share_eur = premium_eur / shares if shares else 0
         a_date = parse_date(a.get('reportDate') or a.get('dateTime') or a.get('tradeDate'))
 
+        premium_per_share_raw = net_premium_raw / shares if shares else 0
         if underlying not in put_assignment_lots:
             put_assignment_lots[underlying] = deque()
         put_assignment_lots[underlying].append({
             'date': a_date,
             'shares_remaining': shares,
             'premium_per_share_eur': premium_per_share_eur,
+            'premium_per_share_raw': premium_per_share_raw,
             'strike': strike,
             'year': a_date.year if a_date else 0,
         })
@@ -1422,6 +1424,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                     'symbol': sym,
                     'shares': consumed,
                     'premium_per_share': lot['premium_per_share_eur'],
+                    'premium_per_share_raw': lot['premium_per_share_raw'],
                     'correction_eur': correction,
                     'assignment_year': lot['year'],
                     'strike': lot['strike'],
@@ -1480,26 +1483,49 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             print(f"Cross-Year Put-Korrektur: {len(cross_year_put_corrections)} Positionen, "
                   f"{cross_year_put_total:,.2f} EUR von PnL abgezogen (Prämie bereits in Vorjahr versteuert).")
 
-            # Add to trade details for Excel export (Issue #23)
+            # Correct stock debug_rows in-place (same pattern as pending_stk_corrections)
+            # Instead of separate correction rows, fix cost/PnL directly on the stock row.
+            # IBKR cost = strike×qty − premium (embedded). Restore to strike×qty.
+            _xy_pending = {}  # {symbol: [{premium_per_share_raw, remaining_shares}]}
             for c in cross_year_put_corrections:
-                c_sym = c['symbol']
-                c_isin = symbol_to_isin.get(c_sym, '')
-                c_is_etf = bool(c_isin and c_isin in etf_isins
-                                and get_classification(c_isin) != 'no_invstg')
-                debug_rows.append({
-                    'dateTime': '', 'reportDate': '',
-                    'symbol': c_sym,
-                    'description': f'Cross-Year Put-Korrektur (BMF Rn. 33, Assignment {c["assignment_year"]})',
-                    'isin': c_isin, 'assetCategory': 'STK', 'subCategory': '',
-                    'buySell': '', 'quantity': str(c['shares']),
-                    'transactionType': 'Korrektur', 'currency': '',
-                    'pnl_raw': -c['correction_eur'], 'fx_rate': '', 'pnl_eur': -c['correction_eur'],
-                    'topf': 'KAP-INV' if c_is_etf else 'Topf1',
-                    'putCall': 'P', 'strike': c['strike'], 'expiry': '',
-                    'multiplier': '',
-                    'underlyingSymbol': c_sym,
-                    'source': 'cross_year_put_korrektur',
+                _xy_pending.setdefault(c['symbol'], []).append({
+                    'premium_per_share_raw': c['premium_per_share_raw'],
+                    'remaining_shares': c['shares'],
                 })
+            for row in debug_rows:
+                if row.get('source') != 'trades' or row.get('assetCategory') != 'STK':
+                    continue
+                row_symbol = (row.get('underlyingSymbol') or row.get('symbol', '')).split()[0]
+                if not row_symbol or row_symbol not in _xy_pending:
+                    continue
+                qty = abs(safe_float(row.get('quantity', '0'), 0))
+                if qty == 0:
+                    continue
+                total_correction_raw = 0.0
+                remaining = qty
+                for corr in _xy_pending[row_symbol]:
+                    if corr['remaining_shares'] <= 0:
+                        continue
+                    consumed = min(remaining, corr['remaining_shares'])
+                    total_correction_raw += consumed * corr['premium_per_share_raw']
+                    corr['remaining_shares'] -= consumed
+                    remaining -= consumed
+                    if remaining <= 0:
+                        break
+                if total_correction_raw > 0:
+                    if row['cost'] >= 0:
+                        row['cost'] += total_correction_raw
+                    else:
+                        row['cost'] -= total_correction_raw
+                    row['fifoPnlRealized'] -= total_correction_raw
+                    fx = row.get('fxRateToBase', 1.0)
+                    if base_currency == 'EUR':
+                        row['pnl_eur'] = round(row['fifoPnlRealized'] * fx, 5)
+                    else:
+                        d = parse_date(row.get('dateTime', ''))
+                        r_eur = get_rate_for_date(d, usd_to_eur_rates)
+                        row['pnl_eur'] = round(row['fifoPnlRealized'] * fx * r_eur, 5)
+                    row['stillhalter_adjusted'] = True
 
     # Zuflussprinzip: cross-year premium aggregation
     # Combines three sources:
@@ -1962,6 +1988,74 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
     # (proceeds × close rate - cost × open rate) per FIFO lot.
     # Delta per lot = cost_trade_ccy × (fxRate_close - fxRate_open)
     # IBKR CLOSED_LOT: cost > 0 bei Longs (Kaufpreis), cost < 0 bei Shorts (Verkaufserlös)
+
+    # Build lookup for Stillhalter put assignment cost corrections:
+    # IBKR embeds the premium in the stock's cost basis (cost = strike - premium).
+    # The Tageskurs formula needs the corrected cost (= strike), so we add the
+    # premium back per share for stock CLOSED_LOTs acquired through put assignments.
+    _tageskurs_put_adj = {}  # {underlying_symbol: deque of {date, shares_remaining, premium_per_share_raw}}
+    for det in stillhalter_details:
+        if det.get('putCall') != 'P':
+            continue  # Only put assignments embed premium in stock COST basis
+        underlying = det['symbol'].split()[0] if det['symbol'] else ''
+        if not underlying:
+            continue
+        mult = det.get('multiplier', 100)
+        shares = det['quantity'] * mult
+        if shares <= 0 or det['premium_raw'] <= 0:
+            continue
+        a_date = (det.get('assignment_date') or '')[:10]
+        _tageskurs_put_adj.setdefault(underlying, deque()).append({
+            'date': a_date,
+            'shares_remaining': shares,
+            'premium_per_share_raw': det['premium_raw'] / shares,
+        })
+    # Include cross-year put assignments (assigned in prior years).
+    # NOTE: This mirrors the matching logic from the cross-year section (~line 1317).
+    # If that logic changes, update this section accordingly.
+    for a in prior_put_assignments:
+        strike = a.get('strike')
+        expiry = a.get('expiry')
+        a_cat = a.get('assetCategory')
+        a_qty = abs(int(safe_float(a.get('quantity'))))
+        mult = int(safe_float(a.get('multiplier'), 100))
+        underlying = a.get('underlyingSymbol', '')
+        if not strike or not underlying or a_qty == 0:
+            continue
+        originals = [t for t in trades
+                     if t.get('assetCategory') == a_cat
+                     and t.get('transactionType') == 'ExchTrade'
+                     and t.get('strike') == strike
+                     and t.get('expiry') == expiry
+                     and t.get('putCall') == 'P'
+                     and t.get('buySell') == 'SELL']
+        if not originals:
+            continue
+        total_premium_raw = 0.0
+        total_commission = 0.0
+        total_orig_qty = 0
+        for orig in originals:
+            price = safe_float(orig.get('tradePrice')) or safe_float(orig.get('closePrice'))
+            qty = abs(int(safe_float(orig.get('quantity'))))
+            comm = safe_float(orig.get('ibCommission'), 0)
+            if qty > 0 and price > 0:
+                total_premium_raw += price * mult * qty
+                total_commission += comm
+                total_orig_qty += qty
+        if total_orig_qty == 0 or total_premium_raw == 0:
+            continue
+        premium_raw = total_premium_raw * a_qty / total_orig_qty + total_commission * a_qty / total_orig_qty
+        shares = a_qty * mult
+        a_date_str = (a.get('dateTime') or a.get('tradeDate') or '')[:10]
+        _tageskurs_put_adj.setdefault(underlying, deque()).append({
+            'date': a_date_str,
+            'shares_remaining': shares,
+            'premium_per_share_raw': premium_raw / shares,
+        })
+    # Sort each symbol's lots by date (FIFO)
+    for sym in _tageskurs_put_adj:
+        _tageskurs_put_adj[sym] = deque(sorted(_tageskurs_put_adj[sym], key=lambda x: x['date']))
+
     fx_correction_total = 0.0
     fx_correction_details = []
     fx_corr_by_topf = {'Topf1': 0.0, 'Topf2': 0.0, 'KAP-INV': 0.0}
@@ -2031,6 +2125,16 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             if category == 'FUT':
                 continue
 
+            # Skip assigned/exercised options (fifoPnlRealized ≈ 0):
+            # - Short assignments (BUY): Premium already handled as Stillhalterprämie
+            #   at option sell-date FX rate. Tageskurs correction would double-count.
+            # - Long exercises (SELL): Cost bundled into stock's cost basis by IBKR.
+            #   Tageskurs on the option lot is phantom.
+            if category in ('OPT', 'FOP', 'FSFOP'):
+                lot_pnl = abs(safe_float(lot.get('fifoPnlRealized'), 0))
+                if lot_pnl < 0.01:
+                    continue
+
             cost_raw = safe_float(lot.get('cost'), 0)
 
             if base_currency == 'EUR':
@@ -2046,6 +2150,27 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
 
             if fx_close <= 0 or fx_open <= 0:
                 continue
+
+            # For STK lots from put assignments: IBKR embeds premium in cost basis
+            # (cost = strike×qty - premium). Restore correct cost (= strike×qty)
+            # so the Tageskurs formula uses the right basis.
+            if category == 'STK' and _tageskurs_put_adj:
+                lot_sym = lot.get('symbol', '').split()[0]
+                if lot_sym in _tageskurs_put_adj:
+                    lot_open_date = open_dt[:10]
+                    lot_qty = abs(safe_float(lot.get('quantity'), 0))
+                    remaining = lot_qty
+                    for adj_lot in _tageskurs_put_adj[lot_sym]:
+                        if adj_lot['shares_remaining'] <= 0:
+                            continue
+                        if adj_lot['date'] and lot_open_date and adj_lot['date'] != lot_open_date:
+                            continue
+                        consumed = min(remaining, adj_lot['shares_remaining'])
+                        cost_raw += consumed * adj_lot['premium_per_share_raw']
+                        adj_lot['shares_remaining'] -= consumed
+                        remaining -= consumed
+                        if remaining <= 0:
+                            break
 
             delta = cost_raw * (fx_close - fx_open)
             fx_correction_total += delta
