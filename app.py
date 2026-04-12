@@ -1432,9 +1432,10 @@ if csv_cats:
     cross_put = d['audit'].get('cross_year_put_total', 0)
     no_invstg_gain = d['audit'].get('no_invstg_gain', 0)
     no_invstg_loss = d['audit'].get('no_invstg_loss', 0)
-    # Add back premiums that WERE subtracted from stocks_gain, but NOT put premiums
-    # where the stock wasn't sold (those were never in stocks_gain to begin with)
-    stillhalter_addback = d['audit'].get('stillhalter_premium_eur', 0) - d['audit'].get('put_nosell_premium_eur', 0)
+    # Add back what was actually subtracted from stock/ETF pools for IBKR comparison.
+    # Uses the actual per-trade correction totals (at stock_fx), not the premium at option_fx,
+    # because the gain/loss split subtracts at the stock trade's FX rate.
+    stillhalter_addback = d['audit'].get('stk_correction_cy', 0) + d['audit'].get('etf_correction_cy', 0)
     our_stk_gain = d['stocks_gain_eur'] + stillhalter_addback + cross_put + no_invstg_gain
     our_stk_loss = d['stocks_loss_eur'] + no_invstg_loss
 

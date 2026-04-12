@@ -855,6 +855,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
     #   in the same tax year (otherwise premium is NOT in stocks_gain yet)
     etf_stillhalter_premium_eur = 0.0
     put_nosell_premium_eur = 0.0
+    stk_gain_corr_cy = 0.0
+    stk_loss_corr_cy = 0.0
+    etf_gain_corr_cy = 0.0
+    etf_loss_corr_cy = 0.0
     if stillhalter_premium_eur > 0:
         # Build set of underlying symbols that have stock SELL PnL in tax_year
         stk_sold_symbols = set()
@@ -2664,6 +2668,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             "stillhalter_count": stillhalter_count,
             "stillhalter_premium_eur": stillhalter_premium_eur,
             "put_nosell_premium_eur": put_nosell_premium_eur,
+            "stk_correction_cy": stk_gain_corr_cy + stk_loss_corr_cy,
+            "etf_correction_cy": etf_gain_corr_cy + etf_loss_corr_cy,
             "stillhalter_unmatched": stillhalter_unmatched,
             "stillhalter_details": stillhalter_details,
             "cross_year_premium_eur": cross_year_premium_eur,
