@@ -888,15 +888,12 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                 cls = get_classification(underlying_isin)
                 if cls != 'no_invstg':
                     etf_premium += det['premium_eur']
-                    # Adjust per-ISIN tracking (keeps etf_by_isin in sync with etf_invstg_gain)
-                    # Both must be adjusted: etf_invstg_gain for total, etf_by_isin for per-ISIN TFS
-                    if underlying_isin in etf_by_isin:
-                        etf_by_isin[underlying_isin]['gain'] -= det['premium_eur']
                     continue
             stk_premium += det['premium_eur']
 
-        stocks_gain -= stk_premium
-        etf_invstg_gain -= etf_premium
+        # NOTE: stocks_gain/etf_invstg_gain are NOT subtracted here.
+        # The per-trade gain/loss split happens below in pending_stk_corrections,
+        # same pattern as cross-year (Issue #23).
         etf_stillhalter_premium_eur = etf_premium
         put_nosell_premium_eur = put_nosell_premium
         options_gain += stillhalter_premium_eur  # total premium always to Topf 2
@@ -947,6 +944,13 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
         # Apply pending corrections to stock trade debug_rows
         # IBKR embeds the premium in the stock's cost basis → cost too low, G/V too high.
         # We add the premium back to cost and subtract from fifoPnlRealized.
+        # Also track gain/loss split per trade (same pattern as cross-year, Issue #23).
+        stk_gain_corr_cy = 0.0
+        stk_loss_corr_cy = 0.0
+        etf_gain_corr_cy = 0.0
+        etf_loss_corr_cy = 0.0
+        _etf_by_isin_corr_cy = {}
+
         for row in debug_rows:
             if row.get('source') != 'trades' or row.get('assetCategory') != 'STK':
                 continue
@@ -957,6 +961,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
             qty = abs(safe_float(row.get('quantity', '0'), 0))
             if qty <= 0:
                 continue
+            original_pnl_eur = row['pnl_eur']
             total_correction_raw = 0.0
             remaining_qty = qty
             for corr in pending_stk_corrections[row_symbol]:
@@ -981,6 +986,38 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None):
                     r_eur = get_rate_for_date(d, usd_to_eur_rates)
                     row['pnl_eur'] = round(row['fifoPnlRealized'] * fx * r_eur, 5)
                 row['stillhalter_adjusted'] = True
+
+                # Per-trade gain/loss split (Issue #23 pattern)
+                correction_eur = original_pnl_eur - row['pnl_eur']
+                row_isin = row.get('isin', '')
+                is_etf = bool(row_isin and row_isin in etf_isins
+                              and get_classification(row_isin) != 'no_invstg')
+                if original_pnl_eur > 0:
+                    from_gain = min(correction_eur, original_pnl_eur)
+                    from_loss = correction_eur - from_gain
+                else:
+                    from_gain = 0.0
+                    from_loss = correction_eur
+                if is_etf:
+                    etf_gain_corr_cy += from_gain
+                    etf_loss_corr_cy += from_loss
+                    if row_isin not in _etf_by_isin_corr_cy:
+                        _etf_by_isin_corr_cy[row_isin] = {'gain': 0.0, 'loss': 0.0}
+                    _etf_by_isin_corr_cy[row_isin]['gain'] += from_gain
+                    _etf_by_isin_corr_cy[row_isin]['loss'] += from_loss
+                else:
+                    stk_gain_corr_cy += from_gain
+                    stk_loss_corr_cy += from_loss
+
+        # Apply per-trade gain/loss split (replaces old pauschal: stocks_gain -= stk_premium)
+        stocks_gain -= stk_gain_corr_cy
+        stocks_loss -= stk_loss_corr_cy
+        etf_invstg_gain -= etf_gain_corr_cy
+        etf_invstg_loss -= etf_loss_corr_cy
+        for _isin, _adj in _etf_by_isin_corr_cy.items():
+            if _isin in etf_by_isin:
+                etf_by_isin[_isin]['gain'] -= _adj['gain']
+                etf_by_isin[_isin]['loss'] -= _adj['loss']
 
         price_source = "tradePrice" if has_trade_price else "closePrice (Näherung)"
         parts = []
