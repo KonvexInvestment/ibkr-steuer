@@ -223,6 +223,332 @@ def extract_fx_multi_xml(xml_files, output_dir):
         print(f"Saved {len(deduped_conv)} merged ConversionRates to {cr_path} (aus {len(xml_files)} XMLs)")
 
 
+def extract_quarterly_xmls(xml_files, output_dir):
+    """Merge multiple quarterly XMLs (same account, same year) into combined CSVs.
+
+    Unlike extract_fx_multi_xml (which only merges trades + FX from history),
+    this merges ALL sections from all XMLs for same-year quarterly exports.
+    """
+    if not xml_files:
+        return
+
+    # Sort by fromDate (Q1 first)
+    def get_from_date(path):
+        try:
+            stmt = ET.parse(path).getroot().find('.//FlexStatement')
+            return stmt.get('fromDate', '') if stmt is not None else ''
+        except Exception:
+            return ''
+
+    xml_files = sorted(xml_files, key=get_from_date)
+    print(f"Quartals-Merge: {len(xml_files)} XMLs")
+
+    # Collectors
+    trades_seen, trades_rows, trades_headers = set(), [], set()
+    lots_seen, lots_rows, lots_headers = set(), [], set()
+    funds_seen, funds_rows, funds_headers = set(), [], set()
+    instruments_seen, instruments_rows, instruments_headers = set(), [], set()
+    cash_seen, cash_rows, cash_headers = set(), [], set()
+    corp_seen, corp_rows, corp_headers = set(), [], set()
+    pnl_agg, pnl_headers = {}, set()
+    fx_pnl_seen, fx_pnl_rows = set(), []
+    all_fx_currency = []
+    all_conv_rates = []
+    earliest_sb_date = None
+    base_curr = 'EUR'
+    tax_year = None
+    acct_data = None
+    fx_trans_count = 0
+
+    for xml_path in xml_files:
+        try:
+            root = ET.parse(xml_path).getroot()
+        except Exception as e:
+            print(f"  FEHLER beim Parsen von {xml_path}: {e}")
+            continue
+
+        stmt = root.find('.//FlexStatement')
+        from_date = stmt.get('fromDate', '') if stmt is not None else ''
+        to_date = stmt.get('toDate', '') if stmt is not None else ''
+        print(f"  {os.path.basename(xml_path)}: {from_date} – {to_date}")
+
+        # AccountInfo (from first XML)
+        acct = root.find('.//AccountInformation')
+        if acct is not None and acct_data is None:
+            acct_data = acct.attrib.copy()
+            base_curr = acct_data.get('currency', 'EUR')
+        if to_date and (tax_year is None or to_date > tax_year):
+            tax_year = to_date[:4]
+
+        # ── Trades (EXECUTION + Lot/CLOSED_LOT) ──
+        trades_node = root.find('.//Trades')
+        if trades_node is not None:
+            for row in trades_node:
+                attrib = row.attrib
+                lod = attrib.get('levelOfDetail', '')
+
+                # Lot / CLOSED_LOT
+                if lod == 'CLOSED_LOT' or row.tag == 'Lot':
+                    key = (attrib.get('symbol', ''), attrib.get('openDateTime', ''),
+                           attrib.get('dateTime', ''), attrib.get('quantity', ''))
+                    lots_headers.update(attrib.keys())
+                    if key not in lots_seen:
+                        lots_seen.add(key)
+                        lots_rows.append(attrib.copy())
+                    continue
+
+                # Only Trade elements with EXECUTION
+                if row.tag != 'Trade':
+                    continue
+                if lod and lod != 'EXECUTION':
+                    continue
+
+                tid = attrib.get('tradeID', '')
+                key = tid if tid else (attrib.get('dateTime', ''), attrib.get('isin', ''),
+                                       attrib.get('buySell', ''), attrib.get('quantity', ''),
+                                       attrib.get('closePrice', ''))
+                if key not in trades_seen:
+                    trades_seen.add(key)
+                    trades_headers.update(attrib.keys())
+                    rec = attrib.copy()
+                    rec['__source_section__'] = 'Trades'
+                    trades_rows.append(rec)
+
+        # ── StmtFunds ──
+        stmtfunds = root.find('.//StmtFunds')
+        if stmtfunds is not None:
+            for row in stmtfunds:
+                attrib = row.attrib
+                act = attrib.get('activityDescription', '')
+
+                # Starting Balance: only keep from earliest XML (Q1)
+                if act == 'Starting Balance':
+                    date = attrib.get('date', '')
+                    if earliest_sb_date is None:
+                        earliest_sb_date = date
+                    if date != earliest_sb_date:
+                        continue
+
+                tid = attrib.get('transactionID', '')
+                if tid:
+                    key = (tid, act)
+                else:
+                    key = (act, attrib.get('date', ''), attrib.get('currency', ''),
+                           attrib.get('balance', ''), attrib.get('amount', ''))
+                if key not in funds_seen:
+                    funds_seen.add(key)
+                    funds_headers.update(attrib.keys())
+                    rec = attrib.copy()
+                    rec['__source_section__'] = 'StmtFunds'
+                    funds_rows.append(rec)
+
+        # ── SecuritiesInfo ──
+        secinfo = root.find('.//SecuritiesInfo')
+        if secinfo is not None:
+            for row in secinfo:
+                attrib = row.attrib
+                key = attrib.get('isin', '') or attrib.get('conid', '') or attrib.get('symbol', '')
+                if key not in instruments_seen:
+                    instruments_seen.add(key)
+                    instruments_headers.update(attrib.keys())
+                    rec = attrib.copy()
+                    rec['__source_section__'] = 'SecuritiesInfo'
+                    instruments_rows.append(rec)
+
+        # ── CashTransactions ──
+        ct_node = root.find('.//CashTransactions')
+        if ct_node is not None:
+            for row in ct_node:
+                attrib = row.attrib
+                key = (attrib.get('transactionID', ''), attrib.get('dateTime', ''),
+                       attrib.get('type', ''))
+                if key not in cash_seen:
+                    cash_seen.add(key)
+                    cash_headers.update(attrib.keys())
+                    rec = attrib.copy()
+                    rec['__source_section__'] = 'CashTransactions'
+                    cash_rows.append(rec)
+
+        # ── CorporateActions ──
+        ca_node = root.find('.//CorporateActions')
+        if ca_node is not None:
+            for row in ca_node:
+                attrib = row.attrib
+                key = (attrib.get('transactionID', ''), attrib.get('dateTime', ''))
+                if key not in corp_seen:
+                    corp_seen.add(key)
+                    corp_headers.update(attrib.keys())
+                    rec = attrib.copy()
+                    rec['__source_section__'] = 'CorporateActions'
+                    corp_rows.append(rec)
+
+        # ── FIFOPerformanceSummaryInBase (aggregate per instrument) ──
+        pnl_node = root.find('.//FIFOPerformanceSummaryInBase')
+        if pnl_node is not None:
+            for row in pnl_node:
+                attrib = row.attrib
+                pnl_headers.update(attrib.keys())
+                ac = attrib.get('assetCategory', '')
+                sym = attrib.get('symbol', '')
+                key = (ac, sym)
+                if key not in pnl_agg:
+                    pnl_agg[key] = attrib.copy()
+                else:
+                    # Sum numeric PnL fields across quarters
+                    # Both "total" prefixed (used by top_gains/top_losses) and
+                    # unprefixed (used by BILL/BOND fallback in calculate_tax_report)
+                    for field in ('totalRealizedPnl', 'totalRealizedSTPnl', 'totalRealizedLTPnl',
+                                  'totalRealizedSTProfit', 'totalRealizedSTLoss',
+                                  'totalRealizedLTProfit', 'totalRealizedLTLoss',
+                                  'realizedSTProfit', 'realizedLTProfit',
+                                  'realizedSTLoss', 'realizedLTLoss'):
+                        if field in attrib or field in pnl_agg[key]:
+                            old = float(pnl_agg[key].get(field, '0') or '0')
+                            new = float(attrib.get(field, '0') or '0')
+                            pnl_agg[key][field] = str(old + new)
+
+        # ── FxTransactions (realized PnL) ──
+        fxt = root.find('.//FxTransactions')
+        if fxt is not None:
+            fx_trans_count += len(list(fxt))
+            for elem in fxt:
+                if elem.get('levelOfDetail') == 'TRANSACTION' and elem.get('realizedPL'):
+                    key = (elem.get('dateTime', ''), elem.get('fxCurrency', ''),
+                           elem.get('quantity', ''))
+                    if key not in fx_pnl_seen:
+                        fx_pnl_seen.add(key)
+                        fx_pnl_rows.append({f: elem.get(f, '') for f in
+                            ['reportDate', 'dateTime', 'functionalCurrency', 'fxCurrency',
+                             'activityDescription', 'quantity', 'proceeds', 'cost',
+                             'realizedPL', 'code', 'levelOfDetail']})
+
+        # ── FX currency transactions + ConversionRates ──
+        all_fx_currency.extend(extract_fx_from_root(root, base_curr))
+        all_conv_rates.extend(extract_conversion_rates(root))
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Write all merged CSVs
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _write_csv(filename, rows, headers):
+        if not rows:
+            return
+        h = set(headers)
+        for r in rows:
+            h.update(r.keys())
+        path = os.path.join(output_dir, filename)
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, sorted(h))
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"  Saved {len(rows)} rows to {filename}")
+
+    # Trades
+    trades_headers.add('__source_section__')
+    _write_csv('trades.csv', trades_rows, trades_headers)
+
+    # CLOSED_LOT
+    if lots_rows:
+        _write_csv('closed_lots.csv', lots_rows, lots_headers)
+
+    # StmtFunds
+    funds_headers.add('__source_section__')
+    _write_csv('statement_of_funds.csv', funds_rows, funds_headers)
+
+    # SecuritiesInfo / financial_instruments
+    instruments_headers.add('__source_section__')
+    _write_csv('financial_instruments.csv', instruments_rows, instruments_headers)
+
+    # CashTransactions
+    cash_headers.add('__source_section__')
+    _write_csv('cash_transactions.csv', cash_rows, cash_headers)
+
+    # CorporateActions
+    corp_headers.add('__source_section__')
+    _write_csv('corporate_actions.csv', corp_rows, corp_headers)
+
+    # PnL Summary (aggregated)
+    pnl_rows = list(pnl_agg.values())
+    for r in pnl_rows:
+        r['__source_section__'] = 'FIFOPerformanceSummaryInBase'
+    pnl_headers.add('__source_section__')
+    _write_csv('pnl_summary.csv', pnl_rows, pnl_headers)
+
+    # FX realized PnL
+    if fx_pnl_rows:
+        fx_pnl_fields = ['reportDate', 'dateTime', 'functionalCurrency', 'fxCurrency',
+                         'activityDescription', 'quantity', 'proceeds', 'cost',
+                         'realizedPL', 'code', 'levelOfDetail']
+        fx_pnl_path = os.path.join(output_dir, 'fx_realized_pnl.csv')
+        with open(fx_pnl_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fx_pnl_fields)
+            writer.writeheader()
+            writer.writerows(fx_pnl_rows)
+        total_pnl = sum(float(r['realizedPL']) for r in fx_pnl_rows)
+        print(f"  Saved {len(fx_pnl_rows)} FX realized PnL entries (Total: {total_pnl:,.2f})")
+
+    # FX currency transactions (dedup, earliest Starting Balance only)
+    all_fx_currency.sort(key=lambda x: x.get('date', ''))
+    sb_seen_curr = set()
+    seen_fx_keys = set()
+    final_fx = []
+    for row in all_fx_currency:
+        desc = row.get('activityDescription', '')
+        tid = row.get('transactionID', '')
+        if desc == 'Starting Balance':
+            curr = row.get('currency', '')
+            if curr in sb_seen_curr:
+                continue
+            sb_seen_curr.add(curr)
+            key = ('SB', curr)
+        elif tid:
+            key = tid
+        else:
+            key = (row.get('date'), row.get('currency'), row.get('amount'))
+        if key not in seen_fx_keys:
+            seen_fx_keys.add(key)
+            final_fx.append(row)
+
+    if final_fx:
+        fx_path = os.path.join(output_dir, 'fx_transactions.csv')
+        sorted_h = sorted(FX_FIELDS)
+        with open(fx_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=sorted_h)
+            writer.writeheader()
+            writer.writerows(final_fx)
+        print(f"  Saved {len(final_fx)} merged FX transactions")
+
+    # ConversionRates (dedup)
+    seen_conv = set()
+    deduped_conv = []
+    for row in all_conv_rates:
+        key = (row['reportDate'], row['fromCurrency'], row['toCurrency'])
+        if key not in seen_conv:
+            seen_conv.add(key)
+            deduped_conv.append(row)
+    if deduped_conv:
+        cr_path = os.path.join(output_dir, 'conversion_rates.csv')
+        with open(cr_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['reportDate', 'fromCurrency', 'toCurrency', 'rate'])
+            writer.writeheader()
+            writer.writerows(deduped_conv)
+        print(f"  Saved {len(deduped_conv)} merged ConversionRates")
+
+    # AccountInfo
+    if acct_data:
+        acct_data['tax_year'] = tax_year or ''
+        acct_data['fx_transactions_count'] = str(fx_trans_count)
+        acct_path = os.path.join(output_dir, 'account_info.csv')
+        with open(acct_path, 'w', newline='', encoding='utf-8') as f:
+            headers = sorted(acct_data.keys())
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+            writer.writerow(acct_data)
+
+    print(f"Quartals-Merge abgeschlossen: {len(trades_rows)} Trades, {len(funds_rows)} StmtFunds, "
+          f"{len(fx_pnl_rows)} FX-PnL, {len(deduped_conv)} ConversionRates")
+
+
 def parse_ibkr_xml(xml_file_path, output_dir):
     print(f"Parsing {xml_file_path}...")
     try:

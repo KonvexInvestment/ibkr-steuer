@@ -327,6 +327,19 @@ def classify_xmls(xml_files):
     # Sort each account's XMLs by to_date (latest = tax year)
     for account_id in accounts:
         accounts[account_id].sort(key=lambda x: x['to_date'])
+    # Detect quarterly mode: multiple XMLs for same account, all within the same year
+    for account_id in accounts:
+        xmls = accounts[account_id]
+        if len(xmls) > 1:
+            years = set()
+            for x in xmls:
+                if x['from_date']:
+                    years.add(x['from_date'][:4])
+                if x['to_date']:
+                    years.add(x['to_date'][:4])
+            if len(years) == 1:
+                for x in xmls:
+                    x['is_quarterly'] = True
     return accounts
 
 def merge_report_data(reports):
@@ -652,7 +665,18 @@ if len(accounts) > 1:
 if accounts_skipped:
     st.markdown(f"""
 <div style="background: rgba(251,191,36,0.06); border: 1px solid rgba(251,191,36,0.2); border-radius: 10px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-size: 0.78rem; color: #94a3b8;">
-    <strong style="color: #fbbf24;">Übersprungen:</strong> {', '.join(accounts_skipped)} — keine Daten für Steuerjahr {global_tax_year} vorhanden.
+    <strong style="color: #fbbf24;">Übersprungen:</strong> {', '.join(accounts_skipped)} -- keine Daten für Steuerjahr {global_tax_year} vorhanden.
+</div>
+""", unsafe_allow_html=True)
+
+# Show quarterly merge info
+for acct_id, xmls in accounts_to_process.items():
+    if all(x.get('is_quarterly') for x in xmls) and len(xmls) > 1:
+        periods = [f"{x['from_date'][5:7]}-{x['to_date'][5:7]}" for x in xmls if x['from_date'] and x['to_date']]
+        acct_label = xmls[-1]['account_name'] or acct_id
+        st.markdown(f"""
+<div style="background: rgba(16,185,129,0.08); border: 1px solid rgba(16,185,129,0.25); border-radius: 10px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
+    <strong style="color: #34d399;">{len(xmls)} Quartals-XMLs erkannt</strong> ({', '.join(periods)}) fur {acct_label} -- werden zu einem Jahresreport {global_tax_year} zusammengefuhrt.
 </div>
 """, unsafe_allow_html=True)
 
@@ -665,22 +689,10 @@ with st.spinner("Berechne Steuerreport…"):
     for acct_id, xmls in sorted(accounts_to_process.items()):
         main_xml = xmls[-1]  # Latest = tax year
         history_xmls = xmls[:-1]  # Older = history
+        is_quarterly = all(x.get('is_quarterly') for x in xmls) and len(xmls) > 1
         acct_label = main_xml['account_name'] or acct_id
 
         with tempfile.TemporaryDirectory() as tmp:
-            # Save main XML
-            xml_path = os.path.join(tmp, "input.xml")
-            with open(xml_path, "wb") as f:
-                f.write(main_xml['file'].getbuffer())
-
-            # Save history XMLs
-            history_paths = []
-            for i, hxml in enumerate(history_xmls):
-                hp = os.path.join(tmp, f"history_{i}.xml")
-                with open(hp, "wb") as f:
-                    f.write(hxml['file'].getbuffer())
-                history_paths.append(hp)
-
             # Save CSV report (only for first account)
             csv_report_path = None
             if ibkr_csv_file is not None and len(reports) == 0:
@@ -689,11 +701,33 @@ with st.spinner("Berechne Steuerreport…"):
                     f.write(ibkr_csv_file.getbuffer())
 
             try:
-                if history_paths:
-                    all_xmls_paths = sorted(history_paths) + [xml_path]
-                    extract_ibkr_data.extract_fx_multi_xml(all_xmls_paths, tmp)
+                if is_quarterly:
+                    # Quarterly mode: merge all XMLs from same year
+                    xml_paths = []
+                    for i, qxml in enumerate(xmls):
+                        qp = os.path.join(tmp, f"quarter_{i}.xml")
+                        with open(qp, "wb") as f:
+                            f.write(qxml['file'].getbuffer())
+                        xml_paths.append(qp)
+                    extract_ibkr_data.extract_quarterly_xmls(xml_paths, tmp)
                 else:
-                    extract_ibkr_data.parse_ibkr_xml(xml_path, tmp)
+                    # Standard mode: single XML or multi-year history
+                    xml_path = os.path.join(tmp, "input.xml")
+                    with open(xml_path, "wb") as f:
+                        f.write(main_xml['file'].getbuffer())
+
+                    history_paths = []
+                    for i, hxml in enumerate(history_xmls):
+                        hp = os.path.join(tmp, f"history_{i}.xml")
+                        with open(hp, "wb") as f:
+                            f.write(hxml['file'].getbuffer())
+                        history_paths.append(hp)
+
+                    if history_paths:
+                        all_xmls_paths = sorted(history_paths) + [xml_path]
+                        extract_ibkr_data.extract_fx_multi_xml(all_xmls_paths, tmp)
+                    else:
+                        extract_ibkr_data.parse_ibkr_xml(xml_path, tmp)
                 d_acct = calculate_tax_report.calculate_tax(tmp, fx_csv_path=csv_report_path)
 
                 # Validate base currency consistency
