@@ -134,16 +134,31 @@ def parse_ibkr_csv_report(csv_path):
             parts = list(csv_module.reader(io.StringIO(line)))[0]
 
             # Dividenden/Zinsen/Quellensteuer EUR totals
+            # Multi-Currency-CSVs haben eine explizite "Gesamt X in EUR"-Zeile (echte Summe
+            # über alle Währungen). Single-Currency-CSVs haben nur "Gesamtwert in EUR"
+            # (USD-Teil umgerechnet = Gesamt). Präzise Zeile gewinnt, Gesamtwert ist Fallback.
             if len(parts) >= 6:
                 field = parts[2].strip() if len(parts) > 2 else ''
                 if line.startswith('Dividenden,Data,Gesamt Dividenden in EUR'):
                     income_totals['dividends_eur'] = safe_float(parts[5], 0)
                     continue
+                elif line.startswith('Dividenden,Data,Gesamtwert in EUR'):
+                    if 'dividends_eur' not in income_totals:
+                        income_totals['dividends_eur'] = safe_float(parts[5], 0)
+                    continue
                 elif line.startswith('Zinsen,Data,Gesamt Zinsen in EUR'):
                     income_totals['interest_eur'] = safe_float(parts[5], 0)
                     continue
-                elif line.startswith('Quellensteuer,Data,Gesamtwert in EUR'):
+                elif line.startswith('Zinsen,Data,Gesamtwert in EUR'):
+                    if 'interest_eur' not in income_totals:
+                        income_totals['interest_eur'] = safe_float(parts[5], 0)
+                    continue
+                elif line.startswith('Quellensteuer,Data,Gesamt Quellensteuer in EUR'):
                     income_totals['withholding_tax_eur'] = safe_float(parts[5], 0)
+                    continue
+                elif line.startswith('Quellensteuer,Data,Gesamtwert in EUR'):
+                    if 'withholding_tax_eur' not in income_totals:
+                        income_totals['withholding_tax_eur'] = safe_float(parts[5], 0)
                     continue
 
             if not line.startswith('Übersicht  zur realisierten und unrealisierten Performance,Data,'):
