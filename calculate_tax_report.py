@@ -1155,64 +1155,79 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         if unclosed_qty <= 0:
             continue
 
-        # Weighted average premium across all SELL fills
+        # FIFO: älteste Sells werden zuerst durch closes (Rückkäufe + Assignments) verbraucht.
+        # Issue #40: Vorher gewichteter Durchschnitt über alle Sells — falsch bei
+        # Teilschließungen mit unterschiedlichen Preisen. Jetzt: nur die offenen Fills summieren.
+        sells_sorted = sorted(sells, key=lambda t: t.get('dateTime', '') or t.get('tradeDate', ''))
+        remaining_close = closed_qty
+
         total_premium_raw = 0.0
         total_commission = 0.0
-        total_qty = 0
-        mult = int(safe_float(sells[0].get('multiplier'), 100))
+        total_open_qty = 0
+        mult = int(safe_float(sells_sorted[0].get('multiplier'), 100))
         fx_weighted = 0.0
+        eur_rate_weighted = 0.0
 
-        for s in sells:
+        for s in sells_sorted:
+            s_qty = abs(int(safe_float(s.get('quantity'))))
+            if s_qty <= 0:
+                continue
+            if remaining_close >= s_qty:
+                remaining_close -= s_qty
+                continue
+            open_qty = s_qty - remaining_close
+            remaining_close = 0
+
             price = safe_float(s.get('tradePrice')) or safe_float(s.get('closePrice'))
-            qty = abs(int(safe_float(s.get('quantity'))))
+            if price <= 0:
+                continue
             fx = safe_float(s.get('fxRateToBase'), 1.0)
             comm = safe_float(s.get('ibCommission'), 0)
-            if qty > 0 and price > 0:
-                total_premium_raw += price * mult * qty
-                total_commission += comm
-                fx_weighted += fx * qty
-                total_qty += qty
+            if open_qty < s_qty:
+                comm = comm * open_qty / s_qty
 
-        if total_qty == 0 or total_premium_raw == 0:
+            total_premium_raw += price * mult * open_qty
+            total_commission += comm
+            fx_weighted += fx * open_qty
+            total_open_qty += open_qty
+            if base_currency != 'EUR':
+                sd = parse_date(s.get('dateTime') or s.get('tradeDate'))
+                if sd:
+                    eur_rate_weighted += get_rate_for_date(sd, usd_to_eur_rates) * open_qty
+
+        if total_open_qty == 0 or total_premium_raw == 0:
             continue
 
-        # Scale premium and commission to unclosed quantity
-        premium_raw = total_premium_raw * unclosed_qty / total_qty
-        commission_raw = total_commission * unclosed_qty / total_qty
+        # Keine Skalierung mehr — die Summe ist bereits exakt für die offene Menge
+        premium_raw = total_premium_raw
+        commission_raw = total_commission
         net_premium_raw = premium_raw + commission_raw
-        fx_to_base = fx_weighted / total_qty
+        fx_to_base = fx_weighted / total_open_qty
 
         if base_currency == 'EUR':
             premium_eur = net_premium_raw * fx_to_base
         else:
-            # Weighted average EUR rate across all SELL fills (analog zu Stillhalter Zeile 762)
-            eur_rate_weighted = 0.0
-            for s in sells:
-                sd = parse_date(s.get('dateTime') or s.get('tradeDate'))
-                sq = abs(int(safe_float(s.get('quantity'))))
-                if sd and sq > 0:
-                    eur_rate_weighted += get_rate_for_date(sd, usd_to_eur_rates) * sq
-            rate_eur = eur_rate_weighted / total_qty if total_qty else get_rate_for_date(parse_date(sells[0].get('dateTime') or sells[0].get('tradeDate')), usd_to_eur_rates)
+            rate_eur = eur_rate_weighted / total_open_qty if total_open_qty else get_rate_for_date(parse_date(sells_sorted[0].get('dateTime') or sells_sorted[0].get('tradeDate')), usd_to_eur_rates)
             premium_eur = net_premium_raw * fx_to_base * rate_eur
 
         zufluss_premium_eur += premium_eur
         zufluss_count += 1
 
         sell_date = None
-        for s in sells:
+        for s in sells_sorted:
             sd = parse_date(s.get('dateTime') or s.get('tradeDate'))
             if sd and (sell_date is None or sd < sell_date):
                 sell_date = sd
 
-        symbol = sells[0].get('symbol') or sells[0].get('description') or f"{key[1]} {key[2]} {key[3]}"
-        currency = sells[0].get('currency', '')
-        avg_price = total_premium_raw / (total_qty * mult) if (total_qty and mult) else 0
+        symbol = sells_sorted[0].get('symbol') or sells_sorted[0].get('description') or f"{key[1]} {key[2]} {key[3]}"
+        currency = sells_sorted[0].get('currency', '')
+        avg_price = total_premium_raw / (total_open_qty * mult) if (total_open_qty and mult) else 0
         zufluss_details.append({
             'symbol': symbol,
             'strike': key[1],
             'expiry': key[2],
             'putCall': key[3],
-            'quantity': unclosed_qty,
+            'quantity': total_open_qty,
             'premium_eur': premium_eur,
             'premium_raw': net_premium_raw,
             'commission_raw': commission_raw,
