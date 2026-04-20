@@ -331,6 +331,7 @@ ETF_CLASSIFICATION = {
     'US3837861092': ('GBTC', 'Grayscale Bitcoin Trust ETF',                     'no_invstg'),  # Spot-Trust, einzelner Basiswert
     'US0919481095': ('BSOL', 'Bitwise Solana Staking ETF',                      'no_invstg'),  # Spot-Trust (SOL), nicht Investment Company Act 1940 — §20 EStG
     'DE000A4A59D2': ('BSOL', 'Bitwise Solana Staking ETP (DE)',                 'no_invstg'),  # deutsche ETP-Variante (Schuldverschreibung, kein Fonds)
+    'CH1471826029': ('HYPE', '21Shares Hyperliquid Staking ETP',                'no_invstg'),  # Krypto-ETN (CH), einzelner Basiswert; gilt für HYPEEUR und HYPEUSD
     'US74347G4405': ('BITO', 'ProShares Bitcoin Strategy ETF',                  'sonstiger_fonds'),  # Investment Company Act 1940, BTC-Futures + Treasuries → InvStG
 
     # --- ETNs (Schuldverschreibungen, kein Fonds) ---
