@@ -381,7 +381,8 @@ def calculate_fx_gains(trades, fx_transactions, tax_year, base_currency='EUR'):
     return results, total_gain, total_loss, has_prior_data
 
 
-def _get_open_option_sells(trades, a_cat, strike, expiry, pc, assignment_qty_for_series):
+def _get_open_option_sells(trades, a_cat, strike, expiry, pc, assignment_qty_for_series,
+                           underlying=None):
     """Return only SELL trades still open after FIFO-consuming closed positions.
 
     IBKR may have multiple SELL ExchTrades for the same option series (strike/expiry/putCall).
@@ -389,6 +390,10 @@ def _get_open_option_sells(trades, a_cat, strike, expiry, pc, assignment_qty_for
     This function uses FIFO to determine which sells are still open:
       close_qty = total_sell_qty - assignment_qty_for_series
     The oldest close_qty sells are consumed; the remaining are returned with '_open_qty' set.
+
+    Wenn `underlying` angegeben ist, werden nur Sells fuer dieses Underlying
+    beruecksichtigt — wichtig, weil verschiedene Aktien dieselbe strike/expiry-
+    Kombination haben koennen (z.B. KWEB P 30 exp 2024-12-20 vs FXI P 30 exp 2024-12-20).
     """
     all_sells = sorted(
         [t for t in trades
@@ -397,7 +402,8 @@ def _get_open_option_sells(trades, a_cat, strike, expiry, pc, assignment_qty_for
          and t.get('strike') == strike
          and t.get('expiry') == expiry
          and t.get('putCall') == pc
-         and t.get('buySell') == 'SELL'],
+         and t.get('buySell') == 'SELL'
+         and (underlying is None or t.get('underlyingSymbol', '') == underlying)],
         key=lambda t: t.get('dateTime', '') or t.get('tradeDate', '')
     )
     total_sell_qty = sum(abs(int(safe_float(t.get('quantity')))) for t in all_sells)
@@ -421,6 +427,66 @@ def _get_open_option_sells(trades, a_cat, strike, expiry, pc, assignment_qty_for
             s_copy['_open_qty'] = s_qty
             open_sells.append(s_copy)
     return open_sells
+
+
+def _consume_open_sells_fifo(originals_state, a_qty, mult, base_currency='EUR', usd_to_eur_rates=None):
+    """FIFO-Konsum aus open Sells fuer eine einzelne Andienung.
+
+    originals_state: Liste von _get_open_option_sells()-Dicts (sortiert nach
+    dateTime aufsteigend). Wird IN-PLACE mutiert: '_open_qty' wird pro Eintrag
+    reduziert um die durch diese Andienung verbrauchte Menge.
+
+    Wichtig: premium_eur wird per-Fill akkumuliert, nicht ueber einen kontrakt-
+    gewichteten FX-Mittelwert. Sonst entstehen bei Fills mit unterschiedlichen
+    Preisen und FX-Raten Konversionsfehler (Issue Codex P2).
+
+    Returns: (premium_raw, commission_raw, fx_weighted, premium_eur, sells_consumed, consumed_qty)
+    - premium_raw, commission_raw: Brutto-Werte in Trade-Waehrung
+    - fx_weighted: kontrakt-gewichtete Summe der fxRateToBase (nur fuer Display
+      des effektiven Mittelkurses; NICHT fuer EUR-Konversion verwenden)
+    - premium_eur: NETTO-EUR (Praemie + Kommission), per-Fill exakt umgerechnet
+    - sells_consumed: Liste von (orig_dict, consume_qty) fuer Detail-Tracking
+    """
+    remaining = a_qty
+    premium_raw = 0.0
+    commission_raw = 0.0
+    fx_weighted = 0.0
+    premium_eur = 0.0
+    consumed = 0
+    sells_consumed = []
+    for orig in originals_state:
+        if remaining <= 0:
+            break
+        q_avail = orig.get('_open_qty', 0)
+        if q_avail <= 0:
+            continue
+        consume = min(remaining, q_avail)
+        price = safe_float(orig.get('tradePrice')) or safe_float(orig.get('closePrice'))
+        if price <= 0:
+            orig['_open_qty'] = q_avail - consume
+            remaining -= consume
+            continue
+        orig_full_qty = abs(int(safe_float(orig.get('quantity'))))
+        comm_full = safe_float(orig.get('ibCommission'), 0)
+        comm_share = comm_full * consume / orig_full_qty if orig_full_qty else 0
+        fill_premium_raw = price * mult * consume
+        fill_net_raw = fill_premium_raw + comm_share
+        fx = safe_float(orig.get('fxRateToBase'), 1.0)
+        if base_currency == 'EUR':
+            fill_eur = fill_net_raw * fx
+        else:
+            sd = parse_date(orig.get('dateTime') or orig.get('tradeDate'))
+            r_eur = get_rate_for_date(sd, usd_to_eur_rates) if usd_to_eur_rates else 1.0
+            fill_eur = fill_net_raw * fx * r_eur
+        premium_raw += fill_premium_raw
+        commission_raw += comm_share
+        fx_weighted += fx * consume
+        premium_eur += fill_eur
+        consumed += consume
+        sells_consumed.append((orig, consume))
+        orig['_open_qty'] = q_avail - consume
+        remaining -= consume
+    return premium_raw, commission_raw, fx_weighted, premium_eur, sells_consumed, consumed
 
 
 def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrides=None):
@@ -779,7 +845,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         if not strike or not expiry or not pc or a_qty == 0:
             continue
 
-        # Total assignment qty for this series (all years) to determine open sells
+        # Total assignment qty for this series (all years) to determine open sells.
+        # underlyingSymbol einbeziehen — verschiedene Aktien koennen dieselbe
+        # strike/expiry-Kombination haben (z.B. KWEB P 30 vs FXI P 30).
+        a_underlying = a.get('underlyingSymbol', '')
         assign_qty_series = sum(
             abs(int(safe_float(t.get('quantity'))))
             for t in trades
@@ -789,11 +858,13 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             and t.get('strike') == strike
             and t.get('expiry') == expiry
             and t.get('putCall') == pc
+            and t.get('underlyingSymbol', '') == a_underlying
             and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01
         )
 
         # Find only OPEN original sells (FIFO: bought-back/expired positions consumed first)
-        originals = _get_open_option_sells(trades, a_cat, strike, expiry, pc, assign_qty_series)
+        originals = _get_open_option_sells(trades, a_cat, strike, expiry, pc, assign_qty_series,
+                                           underlying=a_underlying)
 
         if not originals:
             symbol = a.get('symbol', f"{strike} {expiry} {pc}")
@@ -808,11 +879,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             })
             continue
 
-        # Weighted average premium across open fills only
-        # Use tradePrice (actual fill price) if available, fall back to closePrice
+        # Per-Fill Akkumulation: brutto raw, EUR netto (inkl. Commission) jeweils
+        # mit dem FX-Kurs des einzelnen Fills. Vermeidet den FX-Mittelungs-Bug
+        # bei divergenten Preisen + Raten (Codex P2).
         total_premium_raw = 0.0
         total_commission = 0.0
+        total_premium_eur = 0.0
         total_orig_qty = 0
+        fx_weighted = 0.0
         mult = int(safe_float(originals[0].get('multiplier'), 100))
 
         for orig in originals:
@@ -824,32 +898,31 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             if orig_full_qty > 0 and qty < orig_full_qty:
                 comm = comm * qty / orig_full_qty
             if qty > 0 and price > 0:
-                total_premium_raw += price * mult * qty
+                fill_brutto_raw = price * mult * qty
+                fill_net_raw = fill_brutto_raw + comm
+                fx = safe_float(orig.get('fxRateToBase'), 1.0)
+                if base_currency == 'EUR':
+                    fill_eur = fill_net_raw * fx
+                else:
+                    sd = parse_date(orig.get('dateTime') or orig.get('tradeDate'))
+                    r_eur = get_rate_for_date(sd, usd_to_eur_rates)
+                    fill_eur = fill_net_raw * fx * r_eur
+                total_premium_raw += fill_brutto_raw
                 total_commission += comm
+                total_premium_eur += fill_eur
+                fx_weighted += fx * qty
                 total_orig_qty += qty
 
         if total_orig_qty == 0 or total_premium_raw == 0:
             continue
 
         # Scale to assignment quantity (may be less than total open sells)
-        premium_raw = total_premium_raw * a_qty / total_orig_qty
-        commission_raw = total_commission * a_qty / total_orig_qty
-
-        # Convert to EUR using the original trade's FX rate
-        # Use weighted average rate from open originals only
-        fx_weighted = sum(safe_float(o.get('fxRateToBase'), 1.0) * o.get('_open_qty', abs(int(safe_float(o.get('quantity')))))
-                         for o in originals)
-        fx_to_base = fx_weighted / total_orig_qty if total_orig_qty else 1.0
-
-        # Net premium = gross - commissions (ibCommission is negative for fees, positive for rebates)
+        scale = a_qty / total_orig_qty
+        premium_raw = total_premium_raw * scale
+        commission_raw = total_commission * scale
         net_premium_raw = premium_raw + commission_raw
-
-        if base_currency == 'EUR':
-            premium_eur = net_premium_raw * fx_to_base
-        else:
-            date = parse_date(a.get('dateTime') or a.get('tradeDate'))
-            rate_eur = get_rate_for_date(date, usd_to_eur_rates)
-            premium_eur = net_premium_raw * fx_to_base * rate_eur
+        premium_eur = total_premium_eur * scale
+        fx_to_base = fx_weighted / total_orig_qty if total_orig_qty else 1.0  # nur Display
 
         stillhalter_premium_eur += premium_eur
         stillhalter_count += 1
@@ -1187,10 +1260,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
 
         total_premium_raw = 0.0
         total_commission = 0.0
+        total_premium_eur = 0.0
         total_open_qty = 0
         mult = int(safe_float(sells_sorted[0].get('multiplier'), 100))
-        fx_weighted = 0.0
-        eur_rate_weighted = 0.0
+        fx_weighted = 0.0  # nur Display
 
         for s in sells_sorted:
             s_qty = abs(int(safe_float(s.get('quantity'))))
@@ -1210,14 +1283,19 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             if open_qty < s_qty:
                 comm = comm * open_qty / s_qty
 
-            total_premium_raw += price * mult * open_qty
+            fill_brutto_raw = price * mult * open_qty
+            fill_net_raw = fill_brutto_raw + comm
+            if base_currency == 'EUR':
+                fill_eur = fill_net_raw * fx
+            else:
+                sd = parse_date(s.get('dateTime') or s.get('tradeDate'))
+                r_eur = get_rate_for_date(sd, usd_to_eur_rates) if sd else 1.0
+                fill_eur = fill_net_raw * fx * r_eur
+            total_premium_raw += fill_brutto_raw
             total_commission += comm
+            total_premium_eur += fill_eur
             fx_weighted += fx * open_qty
             total_open_qty += open_qty
-            if base_currency != 'EUR':
-                sd = parse_date(s.get('dateTime') or s.get('tradeDate'))
-                if sd:
-                    eur_rate_weighted += get_rate_for_date(sd, usd_to_eur_rates) * open_qty
 
         if total_open_qty == 0 or total_premium_raw == 0:
             continue
@@ -1226,13 +1304,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         premium_raw = total_premium_raw
         commission_raw = total_commission
         net_premium_raw = premium_raw + commission_raw
-        fx_to_base = fx_weighted / total_open_qty
-
-        if base_currency == 'EUR':
-            premium_eur = net_premium_raw * fx_to_base
-        else:
-            rate_eur = eur_rate_weighted / total_open_qty if total_open_qty else get_rate_for_date(parse_date(sells_sorted[0].get('dateTime') or sells_sorted[0].get('tradeDate')), usd_to_eur_rates)
-            premium_eur = net_premium_raw * fx_to_base * rate_eur
+        premium_eur = total_premium_eur
+        fx_to_base = fx_weighted / total_open_qty if total_open_qty else 1.0  # nur Display
 
         zufluss_premium_eur += premium_eur
         zufluss_count += 1
@@ -1355,10 +1428,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             remaining_close = close_qty
             total_premium_raw = 0.0
             total_commission = 0.0
+            total_premium_eur = 0.0
             consumed_qty = 0
             mult = int(safe_float(prior_sorted[0].get('multiplier'), 100))
-            fx_weighted = 0.0
-            eur_rate_weighted = 0.0
+            fx_weighted = 0.0  # nur Display
             sell_date = None
 
             for s in prior_sorted:
@@ -1375,14 +1448,19 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 comm = safe_float(s.get('ibCommission'), 0)
                 if take < s_qty:
                     comm = comm * take / s_qty
-                total_premium_raw += price * mult * take
+                fill_brutto_raw = price * mult * take
+                fill_net_raw = fill_brutto_raw + comm
+                if base_currency == 'EUR':
+                    fill_eur = fill_net_raw * fx
+                else:
+                    sd_eur = parse_date(s.get('dateTime') or s.get('tradeDate'))
+                    r_eur = get_rate_for_date(sd_eur, usd_to_eur_rates) if sd_eur else 1.0
+                    fill_eur = fill_net_raw * fx * r_eur
+                total_premium_raw += fill_brutto_raw
                 total_commission += comm
+                total_premium_eur += fill_eur
                 fx_weighted += fx * take
                 consumed_qty += take
-                if base_currency != 'EUR':
-                    sd = parse_date(s.get('dateTime') or s.get('tradeDate'))
-                    if sd:
-                        eur_rate_weighted += get_rate_for_date(sd, usd_to_eur_rates) * take
                 sd = parse_date(s.get('dateTime') or s.get('tradeDate'))
                 if sd and (sell_date is None or sd < sell_date):
                     sell_date = sd
@@ -1396,14 +1474,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             premium_raw = total_premium_raw
             commission_raw = total_commission
             net_premium_raw = premium_raw + commission_raw
-            fx_to_base = fx_weighted / consumed_qty
-
-            if base_currency == 'EUR':
-                correction_eur = net_premium_raw * fx_to_base
-            else:
-                rate_eur = eur_rate_weighted / consumed_qty if consumed_qty else get_rate_for_date(
-                    parse_date(prior_sorted[0].get('dateTime') or prior_sorted[0].get('tradeDate')), usd_to_eur_rates)
-                correction_eur = net_premium_raw * fx_to_base * rate_eur
+            correction_eur = total_premium_eur
+            fx_to_base = fx_weighted / consumed_qty if consumed_qty else 1.0  # nur Display
 
             prior_zufluss_correction_eur += correction_eur
             symbol = prior_sorted[0].get('symbol') or prior_sorted[0].get('description') or f"{key[1]} {key[2]} {key[3]}"
@@ -1515,10 +1587,27 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     # Build FIFO lots per underlying symbol from prior-year put assignments
     from collections import deque
     put_assignment_lots = {}  # {symbol: deque of (date, shares_remaining, premium_per_share_eur)}
+    # Issue #55: paralleles immutable Dict fuer _tageskurs_put_adj. Da
+    # put_assignment_lots durch die Apply-Schleife (popleft bei shares_remaining<=0)
+    # mutiert wird, koennen die Original-Werte spaeter nicht mehr abgerufen werden.
+    _xy_tageskurs_lots = {}  # {symbol: list of {date_str, shares, premium_per_share_raw}}
     cross_year_put_corrections = []
     cross_year_put_total = 0.0
 
-    for a in prior_put_assignments:
+    # Issue #54: Bei mehreren Andienungen derselben Series werden die Original-Sells
+    # FIFO konsumiert (aelteste zuerst), nicht als Durchschnitt verteilt. State pro
+    # Series wird zwischen den Iterationen weitergetragen. Andienungen werden zeitlich
+    # sortiert, damit die fruehere Andienung die aelteren Sells bekommt.
+    # Sort-Key: dateTime → tradeDate → reportDate (analog zum Filter oben).
+    prior_put_assignments_sorted = sorted(
+        prior_put_assignments,
+        key=lambda t: (t.get('dateTime', '') or t.get('tradeDate', '') or t.get('reportDate', '') or '')
+    )
+    # series_key umfasst underlyingSymbol — verschiedene Aktien koennen dieselbe
+    # strike/expiry-Kombination haben (z.B. KWEB P 30 vs FXI P 30).
+    _prior_put_series_state = {}  # {(a_cat, underlying, strike, expiry): originals_state_list}
+
+    for a in prior_put_assignments_sorted:
         strike = a.get('strike')
         expiry = a.get('expiry')
         a_cat = a.get('assetCategory')
@@ -1528,58 +1617,36 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         if not strike or not underlying or a_qty == 0:
             continue
 
-        # Total assignment qty for this series (all years) to determine open sells
-        assign_qty_series = sum(
-            abs(int(safe_float(t.get('quantity'))))
-            for t in trades
-            if t.get('assetCategory') == a_cat
-            and t.get('transactionType') == 'BookTrade'
-            and t.get('buySell') == 'BUY'
-            and t.get('strike') == strike
-            and t.get('expiry') == expiry
-            and t.get('putCall') == 'P'
-            and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01
-        )
+        series_key = (a_cat, underlying, strike, expiry)
+        if series_key not in _prior_put_series_state:
+            assign_qty_series = sum(
+                abs(int(safe_float(t.get('quantity'))))
+                for t in trades
+                if t.get('assetCategory') == a_cat
+                and t.get('transactionType') == 'BookTrade'
+                and t.get('buySell') == 'BUY'
+                and t.get('strike') == strike
+                and t.get('expiry') == expiry
+                and t.get('putCall') == 'P'
+                and t.get('underlyingSymbol', '') == underlying
+                and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01
+            )
+            _prior_put_series_state[series_key] = _get_open_option_sells(
+                trades, a_cat, strike, expiry, 'P', assign_qty_series, underlying=underlying)
 
-        # Find only OPEN original sells (FIFO: bought-back/expired positions consumed first)
-        originals = _get_open_option_sells(trades, a_cat, strike, expiry, 'P', assign_qty_series)
-
-        if not originals:
+        originals_state = _prior_put_series_state[series_key]
+        if not originals_state:
             continue
 
-        total_premium_raw = 0.0
-        total_commission = 0.0
-        total_orig_qty = 0
-        for orig in originals:
-            price = safe_float(orig.get('tradePrice')) or safe_float(orig.get('closePrice'))
-            qty = orig.get('_open_qty', abs(int(safe_float(orig.get('quantity')))))
-            orig_full_qty = abs(int(safe_float(orig.get('quantity'))))
-            comm = safe_float(orig.get('ibCommission'), 0)
-            if orig_full_qty > 0 and qty < orig_full_qty:
-                comm = comm * qty / orig_full_qty
-            if qty > 0 and price > 0:
-                total_premium_raw += price * mult * qty
-                total_commission += comm
-                total_orig_qty += qty
+        premium_raw, commission_raw, fx_weighted, premium_eur, sells_consumed, consumed_qty = \
+            _consume_open_sells_fifo(originals_state, a_qty, mult, base_currency, usd_to_eur_rates)
 
-        if total_orig_qty == 0 or total_premium_raw == 0:
+        if consumed_qty == 0 or premium_raw == 0:
             continue
 
-        premium_raw = total_premium_raw * a_qty / total_orig_qty
-        commission_raw = total_commission * a_qty / total_orig_qty
         net_premium_raw = premium_raw + commission_raw
-        shares = a_qty * mult
-
-        fx_weighted = sum(safe_float(o.get('fxRateToBase'), 1.0) * o.get('_open_qty', abs(int(safe_float(o.get('quantity')))))
-                         for o in originals)
-        fx_to_base = fx_weighted / total_orig_qty if total_orig_qty else 1.0
-
-        if base_currency == 'EUR':
-            premium_eur = net_premium_raw * fx_to_base
-        else:
-            date = parse_date(a.get('dateTime') or a.get('tradeDate'))
-            rate_eur = get_rate_for_date(date, usd_to_eur_rates)
-            premium_eur = net_premium_raw * fx_to_base * rate_eur
+        shares = consumed_qty * mult
+        fx_to_base = fx_weighted / consumed_qty if consumed_qty else 1.0  # nur Display
 
         premium_per_share_eur = premium_eur / shares if shares else 0
         a_date = parse_date(a.get('reportDate') or a.get('dateTime') or a.get('tradeDate'))
@@ -1594,6 +1661,18 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             'premium_per_share_raw': premium_per_share_raw,
             'strike': strike,
             'year': a_date.year if a_date else 0,
+        })
+        # Issue #55: Snapshot fuer _tageskurs_put_adj — bleibt erhalten auch wenn
+        # put_assignment_lots durch Apply-Schleife geleert wird.
+        # WICHTIG: date_str MUSS dateTime/tradeDate sein (Trade-Datum), nicht
+        # reportDate (Settlement). closed_lots.openDateTime[:10] matcht das
+        # Trade-Datum — bei OpEx-Friday-Andienungen liegt reportDate auf Mo,
+        # was den Match brechen wuerde. put_assignment_lots.date bleibt
+        # unveraendert (reportDate-bevorzugt) fuer Sortier-Zwecke.
+        _xy_tageskurs_lots.setdefault(underlying, []).append({
+            'date_str': (a.get('dateTime') or a.get('tradeDate') or '')[:10],
+            'shares': shares,
+            'premium_per_share_raw': premium_per_share_raw,
         })
         # Anlage-SO-Lookup für cross-year (Issue #51)
         u_isin_xy = symbol_to_isin.get(underlying, '')
@@ -1796,11 +1875,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         if det['is_cross_year']:
             yr = det['orig_sell_year']
             cross_year_by_year[yr] = cross_year_by_year.get(yr, 0) + det['premium_eur']
-    # Add prior-year SELL-to-open corrections to cross_year tracking
+    # Add prior-year SELL-to-open corrections to cross_year_by_year (display only).
+    # Do NOT add to cross_year_premium_eur — prior_zufluss_correction_eur is already
+    # subtracted from options_gain in the block above (line ~1484). Aggregating it
+    # here would cause the GUI's Zuflussprinzip toggle to subtract the same amount
+    # a second time (Double-Dip in Z19).
     for det in prior_zufluss_details:
         yr = det['sell_year']
         cross_year_by_year[yr] = cross_year_by_year.get(yr, 0) + det['premium_eur']
-        cross_year_premium_eur += det['premium_eur']
 
     # --- PLAUSIBILITY: Raw Sums for Reconciliation ---
     # Use reportDate (booking date) for year assignment — Zuflussprinzip (§11 EStG)
@@ -2273,56 +2355,19 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             'premium_per_share_raw': det['premium_raw'] / shares,
         })
     # Include cross-year put assignments (assigned in prior years).
-    # NOTE: This mirrors the matching logic from the cross-year section (~line 1317).
-    # If that logic changes, update this section accordingly.
-    for a in prior_put_assignments:
-        strike = a.get('strike')
-        expiry = a.get('expiry')
-        a_cat = a.get('assetCategory')
-        a_qty = abs(int(safe_float(a.get('quantity'))))
-        mult = int(safe_float(a.get('multiplier'), 100))
-        underlying = a.get('underlyingSymbol', '')
-        if not strike or not underlying or a_qty == 0:
-            continue
-        # Total assignment qty for this series (all years) to determine open sells
-        assign_qty_series = sum(
-            abs(int(safe_float(t.get('quantity'))))
-            for t in trades
-            if t.get('assetCategory') == a_cat
-            and t.get('transactionType') == 'BookTrade'
-            and t.get('buySell') == 'BUY'
-            and t.get('strike') == strike
-            and t.get('expiry') == expiry
-            and t.get('putCall') == 'P'
-            and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01
-        )
-        originals = _get_open_option_sells(trades, a_cat, strike, expiry, 'P', assign_qty_series)
-        if not originals:
-            continue
-        total_premium_raw = 0.0
-        total_commission = 0.0
-        total_orig_qty = 0
-        for orig in originals:
-            price = safe_float(orig.get('tradePrice')) or safe_float(orig.get('closePrice'))
-            qty = orig.get('_open_qty', abs(int(safe_float(orig.get('quantity')))))
-            orig_full_qty = abs(int(safe_float(orig.get('quantity'))))
-            comm = safe_float(orig.get('ibCommission'), 0)
-            if orig_full_qty > 0 and qty < orig_full_qty:
-                comm = comm * qty / orig_full_qty
-            if qty > 0 and price > 0:
-                total_premium_raw += price * mult * qty
-                total_commission += comm
-                total_orig_qty += qty
-        if total_orig_qty == 0 or total_premium_raw == 0:
-            continue
-        premium_raw = total_premium_raw * a_qty / total_orig_qty + total_commission * a_qty / total_orig_qty
-        shares = a_qty * mult
-        a_date_str = (a.get('dateTime') or a.get('tradeDate') or '')[:10]
-        _tageskurs_put_adj.setdefault(underlying, deque()).append({
-            'date': a_date_str,
-            'shares_remaining': shares,
-            'premium_per_share_raw': premium_raw / shares,
-        })
+    # Issue #55: Premium-Werte werden aus _xy_tageskurs_lots gelesen (dort waehrend
+    # der prior_put_assignments-Schleife unter FIFO-Logik gespeichert, siehe Issue
+    # #54 Fix). Das eliminiert die fruehere parallele Berechnung mit dem identischen
+    # Durchschnitts-Bug.
+    for sym, snap_lots in _xy_tageskurs_lots.items():
+        for snap in snap_lots:
+            if snap['shares'] <= 0:
+                continue
+            _tageskurs_put_adj.setdefault(sym, deque()).append({
+                'date': snap['date_str'],
+                'shares_remaining': snap['shares'],
+                'premium_per_share_raw': snap['premium_per_share_raw'],
+            })
     # Sort each symbol's lots by date (FIFO)
     for sym in _tageskurs_put_adj:
         _tageskurs_put_adj[sym] = deque(sorted(_tageskurs_put_adj[sym], key=lambda x: x['date']))

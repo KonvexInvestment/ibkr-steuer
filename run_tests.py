@@ -2,6 +2,9 @@
 """Regression test runner: vergleicht Steuerberechnung gegen erwartete Werte.
 
 Nutzt test_data/audit_expectations.json als Referenz (echte IBKR-Daten, gitignored).
+Vergleicht die GUI-defaults Werte: Tageskurs-Methode, InvStG/KAP-INV und
+Zuflussprinzip sind alle aktiv. Damit decken die Tests genau das ab, was der
+User in der UI sieht.
 
 Usage:
     python run_tests.py              # alle verfügbaren Szenarien
@@ -20,14 +23,62 @@ SCENARIOS = {
     },
 }
 
-FIELDS = ['zeile_19', 'zeile_20', 'zeile_22', 'zeile_23', 'zeile_41']
-FIELD_KEYS = {
-    'zeile_19': 'zeile_19_netto_eur',
-    'zeile_20': 'zeile_20_stock_gains_eur',
-    'zeile_22': 'zeile_22_other_losses_eur',
-    'zeile_23': 'zeile_23_stock_losses_eur',
-    'zeile_41': 'zeile_41_withholding_tax_eur',
-}
+FIELDS = ['zeile_19', 'zeile_20', 'zeile_22', 'zeile_23', 'zeile_41', 'etf_net_taxable']
+
+
+def compute_user_facing(rd):
+    """Repliziert das GUI-final-Dict mit allen Default-Toggles aktiv (Tageskurs,
+    InvStG, Zuflussprinzip). Die Werte entsprechen dem, was der User sieht.
+    Logik gespiegelt aus gui_app/app.py:825-977."""
+    pre_z19 = rd.get('zeile_19_netto_eur', 0)
+    pre_z20 = rd.get('zeile_20_stock_gains_eur', 0)
+    pre_z22 = rd.get('zeile_22_other_losses_eur', 0)
+    pre_z23 = rd.get('zeile_23_stock_losses_eur', 0)
+    z41 = rd.get('zeile_41_withholding_tax_eur', 0)
+
+    fx_corr_total = rd.get('fx_correction_total', 0)
+    fx_corr = rd.get('fx_correction_by_topf', {}) or {}
+    tk_gain = rd.get('fx_corr_gain_adj', {}) or {}
+    tk_loss = rd.get('fx_corr_loss_adj', {}) or {}
+    kap_inv = rd.get('kap_inv', {}) or {}
+    audit = rd.get('audit', {}) or {}
+    stillhalter_details = audit.get('stillhalter_details', []) or []
+
+    # Zuflussprinzip default-on, aber nur sichtbar wenn cross_year_details
+    # vorhanden (gui_app/app.py:828, 841). adj_cross zieht Vorjahres-Andienungs-
+    # Praemien aus dem aktuellen Steuerjahr heraus.
+    cross_year_premium = sum(d['premium_eur'] for d in stillhalter_details
+                              if d.get('is_cross_year'))
+    has_cross_year_details = any(d.get('is_cross_year') for d in stillhalter_details)
+    adj_cross = cross_year_premium if has_cross_year_details else 0
+
+    # Tageskurs-Toggle wird in der GUI nur gezeigt wenn |fx_corr_total| > 0.01
+    # (gui_app/app.py:903). Wenn nicht gezeigt → tageskurs_aktiv=False → keine
+    # Korrekturen anwenden. Verhindert dass sich aufhebende Topf1/Topf2-Korrekturen
+    # den Test-Vergleich verfaelschen.
+    tageskurs_aktiv = abs(fx_corr_total) > 0.01
+
+    # InvStG aktiv → KAP-INV bleibt separat, Z19-Korrektur nur fuer Topf1+Topf2.
+    z19 = pre_z19 - adj_cross
+    z20 = pre_z20
+    z22 = pre_z22
+    z23 = pre_z23
+    if tageskurs_aktiv:
+        z19 += fx_corr.get('Topf1', 0) + fx_corr.get('Topf2', 0)
+        z20 += tk_gain.get('Topf1', 0)
+        z22 -= tk_loss.get('Topf2', 0)
+        z23 -= tk_loss.get('Topf1', 0)
+    has_etf = bool(kap_inv.get('etf_by_isin'))
+    etf_net = (kap_inv.get('etf_net_taxable_eur', 0)
+               + (fx_corr.get('KAP-INV', 0) if tageskurs_aktiv else 0)) if has_etf else 0
+    return {
+        'zeile_19': z19,
+        'zeile_20': z20,
+        'zeile_22': z22,
+        'zeile_23': z23,
+        'zeile_41': z41,
+        'etf_net_taxable': etf_net,
+    }
 
 
 def run_tests():
@@ -72,13 +123,22 @@ def run_tests():
         with contextlib.redirect_stdout(io.StringIO()):
             rd = calculate_tax(out_dir)
 
-        # Compare
+        # GUI-defaults anwenden (Tageskurs+InvStG+Zufluss aktiv)
+        user = compute_user_facing(rd)
+
         mismatches = []
+        missing_fields = []
         for field in FIELDS:
-            actual = round(rd.get(FIELD_KEYS[field], 0), 2)
+            if field not in exp['expected']:
+                missing_fields.append(field)
+                continue
+            actual = round(user.get(field, 0), 2)
             expected = exp['expected'][field]
             if abs(actual - expected) > 0.01:
                 mismatches.append(f"{field}: erwartet {expected}, bekommen {actual}")
+        if missing_fields:
+            print(f"  WARN  {name:20s} ({exp['description']}) — fehlende Felder in audit_expectations.json: {', '.join(missing_fields)}")
+            print(f"        Hinweis: 'test_data/' ist gitignored. Nach Schema-Updates lokales JSON manuell ergaenzen.")
 
         if mismatches:
             print(f"  FAIL  {name:20s} ({exp['description']})")
