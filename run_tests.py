@@ -45,11 +45,12 @@ def compute_user_facing(rd):
     stillhalter_details = audit.get('stillhalter_details', []) or []
 
     # Zuflussprinzip default-on, aber nur sichtbar wenn cross_year_details
-    # vorhanden (gui_app/app.py:828, 841). adj_cross zieht Vorjahres-Andienungs-
-    # Praemien aus dem aktuellen Steuerjahr heraus.
-    cross_year_premium = sum(d['premium_eur'] for d in stillhalter_details
-                              if d.get('is_cross_year'))
-    has_cross_year_details = any(d.get('is_cross_year') for d in stillhalter_details)
+    # vorhanden (gui_app/app.py:828, 841). Die GUI zieht audit['cross_year_premium_eur']
+    # ab; genau diesen Wert verwenden wir hier, damit ein falsch aggregiertes
+    # Audit-Feld (z.B. prior_zufluss doppelt enthalten) im Test sichtbar wird.
+    cross_year_details = [d for d in stillhalter_details if d.get('is_cross_year')]
+    cross_year_premium = audit.get('cross_year_premium_eur', 0)
+    has_cross_year_details = bool(cross_year_details)
     adj_cross = cross_year_premium if has_cross_year_details else 0
 
     # Tageskurs-Toggle wird in der GUI nur gezeigt wenn |fx_corr_total| > 0.01
@@ -128,6 +129,17 @@ def run_tests():
 
         mismatches = []
         missing_fields = []
+        audit = rd.get('audit', {}) or {}
+        stillhalter_details = audit.get('stillhalter_details', []) or []
+        cross_year_detail_sum = sum(d.get('premium_eur', 0) for d in stillhalter_details
+                                    if d.get('is_cross_year'))
+        cross_year_field = audit.get('cross_year_premium_eur', 0)
+        if abs(cross_year_field - cross_year_detail_sum) > 0.01:
+            mismatches.append(
+                "cross_year_premium_eur inkonsistent: "
+                f"Audit-Feld {round(cross_year_field, 2)}, "
+                f"Cross-Year-Details {round(cross_year_detail_sum, 2)}"
+            )
         for field in FIELDS:
             if field not in exp['expected']:
                 missing_fields.append(field)
