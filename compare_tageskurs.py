@@ -8,7 +8,6 @@ Nutzung:
 
 import argparse
 import bisect
-import csv
 import os
 import shutil
 import sys
@@ -18,7 +17,7 @@ from collections import defaultdict
 # Import project modules
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from extract_ibkr_data import parse_ibkr_xml, extract_fx_multi_xml
-from calculate_tax_report import calculate_tax, load_csv, safe_float, parse_date
+from calculate_tax_report import calculate_tax, load_csv, safe_float
 
 
 def build_old_fx_map(trades):

@@ -1,7 +1,7 @@
-import streamlit as st
 import os
 import tempfile
 from datetime import datetime as _dt
+import streamlit as st
 
 import extract_ibkr_data
 import calculate_tax_report
@@ -1458,7 +1458,7 @@ if trade_details:
         sym = (row.get('symbol', '') or '').strip()
         return sym.split()[0] if sym else '?'
 
-    def _build_excel(trade_details, trades_by_topf):
+    def _build_excel(trades_by_topf):
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
@@ -1561,7 +1561,7 @@ if trade_details:
         ws.freeze_panes = 'A2'
         buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
-    xlsx_data = _build_excel(trade_details, trades_by_topf)
+    xlsx_data = _build_excel(trades_by_topf)
     st.download_button(
         label=f"Trade-Details als Excel herunterladen ({len(trade_details)} Positionen)",
         data=xlsx_data,

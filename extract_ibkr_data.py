@@ -748,9 +748,9 @@ def parse_ibkr_xml(xml_file_path, output_dir):
             total_pnl = sum(float(r['realizedPL']) for r in fx_pnl_rows)
             print(f"Saved {len(fx_pnl_rows)} FX realized PnL entries to {fx_pnl_path} (Total: {total_pnl:,.2f} EUR)")
     elif fx_trans_count == 0:
-        print(f"FxTransactions: Sektion vorhanden aber leer (Flex Query Konfiguration prüfen)")
+        print("FxTransactions: Sektion vorhanden aber leer (Flex Query Konfiguration prüfen)")
     else:
-        print(f"FxTransactions: Sektion nicht vorhanden")
+        print("FxTransactions: Sektion nicht vorhanden")
 
     # Extract AccountInformation (single element with base currency)
     acct_info = acct_info_node

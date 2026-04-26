@@ -1,9 +1,9 @@
-import streamlit as st
 import sys
 import os
 import tempfile
 from datetime import datetime as _dt
 from pathlib import Path
+import streamlit as st
 
 sys.path.append(str(Path(__file__).parent.parent))
 import extract_ibkr_data
@@ -1487,7 +1487,7 @@ if trade_details:
         sym = (row.get('symbol', '') or '').strip()
         return sym.split()[0] if sym else '?'
 
-    def _build_excel(trade_details, trades_by_topf):
+    def _build_excel(trades_by_topf):
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
@@ -1592,7 +1592,7 @@ if trade_details:
                     cost = r.get('cost', 0)
                     proceeds = r.get('proceeds', 0)
                     price = r.get('tradePrice', 0)
-                    mult = r.get('multiplier', '')
+                    #mult = r.get('multiplier', '')
 
                     anmerkung = ''
                     if source == 'pnl_summary':
@@ -1708,7 +1708,7 @@ if trade_details:
         wb.save(buf)
         return buf.getvalue()
 
-    xlsx_data = _build_excel(trade_details, trades_by_topf)
+    xlsx_data = _build_excel(trades_by_topf)
 
     st.download_button(
         label=f"Trade-Details als Excel herunterladen ({len(trade_details)} Positionen)",

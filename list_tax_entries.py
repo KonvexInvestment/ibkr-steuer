@@ -1,6 +1,5 @@
 import csv
 import os
-from datetime import datetime
 
 def list_taxes():
     file_path = 'statement_of_funds.csv'
