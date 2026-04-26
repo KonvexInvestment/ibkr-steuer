@@ -4,7 +4,7 @@ import io
 import os
 import sys
 from datetime import datetime, timedelta
-from collections import defaultdict
+from collections import defaultdict, deque
 
 def load_csv(filepath):
     if not os.path.exists(filepath):
@@ -118,9 +118,6 @@ def parse_ibkr_csv_report(csv_path):
     Returns:
         dict with 'fx_results', 'fx_total_gain', 'fx_total_loss', 'category_totals'
     """
-    import csv as csv_module
-    import io
-
     fx_results = {}
     fx_total_gain = 0.0
     fx_total_loss = 0.0
@@ -131,14 +128,14 @@ def parse_ibkr_csv_report(csv_path):
 
     with open(csv_path, 'r', encoding='utf-8-sig') as f:
         for line in f:
-            parts = list(csv_module.reader(io.StringIO(line)))[0]
+            parts = list(csv.reader(io.StringIO(line)))[0]
 
             # Dividenden/Zinsen/Quellensteuer EUR totals
             # Multi-Currency-CSVs haben eine explizite "Gesamt X in EUR"-Zeile (echte Summe
             # über alle Währungen). Single-Currency-CSVs haben nur "Gesamtwert in EUR"
             # (USD-Teil umgerechnet = Gesamt). Präzise Zeile gewinnt, Gesamtwert ist Fallback.
             if len(parts) >= 6:
-                field = parts[2].strip() if len(parts) > 2 else ''
+                #field = parts[2].strip() if len(parts) > 2 else ''
                 if line.startswith('Dividenden,Data,Gesamt Dividenden in EUR'):
                     income_totals['dividends_eur'] = safe_float(parts[5], 0)
                     continue
@@ -228,7 +225,6 @@ def calculate_fx_gains(trades, fx_transactions, tax_year, base_currency='EUR'):
     Returns:
         dict per currency, float total_gain, float total_loss, bool has_prior_data
     """
-    from collections import defaultdict, deque
     import bisect
 
     # --- Build daily rate maps per currency from trades.csv ---
@@ -600,7 +596,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         print(f"Base currency is {base_currency} — no USD→EUR rate map needed.")
 
     # 2b. Build ETF lookup from financial_instruments.csv
-    from etf_classification import get_classification, get_etf_info, get_teilfreistellung, is_known_etf, ETF_CLASSIFICATION
+    from etf_classification import get_etf_info, get_teilfreistellung, is_known_etf, ETF_CLASSIFICATION
 
     anlage_so_overrides_set = set(anlage_so_overrides or ())
 
@@ -802,10 +798,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
 
     # Write debug CSV
     if debug_rows:
-        import csv as csv_mod
         debug_path = os.path.join(ib_tax_dir, 'trades_debug_eur.csv')
         with open(debug_path, 'w', newline='', encoding='utf-8') as f:
-            w = csv_mod.DictWriter(f, fieldnames=debug_rows[0].keys())
+            w = csv.DictWriter(f, fieldnames=debug_rows[0].keys())
             w.writeheader()
             w.writerows(debug_rows)
         print(f"Debug: {len(debug_rows)} Trades mit EUR-Umrechnung → {debug_path}")
@@ -1219,7 +1214,6 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                   and d.year == tax_year]
 
     # Group by instrument key to match sells against closes/assignments
-    from collections import defaultdict
     instr_sells = defaultdict(list)   # {key: [sell_trades]}
     instr_closes = defaultdict(int)   # {key: total_closed_qty}
 
@@ -1585,7 +1579,6 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                              and d.year < tax_year]
 
     # Build FIFO lots per underlying symbol from prior-year put assignments
-    from collections import deque
     put_assignment_lots = {}  # {symbol: deque of (date, shares_remaining, premium_per_share_eur)}
     # Issue #55: paralleles immutable Dict fuer _tageskurs_put_adj. Da
     # put_assignment_lots durch die Apply-Schleife (popleft bei shares_remaining<=0)
@@ -2240,7 +2233,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             fx_source = 'xml'
             # USD base: IBKR tracks EUR as foreign currency, but from German tax perspective
             # it's the USD that's foreign. Label accordingly.
-            fx_label = 'USD' if base_currency == 'USD' else '/'.join(fx_by_curr.keys())
+            #fx_label = 'USD' if base_currency == 'USD' else '/'.join(fx_by_curr.keys())
             print(f"FX: Exakte Werte aus XML FxTransactions übernommen ({len(fx_pnl_rows)} Einträge).")
             if base_currency == 'USD':
                 print(f"  USD-Konto: FX-Gewinne/-Verluste aus EUR-Transaktionen (IBKR trackt EUR als Fremdwährung).")
