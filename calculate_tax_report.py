@@ -836,7 +836,22 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                        and (d := parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))) is not None
                        and d.year == tax_year]             # only assignments in tax year
 
-    for a in opt_assignments:
+    # Issue #53: Bei mehreren Andienungen derselben Series werden die Original-Sells
+    # FIFO konsumiert (aelteste zuerst), nicht als Durchschnitt verteilt. State pro
+    # Series wird zwischen den Iterationen weitergetragen — analog zum Cross-Year-
+    # Block (Issue #54). Andienungen werden zeitlich sortiert, damit (a) der Series-
+    # State chronologisch konsumiert wird und (b) pending_stk_corrections[underlying]
+    # in chronologischer Reihenfolge entsteht — Voraussetzung fuer FIFO-konforme
+    # Praemien-Korrektur ueber Stock-Verkaeufe desselben Underlyings (z.B. mehrere
+    # SVOL-Series mit unterschiedlichen Strikes). trades.csv ist in IBKR-Flex-Queries
+    # NICHT garantiert chronologisch, daher muss explizit sortiert werden.
+    opt_assignments_sorted = sorted(
+        opt_assignments,
+        key=lambda t: (t.get('dateTime', '') or t.get('tradeDate', '') or t.get('reportDate', '') or '')
+    )
+    _current_year_series_state = {}  # {(a_cat, underlying, strike, expiry, putCall): originals_state}
+
+    for a in opt_assignments_sorted:
         strike = a.get('strike')
         expiry = a.get('expiry')
         pc = a.get('putCall')
@@ -849,24 +864,61 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # underlyingSymbol einbeziehen — verschiedene Aktien koennen dieselbe
         # strike/expiry-Kombination haben (z.B. KWEB P 30 vs FXI P 30).
         a_underlying = a.get('underlyingSymbol', '')
-        assign_qty_series = sum(
-            abs(int(safe_float(t.get('quantity'))))
-            for t in trades
-            if t.get('assetCategory') == a_cat
-            and t.get('transactionType') == 'BookTrade'
-            and t.get('buySell') == 'BUY'
-            and t.get('strike') == strike
-            and t.get('expiry') == expiry
-            and t.get('putCall') == pc
-            and t.get('underlyingSymbol', '') == a_underlying
-            and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01
-        )
+        series_key = (a_cat, a_underlying, strike, expiry, pc)
 
-        # Find only OPEN original sells (FIFO: bought-back/expired positions consumed first)
-        originals = _get_open_option_sells(trades, a_cat, strike, expiry, pc, assign_qty_series,
-                                           underlying=a_underlying)
+        if series_key not in _current_year_series_state:
+            assign_qty_series = sum(
+                abs(int(safe_float(t.get('quantity'))))
+                for t in trades
+                if t.get('assetCategory') == a_cat
+                and t.get('transactionType') == 'BookTrade'
+                and t.get('buySell') == 'BUY'
+                and t.get('strike') == strike
+                and t.get('expiry') == expiry
+                and t.get('putCall') == pc
+                and t.get('underlyingSymbol', '') == a_underlying
+                and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01
+            )
+            state = _get_open_option_sells(
+                trades, a_cat, strike, expiry, pc, assign_qty_series, underlying=a_underlying
+            )
 
-        if not originals:
+            # Issue #61: Pre-consume Vorjahres-Andienungen derselben Series, damit
+            # der Same-Year-Block FIFO bei den juengeren OPEN Sells startet. Ohne
+            # diesen Schritt konsumiert der Same-Year-Block die aeltesten Sells,
+            # die konzeptionell zur Vorjahres-Andienung gehoeren (im Vorjahres-Lauf
+            # bereits versteuert). Gilt fuer Calls UND Puts (series_key enthaelt pc).
+            prior_assigns = sorted(
+                [t for t in trades
+                 if t.get('assetCategory') == a_cat
+                 and t.get('transactionType') == 'BookTrade'
+                 and t.get('buySell') == 'BUY'
+                 and t.get('strike') == strike
+                 and t.get('expiry') == expiry
+                 and t.get('putCall') == pc
+                 and t.get('underlyingSymbol', '') == a_underlying
+                 and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01
+                 and (pd_ := parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))) is not None
+                 and pd_.year < tax_year],
+                key=lambda t: (t.get('dateTime', '') or t.get('tradeDate', '') or t.get('reportDate', '') or '')
+            )
+            if prior_assigns and state:
+                first_open_pre = next((o for o in state if o.get('_open_qty', 0) > 0), None)
+                if first_open_pre and safe_float(first_open_pre.get('multiplier')) > 0:
+                    mult_pre = int(safe_float(first_open_pre.get('multiplier'), 100))
+                else:
+                    mult_pre = int(safe_float(prior_assigns[0].get('multiplier'), 100))
+                for pa in prior_assigns:
+                    pa_qty = abs(int(safe_float(pa.get('quantity'))))
+                    if pa_qty <= 0:
+                        continue
+                    _consume_open_sells_fifo(state, pa_qty, mult_pre, base_currency, usd_to_eur_rates)
+
+            _current_year_series_state[series_key] = state
+
+        originals_state = _current_year_series_state[series_key]
+
+        if not originals_state:
             symbol = a.get('symbol', f"{strike} {expiry} {pc}")
             print(f"  Stillhalter: Kein Original-SELL gefunden für {symbol} {expiry} {pc}")
             stillhalter_unmatched.append({
@@ -879,57 +931,32 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             })
             continue
 
-        # Per-Fill Akkumulation: brutto raw, EUR netto (inkl. Commission) jeweils
-        # mit dem FX-Kurs des einzelnen Fills. Vermeidet den FX-Mittelungs-Bug
-        # bei divergenten Preisen + Raten (Codex P2).
-        total_premium_raw = 0.0
-        total_commission = 0.0
-        total_premium_eur = 0.0
-        total_orig_qty = 0
-        fx_weighted = 0.0
-        mult = int(safe_float(originals[0].get('multiplier'), 100))
+        # Multiplier aus dem ersten offenen Original-SELL bevorzugen (entspricht dem
+        # Kontrakt, dessen Praemie konsumiert wird). Fallback auf BookTrade-Andienung,
+        # wenn der Original-SELL keinen mult-Wert hat (FOP/FSFOP koennten abweichen).
+        first_open = next((o for o in originals_state if o.get('_open_qty', 0) > 0), None)
+        if first_open and safe_float(first_open.get('multiplier')) > 0:
+            mult = int(safe_float(first_open.get('multiplier'), 100))
+        else:
+            mult = int(safe_float(a.get('multiplier'), 100))
 
-        for orig in originals:
-            price = safe_float(orig.get('tradePrice')) or safe_float(orig.get('closePrice'))
-            qty = orig.get('_open_qty', abs(int(safe_float(orig.get('quantity')))))
-            orig_full_qty = abs(int(safe_float(orig.get('quantity'))))
-            comm = safe_float(orig.get('ibCommission'), 0)
-            # Scale commission proportionally if sell was partially consumed
-            if orig_full_qty > 0 and qty < orig_full_qty:
-                comm = comm * qty / orig_full_qty
-            if qty > 0 and price > 0:
-                fill_brutto_raw = price * mult * qty
-                fill_net_raw = fill_brutto_raw + comm
-                fx = safe_float(orig.get('fxRateToBase'), 1.0)
-                if base_currency == 'EUR':
-                    fill_eur = fill_net_raw * fx
-                else:
-                    sd = parse_date(orig.get('dateTime') or orig.get('tradeDate'))
-                    r_eur = get_rate_for_date(sd, usd_to_eur_rates)
-                    fill_eur = fill_net_raw * fx * r_eur
-                total_premium_raw += fill_brutto_raw
-                total_commission += comm
-                total_premium_eur += fill_eur
-                fx_weighted += fx * qty
-                total_orig_qty += qty
+        premium_raw, commission_raw, fx_weighted, premium_eur, sells_consumed, consumed_qty = \
+            _consume_open_sells_fifo(originals_state, a_qty, mult, base_currency, usd_to_eur_rates)
 
-        if total_orig_qty == 0 or total_premium_raw == 0:
+        if consumed_qty == 0 or premium_raw == 0:
             continue
 
-        # Scale to assignment quantity (may be less than total open sells)
-        scale = a_qty / total_orig_qty
-        premium_raw = total_premium_raw * scale
-        commission_raw = total_commission * scale
         net_premium_raw = premium_raw + commission_raw
-        premium_eur = total_premium_eur * scale
-        fx_to_base = fx_weighted / total_orig_qty if total_orig_qty else 1.0  # nur Display
+        fx_to_base = fx_weighted / consumed_qty if consumed_qty else 1.0  # nur Display
 
         stillhalter_premium_eur += premium_eur
         stillhalter_count += 1
 
         # Collect per-assignment details for Zuflussprinzip
+        # Issue #53: orig_sell_date aus tatsaechlich konsumierten Sells, nicht aus
+        # allen offenen — sonst wird is_cross_year bei Mehrfach-Andienungen verfaelscht.
         orig_sell_date = None
-        for orig in originals:
+        for orig, _consume_qty in sells_consumed:
             od = parse_date(orig.get('dateTime') or orig.get('tradeDate'))
             if od is not None and (orig_sell_date is None or od < orig_sell_date):
                 orig_sell_date = od

@@ -167,6 +167,16 @@ def run_tests():
     if failed > 0:
         sys.exit(1)
 
+    # Synthetische Cross-Year-Series-Tests (Issue #61). Real-Audit-Daten enthalten
+    # 0 Cross-Year-Same-Series; daher synthetische TCs fuer Bug-Coverage.
+    print(f"\n{'-'*60}")
+    print("Synthetische Cross-Year-Series-Tests (Issue #61)")
+    sys.stdout.flush()
+    rc = os.system("python tests/test_cross_year_series.py")
+    if rc != 0:
+        print("FAIL: Cross-Year-Series-Tests")
+        sys.exit(1)
+
 
 if __name__ == '__main__':
     run_tests()
