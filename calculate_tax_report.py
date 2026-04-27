@@ -93,7 +93,10 @@ def fetch_ecb_rates(tax_year):
 
 def get_rate_for_date(target_date, rates_map):
     if not rates_map:
-        return 0.95 # Fallback average 2025 prediction
+        raise RuntimeError(
+            f"get_rate_for_date({target_date}) ohne Wechselkurs-Map aufgerufen — "
+            f"calculate_tax muss USD-Base-Validierung am Eingang sicherstellen."
+        )
 
     if target_date in rates_map:
         return rates_map[target_date]
@@ -596,6 +599,13 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             print(f"EZB-Referenzkurse:  nicht verfügbar für Steuerjahr {tax_year} (nur 2024/2025 eingebettet).")
 
         print(f"Wechselkurse gesamt: {len(usd_to_eur_rates)} Tageskurse.")
+
+        if not usd_to_eur_rates:
+            raise RuntimeError(
+                f"Keine USD/EUR-Wechselkurse verfügbar für Steuerjahr {tax_year}. "
+                f"Weder IBKR-Trade-Daten noch EZB-Referenzkurse (ecb_rates.py) liefern Werte. "
+                f"Bitte EZB-Kursdaten für {tax_year} in ecb_rates.py ergänzen oder Steuerjahr 2024/2025 verwenden."
+            )
     else:
         print(f"Base currency is {base_currency} — no USD→EUR rate map needed.")
 
@@ -2070,7 +2080,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             last_date = sorted(usd_to_eur_rates.keys())[-1]
             default_fallback_rate = usd_to_eur_rates[last_date]
         else:
-            default_fallback_rate = 0.95
+            raise RuntimeError(
+                "PnL-Summary-Fallback: USD-Base ohne Wechselkurse — "
+                "diese Bedingung sollte durch die Eingangs-Validierung in calculate_tax abgefangen sein."
+            )
 
         added_from_summary = 0
         for s_row in summary_rows:
