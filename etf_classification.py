@@ -175,6 +175,7 @@ ETF_CLASSIFICATION = {
     'US78464A8488': ('XSD',  'SPDR S&P Semiconductor ETF',                       'aktienfonds'),
     'US78467Y1070': ('XSM',  'SPDR S&P MidCap 400 ETF',                          'aktienfonds'),
     'US4642883984': ('XUS',  'iShares MSCI ACWI ex U.S. ETF',                    'aktienfonds'),
+    'US37954Y4834': ('QYLD', 'Global X NASDAQ 100 Covered Call ETF',             'aktienfonds'),  # 2025-Prospekt: Nasdaq-100-Aktienkorb mit gedeckten Calls
 
     # --- Commodity-ETFs (Futures/Derivate-basiert, keine Aktien) ---
     'US46138B1035': ('DBC',  'Invesco DB Commodity Index Tracking Fund',         'sonstiger_fonds'),  # Commodity Pool, Futures

@@ -9,17 +9,28 @@ User in der UI sieht.
 Usage:
     python run_tests.py              # alle verfügbaren Szenarien
 """
-import json, os, shlex, sys, tempfile
+import json, os, shlex, subprocess, sys, tempfile
 
 SCENARIOS = {
     "audit1_haupt": {
-        "extract": "python extract_ibkr_data.py test_data/audit1_2024.xml {out} --history test_data/audit1_2023_history.xml",
+        "source": "test_data/audit1_2024.xml",
+        "extract": [
+            "extract_ibkr_data.py", "test_data/audit1_2024.xml", "{out}",
+            "--history", "test_data/audit1_2023_history.xml",
+        ],
     },
     "audit1_zusatz": {
-        "extract": "python extract_ibkr_data.py test_data/audit1_2024_zusatzkonto.xml {out}",
+        "source": "test_data/audit1_2024_zusatzkonto.xml",
+        "extract": [
+            "extract_ibkr_data.py", "test_data/audit1_2024_zusatzkonto.xml", "{out}",
+        ],
     },
     "audit2": {
-        "extract": "python extract_ibkr_data.py test_data/audit2_2022.xml {out} --history test_data/audit2_2021.xml",
+        "source": "test_data/audit2_2022.xml",
+        "extract": [
+            "extract_ibkr_data.py", "test_data/audit2_2022.xml", "{out}",
+            "--history", "test_data/audit2_2021.xml",
+        ],
     },
 }
 
@@ -31,6 +42,7 @@ SYNTHETIC_TESTS = [
     ("Quarterly-History-Extraction", "tests/test_quarterly_history_extraction.py"),
     ("KAP-INV-WHT", "tests/test_kap_inv_wht.py"),
     ("KAP-INV-Tageskurs-TFS", "tests/test_kap_inv_tageskurs.py"),
+    ("QYLD-und-Sonderprodukte", "tests/test_qyld_and_special_products.py"),
     ("German-Dividend-Tax", "-m unittest tests/test_german_dividend_tax.py"),
     ("FX-Margin-Negative-Balance", "tests/test_fx_negative_balance.py"),
 ]
@@ -124,24 +136,31 @@ def run_tests():
             continue
 
         # Check if source files exist
-        extract_cmd = scenario['extract'].format(out='/tmp/_test_check')
-        src_file = extract_cmd.split()[2]  # first XML path
+        src_file = scenario['source']
         if not os.path.exists(src_file):
             print(f"  SKIP  {name:20s} ({exp['description']}) — Datei nicht vorhanden")
             skipped += 1
             continue
 
         # Extract
-        out_dir = tempfile.mkdtemp(prefix=f'test_{name}_')
-        cmd = scenario['extract'].format(out=out_dir)
-        if cmd.startswith("python "):
-            cmd = f"{shlex.quote(sys.executable)} {cmd[len('python '):]}"
-        os.system(f"{cmd} > /dev/null 2>&1")
+        with tempfile.TemporaryDirectory(prefix=f'test_{name}_') as out_dir:
+            cmd = [
+                sys.executable,
+                *(arg.format(out=out_dir) for arg in scenario['extract']),
+            ]
+            completed = subprocess.run(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if completed.returncode != 0:
+                print(f"  FAIL  {name:20s} ({exp['description']}) — Extraktion fehlgeschlagen")
+                failed += 1
+                continue
 
-        # Calculate (suppress stdout)
-        import io, contextlib
-        with contextlib.redirect_stdout(io.StringIO()):
-            rd = calculate_tax(out_dir)
+            # Calculate (suppress stdout)
+            import io, contextlib
+            with contextlib.redirect_stdout(io.StringIO()):
+                rd = calculate_tax(out_dir)
 
         # GUI-defaults anwenden (Tageskurs+InvStG+Zufluss aktiv)
         user = compute_user_facing(rd)
@@ -199,8 +218,10 @@ def run_tests():
     for label, test_cmd in SYNTHETIC_TESTS:
         print(f"  RUN   {label}")
         sys.stdout.flush()
-        rc = os.system(f"{shlex.quote(sys.executable)} {test_cmd}")
-        if rc != 0:
+        completed = subprocess.run(
+            [sys.executable, *shlex.split(test_cmd)], check=False,
+        )
+        if completed.returncode != 0:
             print(f"  FAIL  {label}")
             sys.exit(1)
 
