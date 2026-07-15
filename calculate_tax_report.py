@@ -25,6 +25,16 @@ def safe_float(val, default=0.0):
         return default
     return float(val)
 
+def get_withholding_tax_for_reporting(signed_cash_amount):
+    """Convert IBKR's signed tax cash flow to the report sign convention.
+
+    IBKR records tax deductions as negative cash flows and refunds as positive
+    cash flows. The tax report uses the inverse sign: creditable tax is positive,
+    while a net refund remains negative and must not become a new tax credit.
+    """
+    signed_cash_amount = safe_float(signed_cash_amount)
+    return 0.0 if signed_cash_amount == 0 else -signed_cash_amount
+
 def get_kap_inv_wht_for_reporting(kap_inv):
     """Return KAP-INV withholding tax after Teilfreistellung, with legacy fallback."""
     if not kap_inv:
@@ -40,6 +50,75 @@ def get_kap_inv_tageskurs_delta_for_reporting(report_data):
     if 'fx_correction_kap_inv_taxable' in report_data:
         return safe_float(report_data.get('fx_correction_kap_inv_taxable'))
     return safe_float((report_data.get('fx_correction_by_topf') or {}).get('KAP-INV'))
+
+def get_no_invstg_summary(report_data, include_tageskurs=False):
+    """Aggregate no-InvStG instruments by ISIN from final trade details.
+
+    Trade rows already contain Stillhalter/cross-year corrections. Optional
+    Tageskurs deltas are added separately so the summary stays reconcilable.
+    """
+    from etf_classification import get_classification, get_etf_info
+
+    report_data = report_data or {}
+    summary = {}
+    anlage_so_overrides = set(report_data.get('anlage_so_overrides_applied') or [])
+
+    def ensure_entry(isin):
+        if isin not in summary:
+            info = get_etf_info(isin) or {}
+            summary[isin] = {
+                'ticker': info.get('ticker', isin[:12]),
+                'name': info.get('name', ''),
+                'gain': 0.0,
+                'loss': 0.0,
+                'tageskurs': 0.0,
+                'div': 0.0,
+                'wht': 0.0,
+            }
+        return summary[isin]
+
+    # Auch reine Käufe ohne realisierten Gewinn sichtbar machen.
+    for isin in report_data.get('all_traded_etf_isins', []) or []:
+        if (isin and isin not in anlage_so_overrides
+                and get_classification(isin) == 'no_invstg'):
+            ensure_entry(isin)
+
+    for isin, income in (report_data.get('no_invstg_income_by_isin') or {}).items():
+        if (not isin or isin in anlage_so_overrides
+                or get_classification(isin) != 'no_invstg'):
+            continue
+        entry = ensure_entry(isin)
+        entry['div'] += safe_float(income.get('div'))
+        entry['wht'] += safe_float(income.get('wht'))
+
+    for row in report_data.get('trade_details', []) or []:
+        isin = (row.get('isin') or '').strip()
+        if (row.get('assetCategory') != 'STK' or row.get('topf') != 'Topf2'
+                or not isin or isin in anlage_so_overrides
+                or get_classification(isin) != 'no_invstg'):
+            continue
+        pnl = safe_float(row.get('pnl_eur'))
+        entry = ensure_entry(isin)
+        if pnl >= 0:
+            entry['gain'] += pnl
+        else:
+            entry['loss'] += pnl
+
+    if include_tageskurs:
+        for lot in report_data.get('fx_correction_details', []) or []:
+            isin = (lot.get('isin') or '').strip()
+            if (lot.get('topf') != 'Topf2' or not isin
+                    or isin in anlage_so_overrides
+                    or get_classification(isin) != 'no_invstg'):
+                continue
+            ensure_entry(isin)['tageskurs'] += safe_float(lot.get('delta_eur'))
+
+    for entry in summary.values():
+        entry['trade_net'] = entry['gain'] + entry['loss'] + entry['tageskurs']
+        entry['total'] = entry['trade_net'] + entry['div']
+        entry['wht_reported'] = get_withholding_tax_for_reporting(entry['wht'])
+
+    return summary
 
 GERMAN_DIVIDEND_TAX_TOTAL_RATE = 0.26375
 GERMAN_KEST_RATE = 0.25
@@ -1587,6 +1666,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     # no_invstg ETP tracking (for plausibility check — IBKR counts these as STK/Aktien)
     no_invstg_gain = 0.0
     no_invstg_loss = 0.0
+    no_invstg_income_by_isin = {}
 
     # Anlage SO tracking (§23 EStG — physische Gold-ETCs mit Lieferanspruch)
     # Trades are collected for holding period analysis; gains/losses excluded from KAP entirely
@@ -2988,6 +3068,17 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     funds_processed = 0
     funds_skipped_year = 0
 
+    def ensure_no_invstg_income(isin):
+        if isin not in no_invstg_income_by_isin:
+            info = get_etf_info(isin) or {}
+            no_invstg_income_by_isin[isin] = {
+                'ticker': info.get('ticker', isin[:12]),
+                'name': info.get('name', ''),
+                'div': 0.0,
+                'wht': 0.0,
+            }
+        return no_invstg_income_by_isin[isin]
+
     for f in funds:
         code = f.get('activityCode')
         if not code and is_german_dividend_tax_row(f):
@@ -3035,13 +3126,16 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # Ausschüttungen auf physische Edelmetall-ETCs sind nicht als InvStG-
         # Fondsausschüttungen zu behandeln — sie fließen in reguläre Dividenden.
         is_etf_fund = False
+        is_no_invstg = False
         fund_isin = ''
+        fund_cls = None
         _fund_isin_raw = f.get('isin', '').strip()
         if f.get('subCategory') == 'ETF' or (_fund_isin_raw and is_known_etf(_fund_isin_raw)):
             fund_isin = _fund_isin_raw
             if fund_isin:
-                cls = _effective_classification(fund_isin)
-                if cls not in ('no_invstg', 'anlage_so'):
+                fund_cls = _effective_classification(fund_isin)
+                is_no_invstg = fund_cls == 'no_invstg'
+                if fund_cls not in ('no_invstg', 'anlage_so'):
                     is_etf_fund = True
 
         if code == 'DIV':
@@ -3049,12 +3143,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 etf_dividends_eur += amount_eur
                 if fund_isin not in etf_by_isin:
                     info = get_etf_info(fund_isin)
-                    etf_by_isin[fund_isin] = {'ticker': info['ticker'] if info else fund_isin[:12], 'name': info['name'] if info else '', 'classification': cls or 'sonstiger_fonds', 'gain': 0.0, 'loss': 0.0, 'div': 0.0, 'wht': 0.0}
+                    etf_by_isin[fund_isin] = {'ticker': info['ticker'] if info else fund_isin[:12], 'name': info['name'] if info else '', 'classification': fund_cls or 'sonstiger_fonds', 'gain': 0.0, 'loss': 0.0, 'div': 0.0, 'wht': 0.0}
                 etf_by_isin[fund_isin]['div'] += amount_eur
             elif is_de_isin(f) and funds_match_key(f) in german_dividend_tax_keys:
                 domestic_taxed_dividends_eur += amount_eur
             else:
                 dividends_eur += amount_eur
+                if is_no_invstg:
+                    ensure_no_invstg_income(fund_isin)['div'] += amount_eur
         elif code == 'PIL':
             # Payment in Lieu: positive = received (long position lent out)
             # negative = paid (short position owes dividend)
@@ -3063,12 +3159,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 etf_dividends_eur += amount_eur
                 if fund_isin not in etf_by_isin:
                     info = get_etf_info(fund_isin)
-                    etf_by_isin[fund_isin] = {'ticker': info['ticker'] if info else fund_isin[:12], 'name': info['name'] if info else '', 'classification': cls or 'sonstiger_fonds', 'gain': 0.0, 'loss': 0.0, 'div': 0.0, 'wht': 0.0}
+                    etf_by_isin[fund_isin] = {'ticker': info['ticker'] if info else fund_isin[:12], 'name': info['name'] if info else '', 'classification': fund_cls or 'sonstiger_fonds', 'gain': 0.0, 'loss': 0.0, 'div': 0.0, 'wht': 0.0}
                 etf_by_isin[fund_isin]['div'] += amount_eur
             elif is_de_isin(f) and funds_match_key(f) in german_dividend_tax_keys:
                 domestic_taxed_dividends_eur += amount_eur
             else:
                 dividends_eur += amount_eur
+                if is_no_invstg:
+                    ensure_no_invstg_income(fund_isin)['div'] += amount_eur
         elif code == 'DINT':
             # Margin-Sollzinsen, Leihgebühren, SYEP — NICHT abzugsfähig (§20 Abs. 9 EStG)
             # Werbungskosten bei Kapitalerträgen → nur Sparer-Pauschbetrag erlaubt
@@ -3078,9 +3176,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             # INTP = Accrued interest paid (Stückzinsen — negative Einnahme, abzugsfähig)
             interest_eur += amount_eur
         elif code in ['FRTAX', 'WHT']:
-            # Tax is usually negative. We want the absolute value of the NET tax paid.
-            # If there are adjustments/refunds (positive), they reduce the total tax.
-            # We track the sum directly and take the absolute value later.
+            # IBKR: Einbehalt negativ, Erstattung positiv. Zuerst vorzeichenbehaftet
+            # saldieren; die Berichtskonvention wird erst nach dem Loop angewendet.
             if is_german_dividend_tax_row(f) and not is_etf_fund:
                 domestic_withholding_tax_eur += amount_eur
             elif is_etf_fund:
@@ -3089,9 +3186,13 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     etf_by_isin[fund_isin]['wht'] += amount_eur
             else:
                 withholding_tax_eur += amount_eur
+                if is_no_invstg:
+                    ensure_no_invstg_income(fund_isin)['wht'] += amount_eur
             
-    # Finalize tax: convert net sum to absolute value for "Tax Paid" field
-    withholding_tax_eur = abs(withholding_tax_eur)
+    # Ausländische QSt: Vorzeichen invertieren, nicht absolut setzen. So bleibt
+    # ein Erstattungsüberschuss im Bericht negativ statt zur Scheingutschrift zu werden.
+    withholding_tax_eur = get_withholding_tax_for_reporting(withholding_tax_eur)
+    # Inländische KESt/Soli ist ein separater bestehender Berechnungspfad.
     domestic_withholding_tax_eur = abs(domestic_withholding_tax_eur)
     zeile_37_kapitalertragsteuer_eur = (
         domestic_withholding_tax_eur
@@ -3752,16 +3853,19 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         etf_loss_taxable += data['loss_taxable']
         etf_div_taxable += data['div_taxable']
 
-    etf_wht_abs = abs(etf_wht_eur)  # positive for reporting
+    etf_wht_reported = get_withholding_tax_for_reporting(etf_wht_eur)
     # §56 Abs. 6 InvStG: anrechenbare QSt um Teilfreistellung kürzen
-    etf_wht_anrechenbar = abs(sum(data.get('wht_anrechenbar', data.get('wht', 0)) for data in etf_by_isin.values()))
+    etf_wht_anrechenbar = get_withholding_tax_for_reporting(
+        sum(data.get('wht_anrechenbar', data.get('wht', 0))
+            for data in etf_by_isin.values())
+    )
     etf_net_taxable = etf_gain_taxable + etf_loss_taxable + etf_div_taxable
 
     if etf_by_isin:
         tfs_reduction = (etf_invstg_gain + etf_invstg_loss + etf_dividends_eur) - etf_net_taxable
         print(f"InvStG ETFs: {len(etf_by_isin)} Fonds erkannt. "
               f"Gewinne {etf_invstg_gain:,.2f}, Verluste {etf_invstg_loss:,.2f}, "
-              f"Dividenden {etf_dividends_eur:,.2f}, WHT {etf_wht_abs:,.2f} EUR. "
+              f"Dividenden {etf_dividends_eur:,.2f}, WHT {etf_wht_reported:,.2f} EUR. "
               f"Teilfreistellung: {tfs_reduction:,.2f} EUR Reduktion.")
     if etf_unknown_isins:
         print(f"  (!) {len(etf_unknown_isins)} ETF(s) nicht in Klassifizierungstabelle — als sonstiger Fonds (0% TFS) behandelt.")
@@ -4306,6 +4410,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # Pool details
         "topf_1_aktien_netto": topf_1_aktien,
         "topf_2_sonstiges_netto": topf_2_sonstiges,
+        "no_invstg_income_by_isin": no_invstg_income_by_isin,
         # Keep old keys for backward compatibility
         "dividends_eur": dividends_eur,
         "domestic_taxed_dividends_eur": domestic_taxed_dividends_eur,
@@ -4353,7 +4458,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             "etf_loss_taxable_eur": etf_loss_taxable,
             "etf_dividends_raw_eur": etf_dividends_eur,
             "etf_dividends_taxable_eur": etf_div_taxable,
-            "etf_wht_eur": etf_wht_abs,
+            "etf_wht_eur": etf_wht_reported,
             "etf_wht_anrechenbar_eur": etf_wht_anrechenbar,
             "etf_net_taxable_eur": etf_net_taxable,
             "etf_by_isin": etf_by_isin,
@@ -4469,7 +4574,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         if abs(tfs_reduction) > 0.01:
             print(f"    Teilfreistellung:      {-tfs_reduction:>12,.2f} EUR")
         print(f"    ETF-Netto (stpfl.):    {etf_net_taxable:>12,.2f} EUR")
-        print(f"    ETF-QSt (roh):         {etf_wht_abs:>12,.2f} EUR")
+        print(f"    ETF-QSt (roh):         {etf_wht_reported:>12,.2f} EUR")
         print(f"    ETF-QSt anrechenbar:   {etf_wht_anrechenbar:>12,.2f} EUR")
 
     if anlage_so_result['details'] or anlage_so_result['total_gain'] != 0 or anlage_so_result['total_loss'] != 0:

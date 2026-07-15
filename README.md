@@ -29,19 +29,47 @@ Automatische Berechnung der Anlage KAP und KAP-INV aus Interactive Brokers Flex 
 
 Für genauere Ergebnisse können zusätzlich Vorjahres-XMLs hochgeladen werden (Multi-Year FX-FIFO, Cross-Year Stillhalter).
 
+Die technischen XML-Felder sind grundsätzlich unabhängig von der Portalsprache. Am besten getestet ist derzeit eine englische Flex Query; einzelne von IBKR gelieferte Beschreibungstexte können sprachabhängig sein.
+
 ## Datenschutz
 
 Die App läuft **vollständig im Browser** via WebAssembly (stlite/Pyodide). Es gibt keinen Server, keine Datenbank, keine Analyse. Ihre IBKR-Daten verlassen zu keinem Zeitpunkt Ihren Rechner.
 
 ## Lokale Entwicklung
 
+### macOS / Linux
+
 ```bash
 git clone https://github.com/KonvexInvestment/ibkr-steuer.git
 cd ibkr-steuer
 python3 -m venv .venv
 source .venv/bin/activate
-pip install streamlit openpyxl
-streamlit run app.py
+python -m pip install streamlit openpyxl
+python -m streamlit run app.py
+```
+
+### Windows 10/11 (PowerShell)
+
+```powershell
+git clone https://github.com/KonvexInvestment/ibkr-steuer.git
+cd ibkr-steuer
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install streamlit openpyxl
+python -m streamlit run app.py
+```
+
+Falls PowerShell die Aktivierung blockiert, kann die App auch ohne Aktivierung gestartet werden:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install streamlit openpyxl
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+Regressionstests auf allen Plattformen:
+
+```bash
+python run_tests.py
 ```
 
 ## Steuerliche Grundlagen

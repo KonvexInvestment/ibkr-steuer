@@ -534,6 +534,18 @@ def merge_report_data(reports):
                 merged_kap['etf_unknown_isins'].append(isin)
     merged['kap_inv'] = merged_kap
 
+    # no_invstg income merge (Ausschüttungen/Quellensteuer je ISIN)
+    merged_no_invstg_income = {}
+    for r in reports:
+        for isin, data in (r.get('no_invstg_income_by_isin') or {}).items():
+            if isin not in merged_no_invstg_income:
+                merged_no_invstg_income[isin] = dict(data)
+            else:
+                existing = merged_no_invstg_income[isin]
+                existing['div'] = existing.get('div', 0) + data.get('div', 0)
+                existing['wht'] = existing.get('wht', 0) + data.get('wht', 0)
+    merged['no_invstg_income_by_isin'] = merged_no_invstg_income
+
     # Anlage SO merge
     merged_so = {
         'total_gain': 0, 'total_loss': 0,
@@ -1153,6 +1165,9 @@ if de_kest_variante_b and abs(final['zeile_7']) > 0.01:
     final['zeile_38'] = 0
 
 created_at = _dt.now().strftime('%d.%m.%Y %H:%M')
+no_invstg_summary = calculate_tax_report.get_no_invstg_summary(
+    d, include_tageskurs=tageskurs_aktiv
+)
 
 # ── Basiswährung ────────────────────────────────────────────────────────────
 
@@ -1586,7 +1601,10 @@ if has_etf_data and invstg_aktiv:
                 info['wht_anrechenbar'] = new_wht_anrechenbar
                 cls_map = {0.30: 'aktienfonds', 0.15: 'mischfonds', 0.0: 'sonstiger_fonds'}
                 info['classification'] = cls_map.get(new_tfs, 'sonstiger_fonds')
-        etf_wht = abs(sum(info.get('wht_anrechenbar', info.get('wht', 0)) for info in etf_by_isin.values()))
+        etf_wht = calculate_tax_report.get_withholding_tax_for_reporting(
+            sum(info.get('wht_anrechenbar', info.get('wht', 0))
+                for info in etf_by_isin.values())
+        )
         kap_inv['etf_wht_anrechenbar_eur'] = etf_wht
 
     # ETF-Overrides in final-Dict spiegeln
@@ -1635,6 +1653,28 @@ if has_etf_data and invstg_aktiv:
             div_tax = info.get('div_taxable', 0)
             etf_table += f"| {info.get('ticker', isin)} | {cls_short} | {tfs_pct} | {fmt_de(gv_raw)} | {fmt_de(gv_tax)} | {fmt_de(div_raw)} | {fmt_de(div_tax)} |\n"
         st.markdown(etf_table)
+
+
+# ── Topf 2 · Sonderprodukte außerhalb InvStG ────────────────────────────────
+
+if no_invstg_summary:
+    section_title("Topf 2 · Sonderprodukte außerhalb InvStG")
+    st.caption(
+        "Einzelnachweis für ETPs/Trusts, die nicht als Investmentfonds nach "
+        "InvStG behandelt werden. Die Beträge sind bereits in Topf 2 enthalten. "
+        "Negative QSt-Werte kennzeichnen Erstattungen."
+    )
+    with st.expander("Sonderprodukte nach ISIN", expanded=True):
+        special_table = "| Ticker | ISIN | Realisiertes G/V | Tageskurs | Ausschüttungen | QSt | Summe Topf 2 |\n"
+        special_table += "|--------|------|----------------:|----------:|---------------:|----:|-------------:|\n"
+        for isin, info in sorted(no_invstg_summary.items(), key=lambda x: x[1].get('ticker', '')):
+            realized = info.get('gain', 0) + info.get('loss', 0)
+            special_table += (
+                f"| {info.get('ticker', isin)} | {isin} | {fmt_de(realized)} | "
+                f"{fmt_de(info.get('tageskurs', 0))} | {fmt_de(info.get('div', 0))} | "
+                f"{fmt_de(info.get('wht_reported', 0))} | {fmt_de(info.get('total', 0))} |\n"
+            )
+        st.markdown(special_table)
 
 
 # ── Anlage SO — manuelle Zuordnung (Issue #51) ───────────────────────────────
@@ -1877,6 +1917,7 @@ if d:
         f = export_context['final']
         has_etf = export_context['has_etf_data'] and export_context['invstg_aktiv']
         has_so = export_context['has_so_data']
+        special_products = export_context['no_invstg_summary']
         so_taxable = export_context['so_taxable']
         so_free = export_context['so_free']
         trade_sums = {
@@ -1938,6 +1979,14 @@ if d:
                 ("Anlage KAP-INV", "Erträge nach Teilfreistellung", f['etf_net_taxable'], ""),
                 ("Anlage KAP-INV", "Anrechenbare Quellensteuer ETF", f['etf_wht'], ""),
             ])
+        for isin, info in sorted(special_products.items(), key=lambda x: x[1].get('ticker', '')):
+            summary_rows.append((
+                "Topf 2 Sonderprodukte",
+                f"{info.get('ticker', isin)} ({isin})",
+                info.get('total', 0),
+                "no_invstg; realisiertes G/V + Tageskurs + Ausschüttungen; "
+                f"QSt {fmt_de(info.get('wht_reported', 0))} EUR; negativ = Erstattung",
+            ))
         if has_so:
             summary_rows.extend([
                 ("Anlage SO", "Steuerpflichtig <= 1 Jahr", so_taxable, ""),
@@ -2123,6 +2172,7 @@ if d:
         'created_at': created_at,
         'has_etf_data': has_etf_data,
         'invstg_aktiv': invstg_aktiv,
+        'no_invstg_summary': no_invstg_summary,
         'has_so_data': has_so_data,
         'so_taxable': so_taxable_export,
         'so_free': so_free_export,
@@ -2202,7 +2252,13 @@ if csv_cats:
         our_interest_for_comparison = d['interest_eur'] + d.get('debit_interest_eur', 0)
         rows.append(("Zinsen", csv_income['interest_eur'], our_interest_for_comparison))
     if 'withholding_tax_eur' in csv_income:
-        rows.append(("Quellensteuer", abs(csv_income['withholding_tax_eur']), our_wht))
+        rows.append((
+            "Quellensteuer",
+            calculate_tax_report.get_withholding_tax_for_reporting(
+                csv_income['withholding_tax_eur']
+            ),
+            our_wht,
+        ))
 
     # FX-Saldo-Korrektur-Diff (für Erkennung der erwarteten FX-Devisen-Abweichung)
     _fx_meta_chk = d.get('fx_option_a_meta', {}) or {}
@@ -2796,6 +2852,24 @@ if topf2_cats:
         else:
             topf2_detail_export += f"  {'Tageskurs-Korrektur':24s} G {fmt_de(0):>10} V {fmt_de(tk_corr_topf2):>10} N {fmt_de(tk_corr_topf2):>10} EUR\n"
 
+special_products_export = ""
+if no_invstg_summary:
+    special_products_export = "\nSONDERPRODUKTE AUSSERHALB INVSTG (IN TOPF 2 ENTHALTEN)\n"
+    for isin, info in sorted(no_invstg_summary.items(), key=lambda x: x[1].get('ticker', '')):
+        realized = info.get('gain', 0) + info.get('loss', 0)
+        special_products_export += (
+            f"  {info.get('ticker', isin):8s} {isin}  "
+            f"G/V {fmt_de(realized):>10}  TK {fmt_de(info.get('tageskurs', 0)):>10}  "
+            f"Aussch. {fmt_de(info.get('div', 0)):>10}  "
+            f"Summe {fmt_de(info.get('total', 0)):>10} EUR\n"
+        )
+        wht_reported = info.get('wht_reported', 0)
+        if abs(wht_reported) > 0.005:
+            wht_label = "Quellensteuer" if wht_reported > 0 else "QSt-Erstattung"
+            special_products_export += (
+                f"           {wht_label}: {fmt_de(wht_reported):>10} EUR\n"
+            )
+
 de_kest_export = ""
 if abs(zeile_7) > 0.01:
     z_kest_total = zeile_37 + zeile_38
@@ -2837,7 +2911,7 @@ TOPF 2: SONSTIGES (inkl. Termingeschäfte)
   Sonstige Verluste:    {fmt_de(final['options_loss']):>14} EUR
   ─────────────────────────────────────────────────
   Saldo Sonstiges:       {fmt_de(final['topf_2']):>14} EUR
-{topf2_detail_export}{fx_export}{sh_export}{inv_export}
+{topf2_detail_export}{special_products_export}{fx_export}{sh_export}{inv_export}
 ═══════════════════════════════════════════════════
 ANLAGE KAP EINTRAGUNGEN
 {"" if abs(final['zeile_7']) <= 0.01 else f"  Zeile 7 (inländischer Steuerabzug): {fmt_de(final['zeile_7']):>7} EUR" + chr(10) + f"  Zeile 37 (Kapitalertragsteuer): {fmt_de(final['zeile_37']):>10} EUR" + chr(10) + f"  Zeile 38 (Solidaritätszuschlag): {fmt_de(final['zeile_38']):>9} EUR" + chr(10)}
