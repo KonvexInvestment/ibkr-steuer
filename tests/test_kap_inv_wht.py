@@ -1,5 +1,6 @@
 """Regression tests for KAP-INV withholding-tax reporting."""
 import contextlib
+import copy
 import csv
 import io
 import math
@@ -10,11 +11,15 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from calculate_tax_report import (
+    build_wht_review_rows,
     calculate_creditable_foreign_tax,
     calculate_tax,
+    compare_kap_inv_wht_modes,
+    format_german_date,
     get_kap_line_41_for_reporting,
     get_kap_inv_wht_for_reporting,
     get_withholding_tax_for_reporting,
+    get_wht_event_status_label,
     merge_kap_inv_wht_for_reporting,
 )
 
@@ -243,6 +248,134 @@ def test_paid_short_distributions_are_excluded_from_form_lines():
     assert any("gezahlte" in w.lower() for w in form["warnings"])
 
 
+def test_report_date_sets_tax_year_and_entitlement_date_is_preserved():
+    # Erstattung mit Bezugsdatum im Vorjahr (date=2024), aber Buchung im
+    # Steuerjahr (reportDate=2025): reportDate bestimmt die Zuordnung,
+    # das historische Bezugsdatum bleibt am Event erhalten.
+    rd = calculate_for_funds([
+        {
+            "activityCode": "WHT",
+            "reportDate": "2025-02-05",
+            "date": "2024-12-15",
+            "amount": "27.44",
+            "currency": "EUR",
+            "subCategory": "ETF",
+            "isin": "US4642874329",
+            "symbol": "TLT",
+        },
+    ], dba_beta=True)
+    events = rd["kap_inv"]["wht_events"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["date"] == "2024-12-15"
+    assert event["report_dates"] == ["2025-02-05"]
+    assert event["status"] == "unmatched_refund"
+
+    rows = build_wht_review_rows(
+        rd["kap_inv"]["wht_review_items"], rd["kap_inv"]["etf_by_isin"]
+    )
+    assert len(rows) == 1
+    assert rows[0]["booking_date"] == "05.02.2025"
+    assert rows[0]["entitlement_date"] == "15.12.2024"
+
+
+def test_review_rows_carry_product_identity():
+    # TLT wird ueber die Klassifizierungstabelle erkannt; Ticker, ISIN und
+    # Produktname stehen in den vorbereiteten Tabellenzeilen bereit.
+    rows = build_wht_review_rows([
+        {
+            "isin": "US4642874329",
+            "date": "2023-12-01",
+            "report_dates": ["2024-02-05"],
+            "net_foreign_tax_eur": -27.44,
+            "german_cap_eur": 0.0,
+            "treaty_cap_eur": None,
+            "creditable_tax_eur": -27.44,
+            "status": "unmatched_refund",
+        },
+    ])
+    assert rows[0]["ticker"] == "TLT"
+    assert rows[0]["product"] == "TLT · US4642874329"
+    assert "Treasury" in rows[0]["name"]
+    assert format_german_date("2024-02-05") == "05.02.2024"
+
+
+def test_status_labels_are_user_facing_with_safe_fallback():
+    assert "Zeitversetzte Erstattung" in get_wht_event_status_label("unmatched_refund")
+    assert get_wht_event_status_label("matched") == "Zugeordnet"
+    assert get_wht_event_status_label("fully_refunded") == "Vollständig erstattet"
+    assert "DBA" in get_wht_event_status_label("dba_unverified")
+    assert "Überhang" in get_wht_event_status_label("refund_offsets_excess")
+    # Unbekannte kuenftige Status verschwinden nicht: lesbarer Fallback
+    fallback = get_wht_event_status_label("some_future_status")
+    assert "some_future_status" in fallback
+    assert "Prüfen" in fallback
+    assert "Prüfen" in get_wht_event_status_label("")
+
+
+def test_mode_comparison_sums_per_account_and_never_recalculates_merged():
+    # Konto A: Einbehalt 15 auf 20 Ausschuettung (0% TFS, kein DBA-Eintrag)
+    # -> Beta: Cap 5, Ueberhang 10; Standard: 15.
+    account_a = {
+        "XX0000000001": {
+            "tfs_rate": 0.0,
+            "wht": -15.0,
+            "wht_events": [{
+                "gross_distribution_eur": 20.0,
+                "tax_withheld_eur": 15.0,
+                "tax_refunded_eur": 0.0,
+            }],
+        },
+    }
+    # Konto B: Einbehalt 10 (voll anrechenbar) + separate Erstattung 10
+    # -> Beta: 10 - 10 = 0 (kein eigener Ueberhang); Standard: 0.
+    account_b = {
+        "XX0000000001": {
+            "tfs_rate": 0.0,
+            "wht": 0.0,
+            "wht_events": [
+                {
+                    "gross_distribution_eur": 40.0,
+                    "tax_withheld_eur": 10.0,
+                    "tax_refunded_eur": 0.0,
+                },
+                {
+                    "gross_distribution_eur": 0.0,
+                    "tax_withheld_eur": 0.0,
+                    "tax_refunded_eur": 10.0,
+                },
+            ],
+        },
+    }
+    snapshot_a = copy.deepcopy(account_a)
+    snapshot_b = copy.deepcopy(account_b)
+
+    result = compare_kap_inv_wht_modes([account_a, account_b])
+    # Kontoweise Summe ist der korrekte Vergleichswert.
+    assert round(result["standard_eur"], 2) == 15.00
+    assert round(result["beta_eur"], 2) == 5.00
+    assert round(result["difference_eur"], 2) == -10.00
+    # Der Vergleich mutiert die Eingabedaten nicht.
+    assert account_a == snapshot_a
+    assert account_b == snapshot_b
+
+    # Gegenprobe: auf dem GEMERGTEN Event-Pool verrechnet der Refund-Offset
+    # die Erstattung aus Konto B gegen den Ueberhang aus Konto A -> 15 statt 5.
+    # Genau deshalb darf der Vergleich nie auf gemergten Events rechnen.
+    merged_pool = {
+        "XX0000000001": {
+            "tfs_rate": 0.0,
+            "wht": -15.0,
+            "wht_events": (
+                copy.deepcopy(account_a["XX0000000001"]["wht_events"])
+                + copy.deepcopy(account_b["XX0000000001"]["wht_events"])
+            ),
+        },
+    }
+    merged_result = compare_kap_inv_wht_modes([merged_pool])
+    assert round(merged_result["beta_eur"], 2) == 15.00
+
+
 def test_withholding_tax_reporting_normalizes_zero():
     reported = get_withholding_tax_for_reporting(0)
     assert reported == 0.0
@@ -377,6 +510,10 @@ if __name__ == "__main__":
     test_multi_account_sums_finished_credits_without_global_recap()
     test_verified_us_funds_have_treaty_rate()
     test_paid_short_distributions_are_excluded_from_form_lines()
+    test_report_date_sets_tax_year_and_entitlement_date_is_preserved()
+    test_review_rows_carry_product_identity()
+    test_status_labels_are_user_facing_with_safe_fallback()
+    test_mode_comparison_sums_per_account_and_never_recalculates_merged()
     test_withholding_tax_reporting_normalizes_zero()
     test_kap_inv_wht_refunds_keep_their_sign()
     print("OK: KAP-INV WHT reporting")

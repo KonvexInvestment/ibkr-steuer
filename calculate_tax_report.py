@@ -238,6 +238,110 @@ def calculate_kap_inv_wht_for_mode(etf_by_isin, dba_wht_beta_enabled=False,
     )
 
 
+def compare_kap_inv_wht_modes(etf_by_isin_pools, treaty_rate_getter=None):
+    """Compare standard vs. DBA beta fund-tax PER ACCOUNT, then sum.
+
+    The report calculation runs each account separately and adds the finished
+    results. The comparison must do the same: recalculating the beta on a
+    merged event pool would offset refunds of one account against uncredited
+    excess of another (non-linear) and overstate the beta value. All work
+    happens on deep copies; neither events nor wht_anrechenbar of the caller
+    are mutated.
+    """
+    import copy
+
+    standard_total = 0.0
+    beta_total = 0.0
+    for pool in (etf_by_isin_pools or []):
+        if not pool:
+            continue
+        standard_total += calculate_legacy_kap_inv_wht(
+            copy.deepcopy(pool)
+        )['creditable_tax_eur']
+        beta_total += recalculate_kap_inv_wht(
+            copy.deepcopy(pool),
+            treaty_rate_getter=treaty_rate_getter,
+        )['creditable_tax_eur']
+
+    return {
+        'standard_eur': standard_total,
+        'beta_eur': beta_total,
+        'difference_eur': beta_total - standard_total,
+    }
+
+
+# Interne Event-Status → verstaendliche Anzeige-Texte. Unbekannte kuenftige
+# Status duerfen nicht verschwinden (lesbarer Fallback in der Getter-Funktion).
+WHT_EVENT_STATUS_LABELS = {
+    'matched': 'Zugeordnet',
+    'fully_refunded': 'Vollständig erstattet',
+    'dba_unverified': 'DBA-Höchstsatz nicht belegt',
+    'capped_review_refund': 'Höchstbetrag überschritten; Erstattungsanspruch prüfen',
+    'refund_offsets_excess': 'Erstattung mit nicht angerechnetem Überhang verrechnet',
+    'unmatched_refund': 'Zeitversetzte Erstattung; Bezugszufluss nicht im aktuellen Datensatz',
+    'unmatched_withholding': 'Steuereinbehalt ohne zugeordneten Zufluss',
+    'refund_exceeds_withholding': 'Erstattung übersteigt den Einbehalt des Ereignisses',
+}
+
+
+def get_wht_event_status_label(status):
+    """Translate an internal event status into user-facing German text."""
+    label = WHT_EVENT_STATUS_LABELS.get(status)
+    if label:
+        return label
+    return f'Prüfen (interner Status: {status})' if status else 'Prüfen (ohne Status)'
+
+
+def format_german_date(iso_date):
+    """Format 'YYYY-MM-DD' (optionally with time suffix) as 'DD.MM.YYYY'."""
+    if not iso_date:
+        return ''
+    date_part = str(iso_date)[:10]
+    parts = date_part.split('-')
+    if len(parts) == 3 and all(parts):
+        return f'{parts[2]}.{parts[1]}.{parts[0]}'
+    return str(iso_date)
+
+
+def build_wht_review_rows(review_items, etf_by_isin=None):
+    """Prepare display rows for the withholding-tax review table.
+
+    Separates the booking date (report_dates; determines the tax year) from
+    the historical entitlement date (date; e.g. the 2023 distribution a 2024
+    refund refers to). Product identity comes from etf_by_isin with a lookup
+    fallback, never hard-coded.
+    """
+    etf_by_isin = etf_by_isin or {}
+    rows = []
+    for event in (review_items or []):
+        isin = event.get('isin', '') or ''
+        info = etf_by_isin.get(isin) or {}
+        ticker = info.get('ticker')
+        name = info.get('name')
+        if not ticker or name is None:
+            from etf_classification import get_etf_info
+            lookup = get_etf_info(isin) or {}
+            ticker = ticker or lookup.get('ticker') or (isin[:12] if isin else '?')
+            name = name if name else lookup.get('name', '')
+        report_dates = sorted(set(event.get('report_dates') or []))
+        booking = ', '.join(format_german_date(rd) for rd in report_dates)
+        rows.append({
+            'isin': isin,
+            'ticker': ticker,
+            'name': name or '',
+            'product': f'{ticker} · {isin}' if isin else ticker,
+            'booking_date': booking or '-',
+            'entitlement_date': format_german_date(event.get('date')) or '-',
+            'net_foreign_tax_eur': safe_float(event.get('net_foreign_tax_eur')),
+            'german_cap_eur': safe_float(event.get('german_cap_eur')),
+            'treaty_cap_eur': event.get('treaty_cap_eur'),
+            'creditable_tax_eur': safe_float(event.get('creditable_tax_eur')),
+            'status': event.get('status', ''),
+            'status_label': get_wht_event_status_label(event.get('status', '')),
+        })
+    return rows
+
+
 KAP_INV_FORM_MAPPING = {
     'aktienfonds': {
         'label': 'Aktienfonds', 'tfs_rate': 0.30,

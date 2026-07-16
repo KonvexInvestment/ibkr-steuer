@@ -1,3 +1,4 @@
+import copy
 import streamlit as st
 import os
 import tempfile
@@ -970,6 +971,13 @@ with st.spinner("Berechne Steuerreport…"):
     # Merge all accounts
     d = merge_report_data(reports)
     n_accounts = len(reports)
+    # Snapshot der Konto-Pools fuer den Standard/Beta-Vergleich: die Beta ist
+    # nichtlinear (Refund-Offset pro ISIN), darf also nur kontoweise gerechnet
+    # und dann summiert werden - nie auf dem gemergten Event-Pool.
+    per_account_wht_pools = [
+        copy.deepcopy(r.get('kap_inv', {}).get('etf_by_isin', {}) or {})
+        for r in reports
+    ]
 
 # Derived values
 steuerjahr = d.get('tax_year', 2025)
@@ -1843,23 +1851,37 @@ if has_etf_data and invstg_aktiv:
             "Zeile 41 enthalten. Die optionale DBA-Beta ist deaktiviert."
         )
 
-    # Direkter Modus-Vergleich: beide Berechnungen auf Kopien desselben
-    # Datenstands, damit weder Events noch wht_anrechenbar des aktiven
-    # Modus veraendert werden. Zeigt jedem sofort, ob die DBA-Beta bei
-    # diesen Daten ueberhaupt etwas aendert.
+    # Direkter Modus-Vergleich: beide Berechnungen KONTOWEISE auf Kopien
+    # (die Beta ist durch den Refund-Offset nichtlinear; auf dem gemergten
+    # Event-Pool wuerden Erstattungen eines Kontos gegen Ueberhaenge eines
+    # anderen Kontos verrechnet). Fertige Kontowerte werden nur addiert.
+    # Weder Events noch wht_anrechenbar des aktiven Modus werden veraendert.
     _has_wht_activity = any(
         abs(info.get('wht', 0)) > 0.005 or info.get('wht_events')
         for info in etf_by_isin.values()
     )
     if _has_wht_activity:
-        import copy as _copy
-        wht_standard_value = calculate_tax_report.calculate_legacy_kap_inv_wht(
-            _copy.deepcopy(etf_by_isin)
-        )['creditable_tax_eur']
-        wht_beta_value = calculate_tax_report.recalculate_kap_inv_wht(
-            _copy.deepcopy(etf_by_isin)
-        )['creditable_tax_eur']
-        wht_mode_diff = wht_beta_value - wht_standard_value
+        _compare_pools = []
+        for _pool in per_account_wht_pools or [etf_by_isin]:
+            _pool_copy = copy.deepcopy(_pool)
+            # Manuelle Fondsart-Overrides aus der UI auf die Konto-Kopien
+            # spiegeln, damit der Vergleich denselben Datenstand nutzt.
+            for _isin, _entry in _pool_copy.items():
+                _merged_entry = etf_by_isin.get(_isin)
+                if _merged_entry:
+                    _entry['tfs_rate'] = _merged_entry.get(
+                        'tfs_rate', _entry.get('tfs_rate')
+                    )
+                    _entry['classification'] = _merged_entry.get(
+                        'classification', _entry.get('classification')
+                    )
+            _compare_pools.append(_pool_copy)
+        _mode_compare = calculate_tax_report.compare_kap_inv_wht_modes(
+            _compare_pools
+        )
+        wht_standard_value = _mode_compare['standard_eur']
+        wht_beta_value = _mode_compare['beta_eur']
+        wht_mode_diff = _mode_compare['difference_eur']
         compare_table = (
             "| Fonds-QSt in Zeile 41 | Betrag |\n"
             "|-----------------------|-------:|\n"
@@ -1922,25 +1944,49 @@ if has_etf_data and invstg_aktiv:
         ):
             st.caption(
                 "DBA-Sätze werden nicht aus dem ISIN-Länderpräfix geraten. "
-                "Unbelegte DBA-Fälle und zeitversetzte Erstattungen bleiben sichtbar."
+                "Unbelegte DBA-Fälle und zeitversetzte Erstattungen bleiben sichtbar. "
+                "Buchung = Buchungsdatum (bestimmt das Steuerjahr); "
+                "Bezugsdatum = Datum der zugrunde liegenden Ausschüttung, "
+                "kann im Vorjahr liegen."
             )
-            review_table = (
-                "| ISIN | Datum | Rohsteuer | DE-Höchstbetrag | DBA-Limit | "
-                "Anrechenbar | Status |\n"
-                "|------|-------|-----------:|-----------------:|----------:|"
-                "------------:|--------|\n"
+            review_rows = calculate_tax_report.build_wht_review_rows(
+                wht_review_items, etf_by_isin
             )
-            for event in wht_review_items:
-                treaty_cap = event.get('treaty_cap_eur')
-                treaty_text = fmt_de(treaty_cap) if treaty_cap is not None else "prüfen"
-                review_table += (
-                    f"| {event.get('isin', '')} | {event.get('date', '') or '–'} | "
-                    f"{fmt_de(event.get('net_foreign_tax_eur', 0))} | "
-                    f"{fmt_de(event.get('german_cap_eur', 0))} | {treaty_text} | "
-                    f"{fmt_de(event.get('creditable_tax_eur', 0))} | "
-                    f"{event.get('status', '')} |\n"
+
+            # Verdichtung: eine Zeile je Produkt/Buchung/Status mit Anzahl,
+            # Summe und Produktnamen - darunter die Einzel-Ereignisse.
+            review_groups = {}
+            for row in review_rows:
+                group_key = (row['product'], row['booking_date'], row['status_label'])
+                group = review_groups.setdefault(group_key, {
+                    'count': 0, 'sum': 0.0, 'name': row['name'],
+                })
+                group['count'] += 1
+                group['sum'] += row['net_foreign_tax_eur']
+            for (product, booking, status_label), group in sorted(review_groups.items()):
+                name_part = f" ({group['name']})" if group['name'] else ""
+                plural = "Ereignisse" if group['count'] != 1 else "Ereignis"
+                st.markdown(
+                    f"**{product}**{name_part}: {group['count']} {plural}, "
+                    f"gebucht am {booking}, Netto-QSt gesamt "
+                    f"{fmt_de(group['sum'])} EUR. Status: {status_label}."
                 )
-            st.markdown(review_table)
+
+            review_df_rows = []
+            for row in review_rows:
+                treaty_cap = row['treaty_cap_eur']
+                review_df_rows.append({
+                    'Produkt': row['product'],
+                    'Buchung': row['booking_date'],
+                    'Bezugsdatum': row['entitlement_date'],
+                    'Netto-QSt (+ Einbehalt / − Erstattung)': fmt_de(row['net_foreign_tax_eur']),
+                    'DE-Höchstbetrag': fmt_de(row['german_cap_eur']),
+                    'DBA-Limit': fmt_de(treaty_cap) if treaty_cap is not None else 'prüfen',
+                    'Anrechenbar': fmt_de(row['creditable_tax_eur']),
+                    'Status': row['status_label'],
+                })
+            st.dataframe(review_df_rows, use_container_width=True, hide_index=True)
+            st.caption("Alle Beträge in EUR.")
 
     with st.expander("ETF-Details nach ISIN"):
         etf_table = "| Ticker | Typ | TFS | G/V roh | G/V stpfl. | Div roh | Div stpfl. |\n"
