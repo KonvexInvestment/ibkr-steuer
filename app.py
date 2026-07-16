@@ -1659,7 +1659,7 @@ if has_etf_data and invstg_aktiv:
     inv_hero_color = "#4ade80" if kap_inv_raw_total >= 0 else "#f87171"
     st.markdown(f"""
 <div class="hero-card-inv">
-    <div class="hero-label">KAP-INV · ELSTER-Rohwerte vor Teilfreistellung</div>
+    <div class="hero-label">KAP-INV · Formularwerte vor Teilfreistellung</div>
     <div class="hero-value" style="color:{inv_hero_color}">{fmt(kap_inv_raw_total)}</div>
     <div class="hero-formula">Ausschüttungen und Veräußerungsergebnisse nach Fondsart; ausländische Steuer steht ausschließlich in Anlage KAP Zeile 41.</div>
 </div>
@@ -1680,7 +1680,7 @@ if has_etf_data and invstg_aktiv:
             )
         st.markdown(blocked_table)
 
-    form_table = "| KAP-INV | Fondsart | ELSTER-Betrag vor TFS | Steuerpflichtiger Kontrollwert* |\n"
+    form_table = "| KAP-INV | Fondsart | Eintragungswert vor TFS | Steuerpflichtiger Kontrollwert* |\n"
     form_table += "|---------|----------|-----------------------:|-------------------------------:|\n"
     for line in kap_inv_form.get('lines', []):
         form_table += (
@@ -1691,7 +1691,7 @@ if has_etf_data and invstg_aktiv:
     if kap_inv_form.get('lines'):
         st.markdown(form_table)
         st.caption(
-            "* Kontrollrechnung nach Teilfreistellung – kein ELSTER-Eingabewert. "
+            "* Kontrollrechnung nach Teilfreistellung, kein Eintragungswert. "
             "Veräußerungszeilen sind bis zur späteren Berücksichtigung bereits "
             "angesetzter Vorabpauschalen ausdrücklich noch nicht final."
         )
@@ -2908,7 +2908,7 @@ Die Teilfreistellung wird pro ISIN nur als steuerlicher Kontrollwert berechnet:
   Sonstiger Fonds:                 0% steuerfrei
 
 KAP-INV-Zeilen = Rohbeträge vor TFS nach Fondsart (Z. 4–8 und 14/17/20/23/26)
-Kontrollwert = (ETF-G/V + ETF-Div) × (1 − TFS); kein ELSTER-Eingabewert
+Kontrollwert = (ETF-G/V + ETF-Div) × (1 − TFS); kein Eintragungswert
 ETF-Quellensteuer wird ereignisbezogen begrenzt und in Anlage KAP Zeile 41 ausgewiesen.
 Veräußerungswerte sind bis zur Berücksichtigung bereits angesetzter
 Vorabpauschalen ausdrücklich noch nicht final.
@@ -2986,7 +2986,7 @@ if has_etf_data and invstg_aktiv:
         inv_export += (
             f"             Kontrollwert nach TFS: "
             f"{fmt_de(line['taxable_control_eur']):>10} EUR "
-            "(kein ELSTER-Eingabewert)\n"
+            "(kein Eintragungswert)\n"
         )
     inv_export += (
         f"  Fonds-QSt anrechenbar: {fmt_de(etf_wht):>12} EUR  "

@@ -208,9 +208,9 @@ def build_kap_inv_form(etf_by_isin, fx_by_isin=None, unknown_isins=None,
     """Build the single source of truth for KAP-INV form lines.
 
     Form amounts are gross amounts before partial exemption. Taxable amounts
-    are included only as a control calculation and are never ELSTER inputs.
-    Sale amounts are explicitly preliminary until accumulated advance lump
-    sums (Vorabpauschalen) are supplied in the later implementation phase.
+    are included only as a control calculation and are never direct form
+    inputs. Sale amounts are explicitly preliminary until accumulated advance
+    lump sums (Vorabpauschalen) are supplied in the later implementation phase.
     """
     fx_by_isin = fx_by_isin or {}
     unknown_isins = set(unknown_isins or ())
@@ -230,7 +230,7 @@ def build_kap_inv_form(etf_by_isin, fx_by_isin=None, unknown_isins=None,
             'fund_type': mapping['label'],
             'amount_raw_eur': 0.0,
             'taxable_control_eur': 0.0,
-            'is_elster_input': kind == 'distribution',
+            'is_form_input': kind == 'distribution',
             'requires_advance_lump_sum_review': kind == 'sale',
         })
         entry['amount_raw_eur'] += raw_amount
@@ -296,16 +296,37 @@ def build_kap_inv_form(etf_by_isin, fx_by_isin=None, unknown_isins=None,
             mapping['sale_line'], 'sale', classification, mapping, raw_sale, taxable_sale,
         )
 
+    negative_distribution_lines = [
+        entry for entry in line_totals.values()
+        if entry['kind'] == 'distribution' and entry['amount_raw_eur'] < -0.005
+    ]
+    for entry in negative_distribution_lines:
+        entry['requires_negative_distribution_review'] = True
+
     warnings = []
     if blocked_isins:
         warnings.append(
-            'Fondsart muss vor einer ELSTER-Uebernahme bestaetigt werden: '
-            + ', '.join(blocked_isins)
+            'Fondsart muss vor der Übernahme in die Steuererklärung '
+            'bestätigt werden: ' + ', '.join(blocked_isins)
         )
     if has_sale_activity:
         warnings.append(
-            'Veraeusserungswerte sind vor Abzug bereits angesetzter '
-            'Vorabpauschalen und daher noch nicht als final freigegeben.'
+            'Veräußerungswerte berücksichtigen noch keine bereits '
+            'versteuerten Vorabpauschalen und sind daher vorläufig.'
+        )
+    for entry in negative_distribution_lines:
+        negative_isins = sorted(
+            d['isin'] for d in details
+            if d['distribution_line'] == entry['line']
+            and d['distribution_raw_eur'] < -0.005
+        )
+        warnings.append(
+            f"Zeile {entry['line']} ({entry['fund_type']}): "
+            'Ausschüttungssumme ist negativ '
+            f"({entry['amount_raw_eur']:.2f} EUR; {', '.join(negative_isins)}). "
+            'Negative Beträge entstehen z.B. durch gezahlte Dividenden oder '
+            'Ersatzzahlungen auf Short-Positionen und sind kein gültiger '
+            'Eintragungswert für die Ausschüttungszeilen; bitte prüfen.'
         )
 
     if blocked_isins:
