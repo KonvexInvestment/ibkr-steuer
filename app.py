@@ -1817,6 +1817,44 @@ if has_etf_data and invstg_aktiv:
             "Zeile 41 enthalten. Die optionale DBA-Beta ist deaktiviert."
         )
 
+    # Direkter Modus-Vergleich: beide Berechnungen auf Kopien desselben
+    # Datenstands, damit weder Events noch wht_anrechenbar des aktiven
+    # Modus veraendert werden. Zeigt jedem sofort, ob die DBA-Beta bei
+    # diesen Daten ueberhaupt etwas aendert.
+    _has_wht_activity = any(
+        abs(info.get('wht', 0)) > 0.005 or info.get('wht_events')
+        for info in etf_by_isin.values()
+    )
+    if _has_wht_activity:
+        import copy as _copy
+        wht_standard_value = calculate_tax_report.calculate_legacy_kap_inv_wht(
+            _copy.deepcopy(etf_by_isin)
+        )['creditable_tax_eur']
+        wht_beta_value = calculate_tax_report.recalculate_kap_inv_wht(
+            _copy.deepcopy(etf_by_isin)
+        )['creditable_tax_eur']
+        wht_mode_diff = wht_beta_value - wht_standard_value
+        compare_table = (
+            "| Fonds-QSt in Zeile 41 | Betrag |\n"
+            "|-----------------------|-------:|\n"
+            f"| Standardberechnung | {fmt_de(wht_standard_value)} |\n"
+            f"| DBA-Beta | {fmt_de(wht_beta_value)} |\n"
+            f"| Differenz | {fmt_de(wht_mode_diff)} |\n"
+        )
+        st.markdown(compare_table)
+        if abs(wht_mode_diff) <= 0.005:
+            st.caption(
+                "Die DBA-Beta ändert an diesen Daten nichts; beide Modi liefern "
+                "denselben anrechenbaren Betrag."
+            )
+        else:
+            richtung = "erhöht" if wht_mode_diff > 0 else "verringert"
+            st.caption(
+                f"Die DBA-Beta {richtung} die anrechenbare Fonds-Quellensteuer "
+                f"um {fmt_de(abs(wht_mode_diff))} EUR gegenüber der "
+                "Standardberechnung. Details im Prüffall-Bereich (Beta aktivieren)."
+            )
+
     wht_metric_html = metric_card("Fonds-QSt → KAP Z. 41", etf_wht)
     if abs(etf_wht_raw - etf_wht) > 0.01:
         wht_metric_html = metric_card("ETF-QSt roh", etf_wht_raw) + wht_metric_html
