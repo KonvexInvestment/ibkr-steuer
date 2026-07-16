@@ -7,7 +7,7 @@ This repository is a Python/Streamlit tool for calculating German Anlage KAP/KAP
 - `app.py` is the Streamlit UI and user-facing orchestration layer.
 - `calculate_tax_report.py` contains the main tax calculation logic.
 - `extract_ibkr_data.py` converts IBKR XML exports into CSV inputs.
-- `etf_classification.py`, `ecb_rates.py`, and helper scripts provide classification, FX, audit, and comparison utilities.
+- `etf_classification.py` maintains the InvStG fund classification table (Teilfreistellung rates) and documented treaty withholding-tax rates; `ecb_rates.py` and helper scripts provide FX, audit, and comparison utilities.
 - `tests/` contains focused regression tests; `test_data/` is local and gitignored because it may contain real IBKR data.
 - `Grundlage/` stores reference tax PDFs; root CSV/TXT/XML files are sample, generated, or local working data unless explicitly tracked.
 
@@ -35,17 +35,18 @@ Run the main regression runner:
 python run_tests.py
 ```
 
-Run individual synthetic tests while iterating:
+Run individual synthetic tests while iterating (`run_tests.py` runs all files in `tests/` automatically at the end of a full run):
 
 ```bash
 python tests/test_cross_year_series.py
+python tests/test_kap_inv_wht.py
 python -m unittest tests/test_german_dividend_tax.py
 ```
 
 Extract IBKR XML data for manual checks:
 
 ```bash
-python extract_ibkr_data.py demo_portfolio_2025.xml /tmp/ibkr_extract
+python extract_ibkr_data.py <flex_query_export>.xml /tmp/ibkr_extract
 ```
 
 ## Coding Style & Naming Conventions
@@ -54,7 +55,7 @@ Use Python 3 with 4-space indentation and standard library modules where practic
 
 ## Testing Guidelines
 
-Add regression coverage for tax logic changes, especially around realized gains, withholding tax, FX conversion, ETF classification, and cross-year Stillhalter handling. Prefer small synthetic fixtures in `tests/` for reproducible bugs. `run_tests.py` also uses local `test_data/audit_expectations.json`; if unavailable, some audit scenarios cannot run and may be skipped or fail early.
+Add regression coverage for tax logic changes, especially around realized gains, withholding tax crediting, FX conversion, ETF classification (KAP-INV form mapping), and cross-year Stillhalter handling. Prefer small synthetic fixtures in `tests/` for reproducible bugs; new synthetic test files must be registered in `SYNTHETIC_TESTS` in `run_tests.py` so the full run picks them up. `run_tests.py` also uses local `test_data/audit_expectations.json`; if unavailable, some audit scenarios cannot run and may be skipped or fail early.
 
 ## Commit & Pull Request Guidelines
 
