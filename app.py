@@ -836,7 +836,32 @@ fx_margin_correction_enabled = st.session_state['fx_margin_correction_enabled']
 if 'dba_wht_beta_enabled' not in st.session_state:
     st.session_state['dba_wht_beta_enabled'] = False
 
-with st.expander("Optionale Beta · DBA-Prüfung für Fonds-Quellensteuer", expanded=False):
+with st.expander("DBA-Prüfung für Fonds-Quellensteuer", expanded=False):
+    st.markdown('<div style="margin-top:2px;margin-bottom:12px"><span style="background:linear-gradient(135deg,#f59e0b,#ef4444);color:#fff;padding:5px 16px;border-radius:6px;font-size:0.85em;font-weight:700;letter-spacing:1px;box-shadow:0 2px 8px rgba(239,68,68,0.3)">NEUE FUNKTION &middot; BETA</span></div>', unsafe_allow_html=True)
+    st.markdown("""
+<div style="background: rgba(96,165,250,0.08); border: 1px solid rgba(96,165,250,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
+    <strong style="color: #60a5fa;">Was ist ein DBA?</strong>
+    Ein Doppelbesteuerungsabkommen regelt zwischen Deutschland und dem Quellenstaat,
+    wie viel Quellensteuer dieser auf Ausschüttungen einbehalten darf. Für Ausschüttungen
+    US-amerikanischer Fonds an deutsche Privatanleger sind das höchstens 15%
+    (Art. 10 Abs. 2 Buchst. b DBA-USA).<br><br>
+    <strong style="color: #60a5fa;">Warum anrechnen?</strong>
+    Nach §32d Abs. 5 EStG wird im Ausland gezahlte Quellensteuer auf die deutsche
+    Abgeltungsteuer angerechnet (Anlage KAP Zeile 41). Anrechenbar ist aber nur die
+    nach dem DBA verbleibende Steuer: Was der Quellenstaat über den DBA-Satz hinaus
+    einbehalten hat, ist dort erstattungsfähig und gehört nicht in Zeile 41.
+    Zusätzlich gilt ein Höchstbetrag von 25% je Kapitalertrag; bei teilfreigestellten
+    Fondserträgen zählt dafür nur der steuerpflichtige Teil
+    (BMF-Schreiben vom 14.05.2025, Rn. 148).<br><br>
+    <strong style="color: #60a5fa;">Was macht die Beta?</strong>
+    Der Standardmodus rechnet pauschal: Rohsteuer × (1 − Teilfreistellung).
+    Die Beta prüft stattdessen jedes Ereignis einzeln: Ausschüttung, Einbehalt und
+    Erstattung werden gematcht; hinterlegte DBA-Sätze und der 25%-Höchstbetrag
+    begrenzen die Anrechnung, Auffälligkeiten erscheinen als Prüffälle.
+    Typischer Effekt: Bei US-Aktienfonds mit 30% Teilfreistellung (z.B. QYLD) steigt
+    die anrechenbare Quellensteuer von 10,5% auf 15% der Ausschüttung.
+</div>
+""", unsafe_allow_html=True)
     dba_wht_beta_enabled = st.checkbox(
         "Beta aktivieren: Fonds-Quellensteuer ereignisbezogen nach DBA begrenzen",
         key="dba_wht_beta_enabled",
@@ -844,7 +869,7 @@ with st.expander("Optionale Beta · DBA-Prüfung für Fonds-Quellensteuer", expa
             "Deaktiviert (Standard): bisherige stabile Berechnung Rohsteuer × "
             "(1 − Teilfreistellung). Aktiviert: Ausschüttungen, Einbehalte und "
             "Erstattungen werden je Ereignis gematcht und zusätzlich durch "
-            "hinterlegte DBA-Sätze begrenzt."
+            "hinterlegte DBA-Sätze (Rechtsgrundlagen siehe oben) begrenzt."
         ),
     )
     if dba_wht_beta_enabled:
@@ -1805,6 +1830,7 @@ if has_etf_data and invstg_aktiv:
         )
 
     if dba_wht_beta_enabled:
+        st.markdown('<div style="margin-top:2px;margin-bottom:8px"><span style="background:linear-gradient(135deg,#f59e0b,#ef4444);color:#fff;padding:5px 16px;border-radius:6px;font-size:0.85em;font-weight:700;letter-spacing:1px;box-shadow:0 2px 8px rgba(239,68,68,0.3)">DBA-PR&Uuml;FUNG &middot; BETA</span></div>', unsafe_allow_html=True)
         st.warning(
             f"DBA-Beta aktiv: anrechenbare Fonds-Quellensteuer {fmt_de(etf_wht)} EUR. "
             "Ereignis-Matching und DBA-Caps sind experimentell; der Betrag ist "
