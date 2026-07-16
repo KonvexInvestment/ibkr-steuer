@@ -464,6 +464,15 @@ _EQUITY_QUOTA_REVIEW = {
     'US46641Q3323', 'US46654Q2030',  # JEPI/JEPQ: 80%-Policy; Anlagebedingungen pruefen
 }
 
+_PARTNERSHIP_REVIEW = {
+    # Auslaendische Personengesellschaften (LP): der InvStG-Ausschluss nach
+    # ss 1 Abs. 3 Nr. 2 InvStG steht fest, aber die Anschlussbesteuerung
+    # (transparent nach Rechtstypenvergleich vs. ss 20 EStG) ist offen.
+    # Rechenpfad bleibt vorerst no_invstg/Topf 2.
+    'US91232N2071',  # USO (United States Oil Fund LP)
+    'US9123184098',  # UNG (United States Natural Gas Fund LP)
+}
+
 # Review-Produkte bleiben erkennbar, behalten fuer stabile Ergebnisse vorerst
 # ihren bisherigen Rechenpfad und werden im Bericht sichtbar als offen markiert.
 ETF_CLASSIFICATION_REVIEW = {}
@@ -477,6 +486,9 @@ for _isin in list(ETF_CLASSIFICATION):
         _reason = 'Closed-End-Fonds: Rechtsform und verbindliche Fondsquote einzeln pruefen.'
     elif _isin in _EQUITY_QUOTA_REVIEW:
         _reason = 'Aktienquote wahrscheinlich ueber 50%; Nachweis in den massgeblichen Anlagebedingungen offen.'
+    elif _isin in _PARTNERSHIP_REVIEW:
+        _reason = ('Auslaendische Personengesellschaft (ss 1 Abs. 3 Nr. 2 InvStG): '
+                   'deutscher Rechtstypenvergleich fuer die Anschlussbesteuerung offen.')
     if _reason:
         _ticker, _name, _previous_classification = ETF_CLASSIFICATION.pop(_isin)
         ETF_CLASSIFICATION_REVIEW[_isin] = (

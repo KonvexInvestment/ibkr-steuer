@@ -13,6 +13,7 @@ from etf_classification import (
     ETF_CLASSIFICATION,
     get_classification,
     get_etf_info,
+    get_routing_classification,
     get_teilfreistellung,
     is_investment_fund,
     is_valid_isin,
@@ -141,8 +142,11 @@ def test_gld_requires_classification_review_instead_of_guessing_no_invstg():
 
 def test_active_classifications_have_valid_isins_and_audited_special_cases():
     assert all(is_valid_isin(isin) for isin in ETF_CLASSIFICATION)
-    assert get_classification("US91232N2071") == "no_invstg"  # USO LP
-    assert get_classification("US9123184098") == "no_invstg"  # UNG LP
+    # LPs: InvStG-Ausschluss steht fest, Anschlussbesteuerung
+    # (Rechtstypenvergleich) offen -> Review mit no_invstg-Rechenpfad
+    for lp_isin in ("US91232N2071", "US9123184098"):  # USO, UNG
+        assert requires_classification_review(lp_isin)
+        assert get_routing_classification(lp_isin) == "no_invstg"
     assert requires_classification_review("US46641Q3323")  # JEPI
     assert requires_classification_review("US46654Q2030")  # JEPQ
     assert requires_classification_review("US74347W6012")  # UGL
@@ -188,6 +192,14 @@ def test_limited_partnership_routes_outside_invstg():
     summary = get_no_invstg_summary(rd)
     assert round(summary[USO_ISIN]["div"], 2) == 20.00
     assert round(rd["zeile_19_netto_eur"], 2) == 20.00
+    # LP bleibt rechnerisch no_invstg, ist aber als offener
+    # Rechtstypenvergleich im Review sichtbar
+    review = rd["classification_review_items"]
+    assert any(
+        item["isin"] == USO_ISIN
+        and "Rechtstypenvergleich" in item["review_reason"]
+        for item in review
+    )
 
 
 def test_no_invstg_summary_is_reconciled_by_isin():
