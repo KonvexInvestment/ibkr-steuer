@@ -30,10 +30,20 @@ TEILFREISTELLUNG = {
 
 
 # Belastbar hinterlegte DBA-Hoechstsaetze fuer Ausschüttungen einzelner Fonds.
-# Absichtlich keine Ableitung aus dem ISIN-Laenderpraefix: Sitz, Ertragsart und
-# Erstattungsanspruch muessen je Produkt belegt sein. Fehlt ein Eintrag, kann
-# die Steuerberechnung nur den deutschen 25-%-Hoechstbetrag anwenden und weist
-# den Vorgang sichtbar zur DBA-Pruefung aus.
+# Absichtlich keine Ableitung aus dem blossen ISIN-Laenderpraefix beliebiger
+# Produkte: Sitz, Ertragsart und Erstattungsanspruch muessen je Produkt belegt
+# sein. Fehlt ein Eintrag, kann die Steuerberechnung nur den deutschen
+# 25-%-Hoechstbetrag anwenden und weist den Vorgang sichtbar zur DBA-Pruefung
+# aus.
+#
+# US-domizilierte Investmentfonds der Klassifizierungstabelle: Jede US-ISIN in
+# ETF_CLASSIFICATION ist einzeln verifiziert (cbonds, Prospekt). Fuer diese
+# Fonds (RICs/Trusts mit US-Steuerdomizil) gilt fuer Ausschüttungen an in
+# Deutschland ansaessige Privatanleger der DBA-USA-Dividenden-Hoechstsatz von
+# 15 % (Art. 10 Abs. 2 Buchst. b DBA-USA). Der Satz wird unten fuer alle
+# InvStG-Fondsklassen der Tabelle hinterlegt; no_invstg-/anlage_so-Produkte
+# (ETNs, Trusts ausserhalb des InvStG) brauchen keinen Eintrag, weil ihre
+# Ertraege nicht ueber den Fonds-QSt-Pfad laufen.
 FOREIGN_TAX_TREATY_RATES = {
     'US37954Y4834': 0.15,  # QYLD: US-Fonds, DBA-USA Dividenden-Hoechstsatz
     'US78462F1030': 0.15,  # SPY: US-Fonds, DBA-USA Dividenden-Hoechstsatz
@@ -411,6 +421,37 @@ TICKER_TO_ISIN = {}
 for isin, (ticker, name, classification) in ETF_CLASSIFICATION.items():
     if ticker not in TICKER_TO_ISIN:
         TICKER_TO_ISIN[ticker] = isin
+
+
+# DBA-USA 15 % fuer alle verifizierten US-domizilierten InvStG-Fonds der
+# Tabelle (Begruendung siehe Kommentar an FOREIGN_TAX_TREATY_RATES).
+# Explizite Eintraege oben behalten Vorrang (setdefault).
+#
+# AUSNAHME: Nicht-RIC-Strukturen (Limited Partnerships/Commodity Pools nach
+# ss 1446 IRC, Grantor-/Statutory-Trusts) — ihre Ausschuettungen sind keine
+# Dividenden i.S.d. Art. 10 Abs. 2 DBA-USA (bei Zins-Trusts wie FXE gilt
+# Art. 11: 0 %). Diese ISINs bekommen bewusst KEINEN 15%-Eintrag und bleiben
+# als dba_unverified im Prueffall-Bereich sichtbar.
+_NON_RIC_US_FUNDS = {
+    'US46138B1035',  # DBC  (Delaware Statutory Trust, Commodity Pool)
+    'US46138G1013',  # DBC  alt. ISIN
+    'US46140H7008',  # DBB  (Delaware Statutory Trust, Commodity Pool)
+    'US46428R1077',  # GSG  (Trust, Commodity Pool)
+    'US91232N2071',  # USO  (LP, Commodity Pool)
+    'US9123184098',  # UNG  (LP, Commodity Pool)
+    'US88107A1051',  # WEAT (LP, Commodity Pool)
+    'US88166A8707',  # WEAT alt. ISIN
+    'US11410J2026',  # BDRY (LP, Commodity Pool)
+    'US46138K1034',  # FXE  (Grantor Trust, Zinsertraege -> Art. 11 DBA-USA)
+}
+_INVSTG_FUND_CLASSES = (
+    'aktienfonds', 'mischfonds', 'immobilienfonds',
+    'auslands_immobilienfonds', 'sonstiger_fonds',
+)
+for isin, (ticker, name, classification) in ETF_CLASSIFICATION.items():
+    if (isin.startswith('US') and classification in _INVSTG_FUND_CLASSES
+            and isin not in _NON_RIC_US_FUNDS):
+        FOREIGN_TAX_TREATY_RATES.setdefault(isin, 0.15)
 
 
 # ── Helper-Funktionen ────────────────────────────────────────────────────────

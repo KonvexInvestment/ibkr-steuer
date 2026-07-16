@@ -531,7 +531,8 @@ def merge_report_data(reports):
                 )
             else:
                 existing = merged_kap['etf_by_isin'][isin]
-                for nk in ['gain', 'loss', 'div', 'wht', 'wht_anrechenbar',
+                for nk in ['gain', 'loss', 'div', 'div_received', 'div_paid',
+                           'wht', 'wht_anrechenbar',
                            'gain_taxable', 'loss_taxable', 'div_taxable']:
                     existing[nk] = existing.get(nk, 0) + data.get(nk, 0)
                 existing.setdefault('wht_events', []).extend(data.get('wht_events', []))
@@ -1022,14 +1023,23 @@ has_etf_data = len(etf_by_isin) > 0
 
 invstg_aktiv = False
 if has_etf_data:
-    n_aktien = sum(1 for v in etf_by_isin.values() if v.get('classification') == 'aktienfonds')
-    n_sonst = sum(1 for v in etf_by_isin.values() if v.get('classification') != 'aktienfonds')
+    _cls_labels = {
+        'aktienfonds': 'Aktienfonds (30% TFS)',
+        'mischfonds': 'Mischfonds (15% TFS)',
+        'immobilienfonds': 'Immobilienfonds (60% TFS)',
+        'auslands_immobilienfonds': 'Auslands-Immobilienfonds (80% TFS)',
+    }
+    _cls_counts = {}
+    for v in etf_by_isin.values():
+        label = _cls_labels.get(v.get('classification'), 'sonstige Fonds (0% TFS)')
+        _cls_counts[label] = _cls_counts.get(label, 0) + 1
+    cls_summary = ", ".join(f"{n} {label}" for label, n in sorted(_cls_counts.items()))
     etf_tickers = ", ".join(sorted(v.get('ticker', '?') for v in etf_by_isin.values()))
 
     st.markdown(f"""
 <div style="background: rgba(74,222,128,0.08); border: 1px solid rgba(74,222,128,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
     <strong style="color: #4ade80;">InvStG-Klassifizierung (§2 InvStG):</strong> {len(etf_by_isin)} ETFs in Ihrer XML erkannt, die nach dem Investmentsteuergesetz als Investmentfonds gelten und auf <strong>Anlage KAP-INV</strong> gemeldet werden (nicht auf Anlage KAP).
-    Davon {n_aktien} Aktienfonds (30% TFS) und {n_sonst} sonstige Fonds (0% TFS).<br>
+    Davon {cls_summary}.<br>
     <span style="color: #64748b; font-size: 0.75rem;">Betroffene ETFs: {etf_tickers}</span>
 </div>
 """, unsafe_allow_html=True)
@@ -1037,7 +1047,8 @@ if has_etf_data:
         "InvStG-Klassifizierung anwenden (Anlage KAP-INV)",
         value=True,
         help="ETFs werden als Investmentfonds nach InvStG behandelt: separate Meldung auf Anlage KAP-INV, "
-             "Teilfreistellung (30% für Aktienfonds, 0% für sonstige). "
+             "Teilfreistellung je Fondsart (Aktienfonds 30%, Mischfonds 15%, Immobilienfonds 60%, "
+             "Auslands-Immobilienfonds 80%, sonstige 0%). "
              "Deaktivieren = alle ETFs wie normale Aktien auf Anlage KAP behandeln.")
 
     if not invstg_aktiv:
@@ -1584,10 +1595,18 @@ if has_etf_data and invstg_aktiv:
         st.markdown(f"""
 <div style="background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
     <strong style="color: #fbbf24;">Unbekannte ETFs, manuelle Klassifizierung:</strong> {len(etf_unknown)} ETF(s) nicht in der Klassifizierungstabelle.
-    Standardmässig als sonstiger Fonds (0% TFS) behandelt. Falls es sich um Aktienfonds handelt (mind. 51% Aktienquote), bitte unten korrigieren.
+    Standardmäßig als sonstiger Fonds (0% TFS) behandelt. Bitte unten die tatsächliche Fondsart wählen:
+    Aktienfonds (mind. 51% Aktienquote, 30% TFS), Mischfonds (mind. 25% Aktienquote, 15% TFS),
+    Immobilienfonds (60% TFS), Auslands-Immobilienfonds (80% TFS).
 </div>
 """, unsafe_allow_html=True)
-        cls_options = {"Sonstiger Fonds (0% TFS)": 0.0, "Aktienfonds (30% TFS)": 0.30, "Mischfonds (15% TFS)": 0.15}
+        cls_options = {
+            "Sonstiger Fonds (0% TFS)": 0.0,
+            "Aktienfonds (30% TFS)": 0.30,
+            "Mischfonds (15% TFS)": 0.15,
+            "Immobilienfonds (60% TFS)": 0.60,
+            "Auslands-Immobilienfonds (80% TFS)": 0.80,
+        }
         for isin in etf_unknown:
             info = etf_by_isin.get(isin, {})
             ticker = info.get('ticker', isin[:12])
@@ -1630,7 +1649,13 @@ if has_etf_data and invstg_aktiv:
                 info['gain_taxable'] = new_gain_tax
                 info['loss_taxable'] = new_loss_tax
                 info['div_taxable'] = new_div_tax
-                cls_map = {0.30: 'aktienfonds', 0.15: 'mischfonds', 0.0: 'sonstiger_fonds'}
+                cls_map = {
+                    0.30: 'aktienfonds',
+                    0.15: 'mischfonds',
+                    0.60: 'immobilienfonds',
+                    0.80: 'auslands_immobilienfonds',
+                    0.0: 'sonstiger_fonds',
+                }
                 info['classification'] = cls_map.get(new_tfs, 'sonstiger_fonds')
         previous_etf_wht = etf_wht
         wht_recalculation = calculate_tax_report.recalculate_kap_inv_wht(etf_by_isin)
@@ -1680,6 +1705,23 @@ if has_etf_data and invstg_aktiv:
             )
         st.markdown(blocked_table)
 
+    if kap_inv_form.get('negative_distribution_details'):
+        paid_table = "| Prüffall: gezahlte Ausschüttungen | ISIN | Gezahlt | Erhalten |\n"
+        paid_table += "|----------------------------------|------|--------:|--------:|\n"
+        for item in kap_inv_form['negative_distribution_details']:
+            paid_table += (
+                f"| {item.get('ticker', '')} ({item.get('fund_type', '')}) | {item['isin']} | "
+                f"{fmt_de(item.get('paid_distribution_eur', 0))} | "
+                f"{fmt_de(item.get('received_distribution_eur', 0))} |\n"
+            )
+        st.markdown(paid_table)
+        st.caption(
+            "Gezahlte Dividenden/Ersatzzahlungen (Short-Positionen) sind nicht in "
+            "den Ausschüttungszeilen enthalten; steuerliche Behandlung manuell prüfen. "
+            "Hinweis: Die internen Kontrollwerte (ETF-Netto) verrechnen diese Beträge "
+            "weiterhin und können daher von der Formularlogik abweichen."
+        )
+
     form_table = "| KAP-INV | Fondsart | Eintragungswert vor TFS | Steuerpflichtiger Kontrollwert* |\n"
     form_table += "|---------|----------|-----------------------:|-------------------------------:|\n"
     for line in kap_inv_form.get('lines', []):
@@ -1724,6 +1766,18 @@ if has_etf_data and invstg_aktiv:
 
     wht_review_items = kap_inv.get('wht_review_items', []) or []
     if wht_review_items:
+        unverified_sum = sum(
+            e.get('creditable_tax_eur', 0) for e in wht_review_items
+            if e.get('status') == 'dba_unverified'
+        )
+        if abs(unverified_sum) > 0.01:
+            st.warning(
+                f"Zeile 41 enthält {fmt_de(unverified_sum)} EUR Fonds-Quellensteuer "
+                "ohne hinterlegten DBA-Höchstsatz. Der Betrag ist nur auf den "
+                "deutschen 25%-Höchstbetrag begrenzt; besteht im Quellenstaat ein "
+                "Erstattungsanspruch, ist er entsprechend zu kürzen. Details im "
+                "Prüffall-Bereich unten."
+            )
         with st.expander(
             f"Quellensteuer-Prüffälle ({len(wht_review_items)})",
             expanded=False,
@@ -2105,6 +2159,15 @@ if d:
                     item.get('distribution_raw_eur', 0),
                     "keine Formularzeile bis zur bestätigten Fondsart; "
                     f"G/V roh {fmt_de(item.get('sale_raw_eur', 0))} EUR",
+                ))
+            for item in kap_inv_form_export.get('negative_distribution_details', []):
+                summary_rows.append((
+                    "Anlage KAP-INV Prüffall",
+                    f"{item.get('ticker', '')} ({item['isin']}) - gezahlte Ausschüttungen",
+                    item.get('paid_distribution_eur', 0),
+                    "gezahlte Dividenden/Ersatzzahlungen (Short-Position); nicht in "
+                    "den Ausschüttungszeilen enthalten; steuerliche Behandlung "
+                    "manuell prüfen",
                 ))
             summary_rows.append((
                 "Anlage KAP-INV",
@@ -3008,6 +3071,14 @@ if has_etf_data and invstg_aktiv:
         )
         inv_export += blocked_row
         kap_inv_entries_export += blocked_row
+    for item in kap_inv_form.get('negative_distribution_details', []):
+        paid_row = (
+            f"  PRUEFFALL {item.get('ticker', '')} ({item['isin']}): "
+            f"gezahlte Ausschüttungen {fmt_de(item.get('paid_distribution_eur', 0))} EUR "
+            "(Short-Position); nicht in den Ausschüttungszeilen enthalten\n"
+        )
+        inv_export += paid_row
+        kap_inv_entries_export += paid_row
     inv_export += "  Details je ISIN:\n"
     for detail in kap_inv_form.get('details', []):
         inv_export += (

@@ -150,7 +150,38 @@ def test_kap_inv_form_aggregates_by_fund_type_and_blocks_unknowns():
     assert form["status"] == "classification_review_required"
 
 
+def test_kap_inv_form_excludes_paid_distributions_per_isin():
+    # Komponenten-Tracking: gezahlte Betraege raus aus der Zeile, kein Netting
+    form = build_kap_inv_form({
+        "EQ1": {
+            "ticker": "EQ1", "classification": "aktienfonds", "tfs_rate": 0.30,
+            "gain": 0, "loss": 0,
+            "div": 50, "div_received": 100, "div_paid": -50,
+        },
+    })
+    lines = {line["line"]: line for line in form["lines"]}
+    assert round(lines[4]["amount_raw_eur"], 2) == 100.00
+    assert round(lines[4]["taxable_control_eur"], 2) == 70.00
+    assert round(form["negative_distribution_details"][0]["paid_distribution_eur"], 2) == -50.00
+    assert form["status"] == "paid_distribution_review_required"
+
+    # Legacy-Fallback ohne Komponenten-Felder: netto-negative Ausschuettung
+    # erzeugt keine Formularzeile, sondern nur den Prueffall
+    legacy = build_kap_inv_form({
+        "SHORT": {
+            "ticker": "SHORT", "classification": "aktienfonds", "tfs_rate": 0.30,
+            "gain": 0, "loss": 0, "div": -93.71,
+        },
+    })
+    assert 4 not in {line["line"] for line in legacy["lines"]}
+    paid = legacy["negative_distribution_details"]
+    assert len(paid) == 1
+    assert round(paid[0]["paid_distribution_eur"], 2) == -93.71
+    assert legacy["status"] == "paid_distribution_review_required"
+
+
 if __name__ == "__main__":
     test_kap_inv_tageskurs_delta_applies_tfs_per_isin()
     test_kap_inv_form_aggregates_by_fund_type_and_blocks_unknowns()
+    test_kap_inv_form_excludes_paid_distributions_per_isin()
     print("OK: KAP-INV Tageskurs TFS")

@@ -101,7 +101,12 @@ def calculate_creditable_foreign_tax(gross_distribution, tax_withheld,
         creditable_tax = 0.0
     else:
         caps = [net_foreign_tax, german_cap]
-        if treaty_cap is not None:
+        # Cent-/FX-Rundungstoleranz: IBKR behaelt den DBA-Satz in der
+        # Handelswaehrung ein; nach EUR-Umrechnung und Cent-Rundung kann der
+        # Einbehalt um Zehntel-Cents ueber gross_EUR x Satz liegen. Nur echte
+        # Ueberschreitungen (> 2 Cent) deuten auf einen Erstattungsanspruch
+        # und kappen die Anrechnung.
+        if treaty_cap is not None and net_foreign_tax > treaty_cap + 0.02:
             caps.append(treaty_cap)
         creditable_tax = min(caps)
 
@@ -153,7 +158,7 @@ def recalculate_kap_inv_wht(etf_by_isin, treaty_rate_getter=None):
     for isin, data in (etf_by_isin or {}).items():
         tfs_rate = safe_float(data.get('tfs_rate'))
         events = data.get('wht_events') or []
-        isin_creditable = 0.0
+        isin_events = []
         for event in events:
             result = calculate_creditable_foreign_tax(
                 event.get('gross_distribution_eur'),
@@ -164,9 +169,28 @@ def recalculate_kap_inv_wht(etf_by_isin, treaty_rate_getter=None):
             )
             event.update(result)
             event['isin'] = isin
-            isin_creditable += result['creditable_tax_eur']
+            event['excess_offset_eur'] = 0.0
+            isin_events.append(event)
+
+        # Erstattungsueberschuesse zuerst gegen die NICHT angerechneten
+        # Ueberhaenge (excess_tax) derselben ISIN verrechnen: eine Erstattung
+        # des ohnehin nicht angerechneten Teils darf die Anrechnung nicht
+        # kuerzen. Erst ein darueber hinausgehender Rest reduziert Zeile 41.
+        excess_pool = sum(e['excess_tax_eur'] for e in isin_events)
+        for event in isin_events:
+            if event['creditable_tax_eur'] < 0 and excess_pool > 0.005:
+                offset = min(-event['creditable_tax_eur'], excess_pool)
+                event['excess_offset_eur'] = offset
+                event['creditable_tax_eur'] += offset
+                excess_pool -= offset
+                if event['creditable_tax_eur'] >= -0.005:
+                    event['status'] = 'refund_offsets_excess'
+
+        isin_creditable = 0.0
+        for event in isin_events:
+            isin_creditable += event['creditable_tax_eur']
             all_events.append(event)
-            if result['review_required']:
+            if event['review_required']:
                 review_items.append(event)
         # Per-ISIN legacy field retains IBKR's signed-cash convention.
         data['wht_anrechenbar'] = -isin_creditable
@@ -236,10 +260,23 @@ def build_kap_inv_form(etf_by_isin, fx_by_isin=None, unknown_isins=None,
         entry['amount_raw_eur'] += raw_amount
         entry['taxable_control_eur'] += taxable_control
 
+    negative_distribution_details = []
+
     for isin, data in sorted((etf_by_isin or {}).items()):
         classification = data.get('classification') or 'sonstiger_fonds'
         mapping = KAP_INV_FORM_MAPPING.get(classification)
-        raw_distribution = safe_float(data.get('div'))
+        raw_distribution_net = safe_float(data.get('div'))
+        # Zugeflossene und gezahlte Betraege trennen: nur zugeflossene
+        # Ausschuettungen sind Formularwerte (amtliche KAP-INV-Hilfe);
+        # gezahlte Dividenden/Ersatzzahlungen auf Short-Positionen werden
+        # NICHT gegengerechnet, sondern als Prueffall ausgewiesen.
+        # Legacy-Fallback ohne Komponenten-Tracking: Netto-Vorzeichen.
+        if 'div_received' in data or 'div_paid' in data:
+            raw_distribution = safe_float(data.get('div_received'))
+            paid_distribution = safe_float(data.get('div_paid'))
+        else:
+            raw_distribution = max(raw_distribution_net, 0.0)
+            paid_distribution = min(raw_distribution_net, 0.0)
         raw_fx_delta = (
             safe_float((fx_by_isin.get(isin) or {}).get('raw_delta'))
             if include_tageskurs else 0.0
@@ -249,6 +286,15 @@ def build_kap_inv_form(etf_by_isin, fx_by_isin=None, unknown_isins=None,
             + safe_float(data.get('loss'))
             + raw_fx_delta
         )
+        if paid_distribution < -0.005:
+            negative_distribution_details.append({
+                'isin': isin,
+                'ticker': data.get('ticker', isin[:12]),
+                'classification': classification,
+                'fund_type': mapping['label'] if mapping else classification,
+                'paid_distribution_eur': paid_distribution,
+                'received_distribution_eur': raw_distribution,
+            })
         if not mapping or isin in unknown_isins:
             blocked_isins.append(isin)
             blocked_details.append({
@@ -281,6 +327,7 @@ def build_kap_inv_form(etf_by_isin, fx_by_isin=None, unknown_isins=None,
             'advance_lump_sum_line': mapping['advance_lump_sum_line'],
             'sale_line': mapping['sale_line'],
             'distribution_raw_eur': raw_distribution,
+            'distribution_paid_eur': paid_distribution,
             'distribution_taxable_control_eur': taxable_distribution,
             'sale_raw_eur': raw_sale,
             'sale_taxable_control_eur': taxable_sale,
@@ -296,13 +343,6 @@ def build_kap_inv_form(etf_by_isin, fx_by_isin=None, unknown_isins=None,
             mapping['sale_line'], 'sale', classification, mapping, raw_sale, taxable_sale,
         )
 
-    negative_distribution_lines = [
-        entry for entry in line_totals.values()
-        if entry['kind'] == 'distribution' and entry['amount_raw_eur'] < -0.005
-    ]
-    for entry in negative_distribution_lines:
-        entry['requires_negative_distribution_review'] = True
-
     warnings = []
     if blocked_isins:
         warnings.append(
@@ -314,23 +354,26 @@ def build_kap_inv_form(etf_by_isin, fx_by_isin=None, unknown_isins=None,
             'Veräußerungswerte berücksichtigen noch keine bereits '
             'versteuerten Vorabpauschalen und sind daher vorläufig.'
         )
-    for entry in negative_distribution_lines:
-        negative_isins = sorted(
-            d['isin'] for d in details
-            if d['distribution_line'] == entry['line']
-            and d['distribution_raw_eur'] < -0.005
+    if negative_distribution_details:
+        paid_total = sum(
+            d['paid_distribution_eur'] for d in negative_distribution_details
+        )
+        paid_isins = ', '.join(
+            f"{d['ticker']} ({d['paid_distribution_eur']:.2f} EUR)"
+            for d in negative_distribution_details
         )
         warnings.append(
-            f"Zeile {entry['line']} ({entry['fund_type']}): "
-            'Ausschüttungssumme ist negativ '
-            f"({entry['amount_raw_eur']:.2f} EUR; {', '.join(negative_isins)}). "
-            'Negative Beträge entstehen z.B. durch gezahlte Dividenden oder '
-            'Ersatzzahlungen auf Short-Positionen und sind kein gültiger '
-            'Eintragungswert für die Ausschüttungszeilen; bitte prüfen.'
+            'Gezahlte Dividenden/Ersatzzahlungen auf Short-Positionen '
+            f'({paid_total:.2f} EUR gesamt: {paid_isins}) sind keine '
+            'negativen Ausschüttungen und wurden NICHT in die '
+            'Ausschüttungszeilen eingerechnet. Die steuerliche Behandlung '
+            'gezahlter Ersatzzahlungen ist manuell zu prüfen.'
         )
 
     if blocked_isins:
         status = 'classification_review_required'
+    elif negative_distribution_details:
+        status = 'paid_distribution_review_required'
     elif has_sale_activity:
         status = 'advance_lump_sum_review_required'
     else:
@@ -341,6 +384,7 @@ def build_kap_inv_form(etf_by_isin, fx_by_isin=None, unknown_isins=None,
         'details': details,
         'blocked_isins': blocked_isins,
         'blocked_details': blocked_details,
+        'negative_distribution_details': negative_distribution_details,
         'status': status,
         'warnings': warnings,
         'includes_tageskurs': bool(include_tageskurs),
@@ -2003,10 +2047,22 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 'gain': 0.0,
                 'loss': 0.0,
                 'div': 0.0,
+                'div_received': 0.0,
+                'div_paid': 0.0,
                 'wht': 0.0,
                 'wht_events': [],
             }
         return etf_by_isin[isin]
+
+    def add_etf_distribution(entry, amount_eur):
+        # Zugeflossene und gezahlte Betraege getrennt fuehren: gezahlte
+        # Dividenden/Ersatzzahlungen auf Short-Positionen sind keine
+        # (negativen) Ausschuettungen i.S.d. Anlage KAP-INV.
+        entry['div'] += amount_eur
+        if amount_eur >= 0:
+            entry['div_received'] = entry.get('div_received', 0.0) + amount_eur
+        else:
+            entry['div_paid'] = entry.get('div_paid', 0.0) + amount_eur
 
     def get_etf_wht_event(isin, event_date, currency):
         date_key = event_date.isoformat() if event_date else ''
@@ -3498,7 +3554,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             if is_etf_fund:
                 etf_dividends_eur += amount_eur
                 entry = ensure_etf_fund_entry(fund_isin, fund_cls)
-                entry['div'] += amount_eur
+                add_etf_distribution(entry, amount_eur)
                 event = get_etf_wht_event(fund_isin, date, curr)
                 event['gross_distribution_eur'] += max(amount_eur, 0.0)
                 add_etf_wht_source(event, f, report_date)
@@ -3515,7 +3571,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             if is_etf_fund:
                 etf_dividends_eur += amount_eur
                 entry = ensure_etf_fund_entry(fund_isin, fund_cls)
-                entry['div'] += amount_eur
+                add_etf_distribution(entry, amount_eur)
                 event = get_etf_wht_event(fund_isin, date, curr)
                 event['gross_distribution_eur'] += max(amount_eur, 0.0)
                 add_etf_wht_source(event, f, report_date)
