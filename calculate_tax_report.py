@@ -203,6 +203,41 @@ def recalculate_kap_inv_wht(etf_by_isin, treaty_rate_getter=None):
     }
 
 
+def calculate_legacy_kap_inv_wht(etf_by_isin):
+    """Return the pre-DBA fund-tax calculation.
+
+    Before the event-level DBA beta, fund withholding tax was reduced only by
+    the fund's Teilfreistellung rate. Keep that stable behavior as the default
+    and expose the more granular treaty/refund logic only through an explicit
+    opt-in.
+    """
+    signed_creditable_tax = 0.0
+    for data in (etf_by_isin or {}).values():
+        tfs_rate = min(max(safe_float(data.get('tfs_rate')), 0.0), 1.0)
+        signed_amount = safe_float(data.get('wht')) * (1.0 - tfs_rate)
+        data['wht_anrechenbar'] = signed_amount
+        signed_creditable_tax += signed_amount
+
+    return {
+        'creditable_tax_eur': get_withholding_tax_for_reporting(
+            signed_creditable_tax
+        ),
+        'events': [],
+        'review_items': [],
+    }
+
+
+def calculate_kap_inv_wht_for_mode(etf_by_isin, dba_wht_beta_enabled=False,
+                                   treaty_rate_getter=None):
+    """Select stable legacy or optional event-level DBA fund-tax logic."""
+    if not dba_wht_beta_enabled:
+        return calculate_legacy_kap_inv_wht(etf_by_isin)
+    return recalculate_kap_inv_wht(
+        etf_by_isin,
+        treaty_rate_getter=treaty_rate_getter,
+    )
+
+
 KAP_INV_FORM_MAPPING = {
     'aktienfonds': {
         'label': 'Aktienfonds', 'tfs_rate': 0.30,
@@ -301,6 +336,7 @@ def build_kap_inv_form(etf_by_isin, fx_by_isin=None, unknown_isins=None,
                 'isin': isin,
                 'ticker': data.get('ticker', isin[:12]),
                 'classification': classification,
+                'review_reason': data.get('review_reason', ''),
                 'distribution_raw_eur': raw_distribution,
                 'sale_raw_eur': raw_sale,
                 'tageskurs_raw_eur': raw_fx_delta,
@@ -406,7 +442,7 @@ def get_no_invstg_summary(report_data, include_tageskurs=False):
     Trade rows already contain Stillhalter/cross-year corrections. Optional
     Tageskurs deltas are added separately so the summary stays reconcilable.
     """
-    from etf_classification import get_classification, get_etf_info
+    from etf_classification import get_etf_info, get_routing_classification
 
     report_data = report_data or {}
     summary = {}
@@ -429,12 +465,12 @@ def get_no_invstg_summary(report_data, include_tageskurs=False):
     # Auch reine Käufe ohne realisierten Gewinn sichtbar machen.
     for isin in report_data.get('all_traded_etf_isins', []) or []:
         if (isin and isin not in anlage_so_overrides
-                and get_classification(isin) == 'no_invstg'):
+                and get_routing_classification(isin) == 'no_invstg'):
             ensure_entry(isin)
 
     for isin, income in (report_data.get('no_invstg_income_by_isin') or {}).items():
         if (not isin or isin in anlage_so_overrides
-                or get_classification(isin) != 'no_invstg'):
+                or get_routing_classification(isin) != 'no_invstg'):
             continue
         entry = ensure_entry(isin)
         entry['div'] += safe_float(income.get('div'))
@@ -444,7 +480,7 @@ def get_no_invstg_summary(report_data, include_tageskurs=False):
         isin = (row.get('isin') or '').strip()
         if (row.get('assetCategory') != 'STK' or row.get('topf') != 'Topf2'
                 or not isin or isin in anlage_so_overrides
-                or get_classification(isin) != 'no_invstg'):
+                or get_routing_classification(isin) != 'no_invstg'):
             continue
         pnl = safe_float(row.get('pnl_eur'))
         entry = ensure_entry(isin)
@@ -458,7 +494,7 @@ def get_no_invstg_summary(report_data, include_tageskurs=False):
             isin = (lot.get('isin') or '').strip()
             if (lot.get('topf') != 'Topf2' or not isin
                     or isin in anlage_so_overrides
-                    or get_classification(isin) != 'no_invstg'):
+                    or get_routing_classification(isin) != 'no_invstg'):
                 continue
             ensure_entry(isin)['tageskurs'] += safe_float(lot.get('delta_eur'))
 
@@ -1840,7 +1876,8 @@ def _put_assignment_lot_cost_correction_per_share(closed_lots, det, underlying, 
 
 
 def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrides=None,
-                  fx_margin_correction_enabled=True):
+                  fx_margin_correction_enabled=True,
+                  dba_wht_beta_enabled=False):
     # 0. Detect base currency, tax year, and XML metadata from account_info.csv
     base_currency = 'EUR'  # default — most IBKR accounts for German tax filers are EUR-based
     xml_has_fx_data = False
@@ -1963,8 +2000,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         get_classification,
         get_etf_info,
         get_foreign_tax_treaty_rate,
+        get_routing_classification,
         get_teilfreistellung,
         is_known_etf,
+        requires_classification_review,
     )
 
     anlage_so_overrides_set = set(anlage_so_overrides or ())
@@ -1974,8 +2013,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # manuell als Anlage SO markieren, auch wenn sie nicht im Lookup stehen.
         if isin and isin in anlage_so_overrides_set:
             return 'anlage_so'
-        entry = ETF_CLASSIFICATION.get(isin)
-        return entry[2] if entry else None
+        return get_routing_classification(isin)
 
     etf_isins = set()  # all ISINs that IBKR marks as ETF (subCategory)
     symbol_to_isin = {}  # for Stillhalter underlying lookup
@@ -2052,6 +2090,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 'wht': 0.0,
                 'wht_events': [],
             }
+            if info and info.get('review_required'):
+                etf_by_isin[isin]['review_reason'] = info.get(
+                    'review_reason', 'Steuerliche Klassifikation nicht belegt.'
+                )
         return etf_by_isin[isin]
 
     def add_etf_distribution(entry, amount_eur):
@@ -4257,7 +4299,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     etf_div_taxable = 0.0
     etf_unknown_isins = []  # ISINs with subCategory=ETF but not in lookup table
     for isin in etf_isins:
-        if not is_known_etf(isin) and isin in etf_by_isin:
+        if get_classification(isin) is None and isin in etf_by_isin:
             etf_unknown_isins.append(isin)
 
     for (isin, _date_key, _currency), event in sorted(etf_wht_event_buckets.items()):
@@ -4276,8 +4318,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         etf_div_taxable += data['div_taxable']
 
     etf_wht_reported = get_withholding_tax_for_reporting(etf_wht_eur)
-    etf_wht_calculation = recalculate_kap_inv_wht(
+    etf_wht_calculation = calculate_kap_inv_wht_for_mode(
         etf_by_isin,
+        dba_wht_beta_enabled=dba_wht_beta_enabled,
         treaty_rate_getter=get_foreign_tax_treaty_rate,
     )
     etf_wht_anrechenbar = etf_wht_calculation['creditable_tax_eur']
@@ -4819,6 +4862,20 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         | set(isin for isin in etf_by_isin.keys() if isin)
         | set(t.get('isin', '') for t in anlage_so_trades if t.get('isin'))
     )
+    classification_review_items = []
+    for isin in all_traded_etf_isins:
+        if not requires_classification_review(isin):
+            continue
+        info = get_etf_info(isin) or {}
+        classification_review_items.append({
+            'isin': isin,
+            'ticker': info.get('ticker', isin[:12]),
+            'name': info.get('name', ''),
+            'routing_classification': get_routing_classification(isin),
+            'review_reason': info.get(
+                'review_reason', 'Steuerliche Klassifikation nicht belegt.'
+            ),
+        })
 
     # Foreign tax on fund distributions is entered on Anlage KAP line 41,
     # not on KAP-INV. Keep the legacy non-fund field separate for reconciliation.
@@ -4872,6 +4929,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         "fx_option_a_meta": fx_option_a_meta,
         "fx_has_negative_balance": fx_has_negative_balance,
         "fx_margin_correction_enabled": fx_margin_correction_enabled,
+        "dba_wht_beta_enabled": bool(dba_wht_beta_enabled),
         "xml_has_fx_data": xml_has_fx_data,
         "csv_category_totals": csv_category_totals,
         "csv_income_totals": csv_income_totals,
@@ -4906,6 +4964,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # Alle ETF-ISINs, die im Report auftauchen (für GUI-Override-Auswahl)
         "all_traded_etf_isins": all_traded_etf_isins,
         "anlage_so_overrides_applied": sorted(anlage_so_overrides_set),
+        "classification_review_items": classification_review_items,
         # Trade-level details for FA reporting (Issue #17)
         "trade_details": debug_rows,
         # Plausibility Metadata

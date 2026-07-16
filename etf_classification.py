@@ -14,7 +14,9 @@ fuer die Berechnung der Teilfreistellung:
 Rechtsgrundlage: ss 20 InvStG (Teilfreistellung), ss 2 InvStG (Investmentfonds-Definition)
                  ss 23 Abs. 1 Nr. 2 EStG (private Veraeusserungsgeschaefte)
 
-ISINs verifiziert via cbonds.com (April 2026). Jede ISIN wurde einzeln geprueft.
+Aktive ISIN-Schluessel werden technisch nach ISO 6166 validiert. Produkte mit
+unklarer deutscher Rechtsform-/InvStG-Einordnung oder ungueltiger Kennnummer
+werden nicht automatisch klassifiziert, sondern in den Pruefstatus verschoben.
 """
 
 # ── Teilfreistellungssaetze ──────────────────────────────────────────────────
@@ -36,14 +38,11 @@ TEILFREISTELLUNG = {
 # 25-%-Hoechstbetrag anwenden und weist den Vorgang sichtbar zur DBA-Pruefung
 # aus.
 #
-# US-domizilierte Investmentfonds der Klassifizierungstabelle: Jede US-ISIN in
-# ETF_CLASSIFICATION ist einzeln verifiziert (cbonds, Prospekt). Fuer diese
-# Fonds (RICs/Trusts mit US-Steuerdomizil) gilt fuer Ausschüttungen an in
-# Deutschland ansaessige Privatanleger der DBA-USA-Dividenden-Hoechstsatz von
-# 15 % (Art. 10 Abs. 2 Buchst. b DBA-USA). Der Satz wird unten fuer alle
-# InvStG-Fondsklassen der Tabelle hinterlegt; no_invstg-/anlage_so-Produkte
-# (ETNs, Trusts ausserhalb des InvStG) brauchen keinen Eintrag, weil ihre
-# Ertraege nicht ueber den Fonds-QSt-Pfad laufen.
+# Beta-Annahme fuer aktive US-Fonds: 15 % nach Art. 10 Abs. 2 Buchst. b
+# DBA-USA. Diese Ableitung ist bewusst nur im optionalen DBA-Beta-Modus aktiv;
+# Produktrechtsform, RIC-Status und konkrete Ertragsart sind noch nicht fuer
+# jeden Eintrag abschliessend belegt. Review-/no_invstg-/anlage_so-Produkte
+# erhalten keinen automatischen Satz.
 FOREIGN_TAX_TREATY_RATES = {
     'US37954Y4834': 0.15,  # QYLD: US-Fonds, DBA-USA Dividenden-Hoechstsatz
     'US78462F1030': 0.15,  # SPY: US-Fonds, DBA-USA Dividenden-Hoechstsatz
@@ -52,7 +51,8 @@ FOREIGN_TAX_TREATY_RATES = {
 
 # ── ETF-Lookup: ISIN → (ticker, name, classification) ────────────────────────
 # Sortiert nach Kategorie, dann nach Subkategorie.
-# Alle ISINs via cbonds.com verifiziert (April 2026).
+# Kandidatentabelle; technische ISIN-Validierung und Review-Quarantaene folgen
+# direkt nach dem Literal.
 
 ETF_CLASSIFICATION = {
 
@@ -204,8 +204,8 @@ ETF_CLASSIFICATION = {
     'US46138B1035': ('DBC',  'Invesco DB Commodity Index Tracking Fund',         'sonstiger_fonds'),  # Commodity Pool, Futures
     'US46428R1077': ('GSG',  'iShares S&P GSCI Commodity-Indexed Trust',         'sonstiger_fonds'),  # Commodity Pool, Futures
     'US46090F1003': ('PDBC', 'Invesco Optimum Yield Diversified Commodity Strategy ETF', 'sonstiger_fonds'),  # Commodity-Futures via Subsidiary
-    'US91232N2071': ('USO',  'United States Oil Fund LP',                        'sonstiger_fonds'),  # LP Commodity Pool, Crude Oil Futures
-    'US9123184098': ('UNG',  'United States Natural Gas Fund LP',                'sonstiger_fonds'),  # LP Commodity Pool, Nat Gas Futures
+    'US91232N2071': ('USO',  'United States Oil Fund LP',                        'no_invstg'),  # auslaendische Personengesellschaft, §1 Abs. 3 Nr. 2 InvStG
+    'US9123184098': ('UNG',  'United States Natural Gas Fund LP',                'no_invstg'),  # auslaendische Personengesellschaft, §1 Abs. 3 Nr. 2 InvStG
 
     # --- Leveraged/Inverse ETFs (Derivate-basiert, keine physischen Aktien → 0% TFS) ---
     # §2 Abs. 8 InvStG: Swaps/Futures zaehlen nicht zur Aktienquote
@@ -290,12 +290,12 @@ ETF_CLASSIFICATION = {
     'US25459L7136': ('SPXL', 'Direxion Daily S&P 500 Bull 3X Shares',           'sonstiger_fonds'),
     'US74347B2016': ('TBT',  'ProShares UltraShort 20+ Year Treasury',          'sonstiger_fonds'),
     'US25459L7285': ('TNA',  'Direxion Daily Small Cap Bull 3X Shares',          'sonstiger_fonds'),
-    'US74347F8164': ('UGL',  'ProShares Ultra Gold',                             'sonstiger_fonds'),
+    'US74347W6012': ('UGL',  'ProShares Ultra Gold',                             'sonstiger_fonds'),
     'US74347B7421': ('URTY', 'ProShares UltraPro Russell 2000',                  'sonstiger_fonds'),
     'US25459L7376': ('UTSL', 'Direxion Daily Utilities Bull 3X Shares',          'sonstiger_fonds'),
     'US25459Y8012': ('WANT', 'Direxion Daily Consumer Discretionary Bull 3X Shares', 'sonstiger_fonds'),
     'US25459L7437': ('YINN', 'Direxion Daily FTSE China Bull 3X Shares',         'sonstiger_fonds'),
-    'US74347F8157': ('AGQ',  'ProShares Ultra Silver',                           'sonstiger_fonds'),
+    'US74347W3530': ('AGQ',  'ProShares Ultra Silver',                           'sonstiger_fonds'),
     'US25459L7094': ('NUGT', 'Direxion Daily Gold Miners Index Bull 2X Shares',  'sonstiger_fonds'),  # alt. ISIN
 
     # --- Weitere Anleihen-ETFs (Björn-Audit) ---
@@ -316,8 +316,8 @@ ETF_CLASSIFICATION = {
     'US82889N8552': ('PFIX', 'Simplify Interest Rate Hedge ETF',                 'sonstiger_fonds'),
 
     # --- Covered-Call / Income-Strategie ETFs (Derivate-basiert) ---
-    'US46641Q3323': ('JEPI', 'JPMorgan Equity Premium Income ETF',               'sonstiger_fonds'),
-    'US46654Q2038': ('JEPQ', 'JPMorgan Nasdaq Equity Premium Income ETF',        'sonstiger_fonds'),
+    'US46641Q3323': ('JEPI', 'JPMorgan Equity Premium Income ETF',               'sonstiger_fonds'),  # Aktienfonds-Indiz; InvStG-Nachweis offen
+    'US46654Q2030': ('JEPQ', 'JPMorgan Nasdaq Equity Premium Income ETF',        'sonstiger_fonds'),  # Aktienfonds-Indiz; InvStG-Nachweis offen
     'US88634T7827': ('NFLY', 'YieldMax NFLX Option Income Strategy ETF',         'sonstiger_fonds'),
     'US88634T7744': ('NVDY', 'YieldMax NVDA Option Income Strategy ETF',         'sonstiger_fonds'),
 
@@ -354,7 +354,7 @@ ETF_CLASSIFICATION = {
     'US46428Q1094': ('SLV',  'iShares Silver Trust',                            'no_invstg'),  # cbonds /etf/169/
     'US18500Q1040': ('GLDM', 'SPDR Gold MiniShares Trust',                      'no_invstg'),  # cbonds
 
-    # --- Krypto-ETPs (Spot-Trusts = kein Fonds, Futures-Fonds = sonstiger_fonds) ---
+    # --- Krypto-ETPs (bisheriges Routing; US-Spot-Trusts gehen unten in Review) ---
     'US46438F1012': ('IBIT', 'iShares Bitcoin Trust ETF',                       'no_invstg'),  # Spot-Trust, einzelner Basiswert
     'US3896381072': ('ETHE', 'Grayscale Ethereum Trust ETF',                    'no_invstg'),  # Spot-Trust, einzelner Basiswert
     'US3837861092': ('GBTC', 'Grayscale Bitcoin Trust ETF',                     'no_invstg'),  # Spot-Trust, einzelner Basiswert
@@ -386,11 +386,11 @@ ETF_CLASSIFICATION = {
     # --- Gehebelte/Inverse Rohstoff-ETPs (kein Investmentfonds) ---
     'IE00B6X4BP29': ('3GOS',  'WisdomTree Gold 3x Daily Short',                  'no_invstg'),  # gehebeltes ETP, Schuldverschreibung
 
-    # --- Physische Rohstoff-Trusts (kein Fonds) ---
+    # --- Physische Rohstoff-Trusts (bisheriges Routing; unten Typenvergleich-Review) ---
     'US01924U1097': ('PALL',  'Aberdeen Standard Physical Palladium Shares ETF', 'no_invstg'),  # physischer Palladium-Trust
-    'US9129087967': ('CPER',  'United States Copper Index Fund LP',              'no_invstg'),  # Commodity Pool LP, einzelner Basiswert
+    'US9129087964': ('CPER',  'United States Copper Index Fund',                 'no_invstg'),  # Delaware Statutory Trust; deutscher Typenvergleich offen
 
-    # --- Closed-End Funds (keine offenen Investmentfonds i.S.d. InvStG) ---
+    # --- Closed-End Funds (bisheriges Routing; unten Einzelpruefung) ---
     'US00302L1089': ('AWP',  'Aberdeen Global Premier Properties Fund',          'no_invstg'),  # CEF
     'US6706ER1015': ('BXMX', 'Nuveen S&P 500 Buy-Write Income Fund',            'no_invstg'),  # CEF
     'US1846911030': ('CBA',  'ClearBridge American Energy MLP Fund',             'no_invstg'),  # CEF
@@ -416,15 +416,86 @@ ETF_CLASSIFICATION = {
 }
 
 
+# ── Technische Validierung und steuerlicher Pruefstatus ─────────────────────
+
+def is_valid_isin(isin: str) -> bool:
+    """Validate an ISIN using its ISO-6166/Luhn check digit."""
+    if not isinstance(isin, str) or len(isin) != 12 or not isin.isalnum():
+        return False
+    expanded = ''.join(
+        char if char.isdigit() else str(ord(char.upper()) - 55)
+        for char in isin
+    )
+    total = 0
+    for index, char in enumerate(reversed(expanded)):
+        value = int(char)
+        if index % 2:
+            value *= 2
+            if value > 9:
+                value -= 9
+        total += value
+    return total % 10 == 0
+
+
+_TYPE_COMPARISON_REVIEW = {
+    # Passive Single-Asset-/Grantor-Trusts: Investmentvermoegen nach KAGB ist
+    # moeglich; die deutsche Rechtstyp-Einordnung ist produktbezogen zu belegen.
+    'US78463V1070', 'US4642852044', 'US46428Q1094', 'US18500Q1040',
+    'US46438F1012', 'US3896381072', 'US3837861092', 'US0919481095',
+    'US01924U1097',
+    # Commodity Pools / Statutory Trusts, die in den USA als PTP/Partnership
+    # behandelt werden. US-Steuerstatus ersetzt den deutschen Typenvergleich nicht.
+    'US46138B1035', 'US46138G1013', 'US46140H7008', 'US46428R1077',
+    'US88107A1051', 'US88166A8707', 'US11410J2026', 'US46138K1034',
+    'US74347Y7489', 'US74347Y6804', 'US74347W6012', 'US74347W3530',
+    'US92891H1014', 'US9129087964',
+}
+
+_CLOSED_END_REVIEW = {
+    'US00302L1089', 'US6706ER1015', 'US1846911030', 'US94987B1052',
+    'US27828Q1058', 'US27827X1019', 'US27828X1000', 'US27828H1059',
+    'US27829F1084', 'US31647Q1067', 'US87911K1007', 'US67073B1061',
+    'US55607W1009', 'US95766M1053', 'US0188251096', 'US6706821039',
+    'US89148B1017', 'US76970B1017', 'US19247X1000', 'US2316312014',
+    'US19248A1097', 'US46131M1062',
+}
+
+_EQUITY_QUOTA_REVIEW = {
+    'US46641Q3323', 'US46654Q2030',  # JEPI/JEPQ: 80%-Policy; Anlagebedingungen pruefen
+}
+
+# Review-Produkte bleiben erkennbar, behalten fuer stabile Ergebnisse vorerst
+# ihren bisherigen Rechenpfad und werden im Bericht sichtbar als offen markiert.
+ETF_CLASSIFICATION_REVIEW = {}
+for _isin in list(ETF_CLASSIFICATION):
+    _reason = None
+    if not is_valid_isin(_isin):
+        _reason = 'Ungueltige ISO-6166-Pruefziffer; aktuelle ISIN belegen.'
+    elif _isin in _TYPE_COMPARISON_REVIEW:
+        _reason = 'Deutscher Rechtstyp-/InvStG-Vergleich noch nicht belegt.'
+    elif _isin in _CLOSED_END_REVIEW:
+        _reason = 'Closed-End-Fonds: Rechtsform und verbindliche Fondsquote einzeln pruefen.'
+    elif _isin in _EQUITY_QUOTA_REVIEW:
+        _reason = 'Aktienquote wahrscheinlich ueber 50%; Nachweis in den massgeblichen Anlagebedingungen offen.'
+    if _reason:
+        _ticker, _name, _previous_classification = ETF_CLASSIFICATION.pop(_isin)
+        ETF_CLASSIFICATION_REVIEW[_isin] = (
+            _ticker, _name, _previous_classification, _reason,
+        )
+
+
 # ── Reverse-Lookup: Ticker → ISIN ────────────────────────────────────────────
 TICKER_TO_ISIN = {}
 for isin, (ticker, name, classification) in ETF_CLASSIFICATION.items():
     if ticker not in TICKER_TO_ISIN:
         TICKER_TO_ISIN[ticker] = isin
+for isin, (ticker, name, classification, reason) in ETF_CLASSIFICATION_REVIEW.items():
+    if is_valid_isin(isin) and ticker not in TICKER_TO_ISIN:
+        TICKER_TO_ISIN[ticker] = isin
 
 
-# DBA-USA 15 % fuer alle verifizierten US-domizilierten InvStG-Fonds der
-# Tabelle (Begruendung siehe Kommentar an FOREIGN_TAX_TREATY_RATES).
+# DBA-Beta: 15 % fuer aktive US-domizilierte InvStG-Fonds der Tabelle
+# (Risikohinweis siehe Kommentar an FOREIGN_TAX_TREATY_RATES).
 # Explizite Eintraege oben behalten Vorrang (setdefault).
 #
 # AUSNAHME: Nicht-RIC-Strukturen (Limited Partnerships/Commodity Pools nach
@@ -439,17 +510,16 @@ _NON_RIC_US_FUNDS = {
     'US46428R1077',  # GSG  (Trust, Commodity Pool)
     'US91232N2071',  # USO  (LP, Commodity Pool)
     'US9123184098',  # UNG  (LP, Commodity Pool)
-    'US88107A1051',  # WEAT (LP, Commodity Pool)
+    'US88107A1051',  # WEAT (Statutory Trust / US-tax Partnership)
     'US88166A8707',  # WEAT alt. ISIN
-    'US11410J2026',  # BDRY (LP, Commodity Pool)
+    'US11410J2026',  # BDRY (Statutory Trust / US-tax Partnership)
     'US46138K1034',  # FXE  (Grantor Trust, Zinsertraege -> Art. 11 DBA-USA)
     # ProShares Trust II: Commodity Pools / Publicly Traded Partnerships
     # (steuerlich KEINE RICs, anders als ProShares Trust I wie TQQQ/SSO)
     'US74347Y7489',  # BOIL (ProShares Trust II, PTP)
     'US74347Y6804',  # UVXY (ProShares Trust II, PTP)
-    'US74347X8492',  # UVXY alt. ISIN
-    'US74347F8164',  # UGL  (ProShares Trust II, PTP)
-    'US74347F8157',  # AGQ  (ProShares Trust II, PTP)
+    'US74347W6012',  # UGL  (ProShares Trust II, PTP)
+    'US74347W3530',  # AGQ  (ProShares Trust II, PTP)
     'US92891H1014',  # SVIX (VS Trust, Commodity Pool / PTP)
 }
 _INVSTG_FUND_CLASSES = (
@@ -468,7 +538,19 @@ def get_etf_info(isin: str):
     """Lookup ETF by ISIN. Returns dict with ticker, name, classification, teilfreistellung or None."""
     entry = ETF_CLASSIFICATION.get(isin)
     if entry is None:
-        return None
+        review_entry = ETF_CLASSIFICATION_REVIEW.get(isin)
+        if review_entry is None:
+            return None
+        ticker, name, previous_classification, reason = review_entry
+        return {
+            'ticker': ticker,
+            'name': name,
+            'classification': None,
+            'teilfreistellung': None,
+            'review_required': True,
+            'review_reason': reason,
+            'previous_classification': previous_classification,
+        }
     ticker, name, classification = entry
     return {
         'ticker': ticker,
@@ -489,8 +571,8 @@ def get_teilfreistellung(isin: str) -> float:
 
 
 def is_known_etf(isin: str) -> bool:
-    """Check if ISIN is in the ETF lookup table."""
-    return isin in ETF_CLASSIFICATION
+    """Check if an ETF/ETP is known, including classification-review cases."""
+    return isin in ETF_CLASSIFICATION or isin in ETF_CLASSIFICATION_REVIEW
 
 
 def is_investment_fund(isin: str) -> bool:
@@ -517,6 +599,27 @@ def get_classification(isin: str):
     return entry[2]
 
 
+def get_routing_classification(isin: str):
+    """Return the stable calculation route, including review fallbacks.
+
+    A review marker must not silently move an instrument between KAP and
+    KAP-INV. Until the German type comparison is resolved, calculations keep
+    the previously used route while the report flags the classification.
+    """
+    entry = ETF_CLASSIFICATION.get(isin)
+    if entry is not None:
+        return entry[2]
+    review_entry = ETF_CLASSIFICATION_REVIEW.get(isin)
+    if review_entry is not None:
+        return review_entry[2]
+    return None
+
+
+def requires_classification_review(isin: str) -> bool:
+    """Return True for known products without an automatic tax classification."""
+    return isin in ETF_CLASSIFICATION_REVIEW
+
+
 def get_foreign_tax_treaty_rate(isin: str):
     """Return an explicitly verified treaty cap for fund distributions."""
     return FOREIGN_TAX_TREATY_RATES.get(isin)
@@ -533,9 +636,8 @@ def lookup_by_ticker(ticker: str):
 
 
 def get_unknown_etf_isins(traded_isins):
-    """Given a list of traded ISINs, return those NOT in our lookup table.
-    Useful for flagging instruments that might be ETFs requiring manual classification."""
-    return [isin for isin in traded_isins if isin not in ETF_CLASSIFICATION]
+    """Return unknown or deliberately unclassified ETF/ETP identifiers."""
+    return [isin for isin in traded_isins if get_classification(isin) is None]
 
 
 # ── Selbsttest ────────────────────────────────────────────────────────────────

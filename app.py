@@ -398,6 +398,9 @@ def merge_report_data(reports):
     merged['fx_margin_correction_enabled'] = all(
         r.get('fx_margin_correction_enabled', True) for r in reports
     )
+    merged['dba_wht_beta_enabled'] = all(
+        r.get('dba_wht_beta_enabled', False) for r in reports
+    )
 
     # FX source
     sources = set(r.get('fx_source', 'none') for r in reports)
@@ -598,6 +601,13 @@ def merge_report_data(reports):
         merged_all_etfs.update(r.get('all_traded_etf_isins', []))
     merged['all_traded_etf_isins'] = sorted(merged_all_etfs)
     merged['anlage_so_overrides_applied'] = list(reports[0].get('anlage_so_overrides_applied', []))
+    merged_review_items = {}
+    for r in reports:
+        for item in r.get('classification_review_items', []) or []:
+            isin = item.get('isin', '')
+            if isin:
+                merged_review_items[isin] = dict(item)
+    merged['classification_review_items'] = list(merged_review_items.values())
 
     # Audit merge
     merged_audit = {
@@ -823,6 +833,33 @@ if 'fx_margin_correction_enabled' not in st.session_state:
     st.session_state['fx_margin_correction_enabled'] = True
 fx_margin_correction_enabled = st.session_state['fx_margin_correction_enabled']
 
+if 'dba_wht_beta_enabled' not in st.session_state:
+    st.session_state['dba_wht_beta_enabled'] = False
+
+with st.expander("Optionale Beta · DBA-Prüfung für Fonds-Quellensteuer", expanded=False):
+    dba_wht_beta_enabled = st.checkbox(
+        "Beta aktivieren: Fonds-Quellensteuer ereignisbezogen nach DBA begrenzen",
+        key="dba_wht_beta_enabled",
+        help=(
+            "Deaktiviert (Standard): bisherige stabile Berechnung Rohsteuer × "
+            "(1 − Teilfreistellung). Aktiviert: Ausschüttungen, Einbehalte und "
+            "Erstattungen werden je Ereignis gematcht und zusätzlich durch "
+            "hinterlegte DBA-Sätze begrenzt."
+        ),
+    )
+    if dba_wht_beta_enabled:
+        st.warning(
+            "Beta-Modus: Produktrechtsform, US-RIC-Status und Ertragsart sind "
+            "noch nicht für alle Fonds abschließend belegt. Unbekannte oder "
+            "zeitversetzte Vorgänge bleiben Prüffälle. Werte vor Übernahme in "
+            "die Steuererklärung manuell beziehungsweise steuerlich prüfen."
+        )
+    else:
+        st.caption(
+            "Standardmodus aktiv: keine automatischen DBA-Caps und kein "
+            "ereignisbasiertes Erstattungs-Matching."
+        )
+
 
 # Show quarterly merge info
 for acct_id, xmls in accounts_to_process.items():
@@ -888,6 +925,7 @@ with st.spinner("Berechne Steuerreport…"):
                     fx_csv_path=csv_report_path,
                     anlage_so_overrides=st.session_state.get('anlage_so_overrides', []),
                     fx_margin_correction_enabled=fx_margin_correction_enabled,
+                    dba_wht_beta_enabled=dba_wht_beta_enabled,
                 )
 
                 # Validate base currency consistency
@@ -1222,6 +1260,28 @@ if n_accounts > 1:
     <strong style="color: #fbbf24;">{n_accounts} Konten zusammengeführt</strong>: Jedes Konto wurde separat berechnet, die Ergebnisse wurden addiert.
 </div>
 """, unsafe_allow_html=True)
+
+classification_review_items = d.get('classification_review_items', []) or []
+if classification_review_items:
+    review_names = ", ".join(
+        f"{item.get('ticker', item.get('isin', '?'))} ({item.get('isin', '?')})"
+        for item in classification_review_items
+    )
+    st.warning(
+        f"Steuerliche Produktklassifikation offen: {review_names}. Die Berechnung "
+        "behält bis zur Klärung den bisherigen KAP-/KAP-INV-Pfad bei; die Werte "
+        "sind für diese Produkte nicht zur ungeprüften Übernahme freigegeben."
+    )
+    with st.expander("Details zu offenen ETF-/ETP-Klassifikationen", expanded=False):
+        review_table = "| Produkt | ISIN | Bisheriger Rechenpfad | Prüfgrund |\n"
+        review_table += "|---------|------|-----------------------|-----------|\n"
+        for item in classification_review_items:
+            review_table += (
+                f"| {item.get('ticker', '')} | {item.get('isin', '')} | "
+                f"{item.get('routing_classification', '')} | "
+                f"{item.get('review_reason', '')} |\n"
+            )
+        st.markdown(review_table)
 
 # ── FxTransactions-Warnung ───────────────────────────────────────────────────
 
@@ -1594,7 +1654,7 @@ if has_etf_data and invstg_aktiv:
     if etf_unknown:
         st.markdown(f"""
 <div style="background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #fbbf24;">Unbekannte ETFs, manuelle Klassifizierung:</strong> {len(etf_unknown)} ETF(s) nicht in der Klassifizierungstabelle.
+    <strong style="color: #fbbf24;">ETF-Klassifizierung prüfen:</strong> {len(etf_unknown)} ETF(s) sind unbekannt oder wegen offener Rechtsform-/InvStG-Fragen nicht automatisch klassifiziert.
     Standardmäßig als sonstiger Fonds (0% TFS) behandelt. Bitte unten die tatsächliche Fondsart wählen:
     Aktienfonds (mind. 51% Aktienquote, 30% TFS), Mischfonds (mind. 25% Aktienquote, 15% TFS),
     Immobilienfonds (60% TFS), Auslands-Immobilienfonds (80% TFS).
@@ -1612,6 +1672,8 @@ if has_etf_data and invstg_aktiv:
             ticker = info.get('ticker', isin[:12])
             name = info.get('name', '')
             label = f"{ticker} ({isin})" + (f": {name}" if name else "")
+            if info.get('review_reason'):
+                st.caption(f"Prüfgrund: {info['review_reason']}")
             choice = st.selectbox(label, list(cls_options.keys()), key=f"etf_cls_{isin}")
             classification_confirmed = st.checkbox(
                 "Fondsart für die Formularzuordnung bestätigen",
@@ -1658,7 +1720,10 @@ if has_etf_data and invstg_aktiv:
                 }
                 info['classification'] = cls_map.get(new_tfs, 'sonstiger_fonds')
         previous_etf_wht = etf_wht
-        wht_recalculation = calculate_tax_report.recalculate_kap_inv_wht(etf_by_isin)
+        wht_recalculation = calculate_tax_report.calculate_kap_inv_wht_for_mode(
+            etf_by_isin,
+            dba_wht_beta_enabled=dba_wht_beta_enabled,
+        )
         etf_wht = wht_recalculation['creditable_tax_eur']
         kap_inv['etf_wht_anrechenbar_eur'] = etf_wht
         kap_inv['wht_events'] = wht_recalculation['events']
@@ -1695,11 +1760,12 @@ if has_etf_data and invstg_aktiv:
             st.warning(warning)
 
     if kap_inv_form.get('blocked_details'):
-        blocked_table = "| Nicht zugeordnet | ISIN | Ausschüttung roh | G/V roh |\n"
-        blocked_table += "|-----------------|------|------------------:|---------:|\n"
+        blocked_table = "| Nicht zugeordnet | ISIN | Prüfgrund | Ausschüttung roh | G/V roh |\n"
+        blocked_table += "|-----------------|------|-----------|------------------:|---------:|\n"
         for item in kap_inv_form['blocked_details']:
             blocked_table += (
                 f"| {item.get('ticker', '')} | {item['isin']} | "
+                f"{item.get('review_reason', 'Fondsart nicht bestätigt')} | "
                 f"{fmt_de(item.get('distribution_raw_eur', 0))} | "
                 f"{fmt_de(item.get('sale_raw_eur', 0))} |\n"
             )
@@ -1738,10 +1804,18 @@ if has_etf_data and invstg_aktiv:
             "angesetzter Vorabpauschalen ausdrücklich noch nicht final."
         )
 
-    st.info(
-        f"Anrechenbare ausländische Fonds-Quellensteuer: {fmt_de(etf_wht)} EUR – "
-        "bereits in Anlage KAP Zeile 41 enthalten; KAP-INV hat dafür keine eigene Zeile."
-    )
+    if dba_wht_beta_enabled:
+        st.warning(
+            f"DBA-Beta aktiv: anrechenbare Fonds-Quellensteuer {fmt_de(etf_wht)} EUR. "
+            "Ereignis-Matching und DBA-Caps sind experimentell; der Betrag ist "
+            "bereits in Anlage KAP Zeile 41 enthalten."
+        )
+    else:
+        st.info(
+            f"Standardberechnung Fonds-Quellensteuer: {fmt_de(etf_wht)} EUR "
+            "(Rohsteuer × (1 − Teilfreistellung)); bereits in Anlage KAP "
+            "Zeile 41 enthalten. Die optionale DBA-Beta ist deaktiviert."
+        )
 
     wht_metric_html = metric_card("Fonds-QSt → KAP Z. 41", etf_wht)
     if abs(etf_wht_raw - etf_wht) > 0.01:
@@ -1765,7 +1839,7 @@ if has_etf_data and invstg_aktiv:
     )
 
     wht_review_items = kap_inv.get('wht_review_items', []) or []
-    if wht_review_items:
+    if dba_wht_beta_enabled and wht_review_items:
         unverified_sum = sum(
             e.get('creditable_tax_eur', 0) for e in wht_review_items
             if e.get('status') == 'dba_unverified'
@@ -2972,7 +3046,10 @@ Die Teilfreistellung wird pro ISIN nur als steuerlicher Kontrollwert berechnet:
 
 KAP-INV-Zeilen = Rohbeträge vor TFS nach Fondsart (Z. 4–8 und 14/17/20/23/26)
 Kontrollwert = (ETF-G/V + ETF-Div) × (1 − TFS); kein Eintragungswert
-ETF-Quellensteuer wird ereignisbezogen begrenzt und in Anlage KAP Zeile 41 ausgewiesen.
+ETF-Quellensteuer wird im Standardmodus wie vor dem DBA-Update proportional
+zur Teilfreistellung gekürzt. Optional kann die ausdrücklich als Beta markierte
+ereignisbezogene DBA-/Erstattungsprüfung aktiviert werden. Der Ergebnisbetrag
+wird in Anlage KAP Zeile 41 ausgewiesen.
 Veräußerungswerte sind bis zur Berücksichtigung bereits angesetzter
 Vorabpauschalen ausdrücklich noch nicht final.
 ```
@@ -3034,6 +3111,16 @@ inv_export = ""
 kap_inv_entries_export = ""
 if has_etf_data and invstg_aktiv:
     inv_export = f"\nANLAGE KAP-INV: INVESTMENTFONDS (InvStG)\n"
+    if dba_wht_beta_enabled:
+        inv_export += (
+            "  Fonds-QSt-Modus: DBA-BETA AKTIV "
+            "(Ereignis-Matching/DBA-Caps; manuell prüfen)\n"
+        )
+    else:
+        inv_export += (
+            "  Fonds-QSt-Modus: STANDARD "
+            "(Rohsteuer × (1 - Teilfreistellung); DBA-Beta aus)\n"
+        )
     kap_inv_entries_export = "\nANLAGE KAP-INV EINTRAGUNGEN\n"
     for line in kap_inv_form.get('lines', []):
         suffix = (
@@ -3148,10 +3235,24 @@ multi_acct_export = ""
 if n_accounts > 1:
     multi_acct_export = f"Konten: {n_accounts} (separat berechnet, Ergebnisse addiert)\n"
 
+classification_review_export = ""
+if classification_review_items:
+    classification_review_export = "\nOFFENE PRODUKTKLASSIFIKATIONEN\n"
+    classification_review_export += (
+        "  Bisheriger Rechenpfad bleibt vorläufig bestehen; Werte manuell prüfen.\n"
+    )
+    for item in classification_review_items:
+        classification_review_export += (
+            f"  {item.get('ticker', ''):8s} {item.get('isin', '')}  "
+            f"Pfad {item.get('routing_classification', '')}: "
+            f"{item.get('review_reason', '')}\n"
+        )
+
 report_text = f"""ANLAGE KAP {steuerjahr} - Steuerbericht
 Erstellt: {created_at}
 Basiswährung: {d.get('base_currency', 'USD')}
 {multi_acct_export}
+{classification_review_export}
 ═══════════════════════════════════════════════════
 TOPF 1: AKTIEN (ohne ETF-Fonds)
   Aktiengewinne:         {fmt_de(final['stocks_gain']):>14} EUR

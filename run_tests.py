@@ -3,8 +3,8 @@
 
 Nutzt test_data/audit_expectations.json als Referenz (echte IBKR-Daten, gitignored).
 Vergleicht die GUI-defaults Werte: Tageskurs-Methode, InvStG/KAP-INV und
-Zuflussprinzip sind alle aktiv. Damit decken die Tests genau das ab, was der
-User in der UI sieht.
+Zuflussprinzip sind aktiv; die optionale DBA-Quellensteuer-Beta ist aus.
+Damit decken die Tests genau das ab, was der User ohne Beta-Opt-in sieht.
 
 Usage:
     python run_tests.py              # alle verfügbaren Szenarien
@@ -162,7 +162,7 @@ def run_tests():
             with contextlib.redirect_stdout(io.StringIO()):
                 rd = calculate_tax(out_dir)
 
-        # GUI-defaults anwenden (Tageskurs+InvStG+Zufluss aktiv)
+        # GUI-defaults anwenden (Tageskurs+InvStG+Zufluss aktiv, DBA-Beta aus)
         user = compute_user_facing(rd)
 
         mismatches = []

@@ -19,7 +19,7 @@ from calculate_tax_report import (
 )
 
 
-def calculate_for_funds(funds):
+def calculate_for_funds(funds, dba_beta=False):
     fieldnames = sorted({k for row in funds for k in row})
     with tempfile.TemporaryDirectory() as tmp:
         with open(os.path.join(tmp, "account_info.csv"), "w", newline="") as f:
@@ -31,7 +31,7 @@ def calculate_for_funds(funds):
             writer.writeheader()
             writer.writerows(funds)
         with contextlib.redirect_stdout(io.StringIO()):
-            return calculate_tax(tmp)
+            return calculate_tax(tmp, dba_wht_beta_enabled=dba_beta)
 
 
 def test_creditable_tax_uses_caps_instead_of_proportional_tfs_reduction():
@@ -94,7 +94,7 @@ def test_kap_inv_wht_anrechenbar_uses_event_cap():
             "isin": "US78462F1030",
             "symbol": "SPY",
         },
-    ])
+    ], dba_beta=True)
     kap_inv = rd["kap_inv"]
     assert round(kap_inv["etf_wht_eur"], 2) == 150.00
     assert round(kap_inv["etf_wht_anrechenbar_eur"], 2) == 150.00
@@ -104,6 +104,43 @@ def test_kap_inv_wht_anrechenbar_uses_event_cap():
 
 def test_kap_inv_wht_reporting_falls_back_for_legacy_data():
     assert get_kap_inv_wht_for_reporting({"etf_wht_eur": 150.0}) == 150.0
+
+
+def test_dba_beta_is_opt_in_and_legacy_mode_is_default():
+    rows = [
+        {
+            "activityCode": "DIV",
+            "reportDate": "2025-03-15",
+            "date": "2025-03-15",
+            "amount": "1000",
+            "currency": "EUR",
+            "subCategory": "ETF",
+            "isin": "US78462F1030",
+            "symbol": "SPY",
+        },
+        {
+            "activityCode": "WHT",
+            "reportDate": "2025-03-15",
+            "date": "2025-03-15",
+            "amount": "-300",
+            "currency": "EUR",
+            "subCategory": "ETF",
+            "isin": "US78462F1030",
+            "symbol": "SPY",
+        },
+    ]
+
+    stable = calculate_for_funds(rows)
+    assert stable["dba_wht_beta_enabled"] is False
+    # Vor-DBA-Verhalten: 300 Rohsteuer × (1 - 30% TFS) = 210.
+    assert round(stable["kap_inv"]["etf_wht_anrechenbar_eur"], 2) == 210.00
+    assert stable["kap_inv"]["wht_events"] == []
+    assert stable["kap_inv"]["wht_review_items"] == []
+
+    beta = calculate_for_funds(rows, dba_beta=True)
+    assert beta["dba_wht_beta_enabled"] is True
+    assert round(beta["kap_inv"]["etf_wht_anrechenbar_eur"], 2) == 150.00
+    assert len(beta["kap_inv"]["wht_events"]) == 1
 
 
 def test_line_41_invstg_toggle_replaces_fund_tax_without_double_counting():
@@ -141,7 +178,7 @@ def test_multi_account_sums_finished_credits_without_global_recap():
 
 
 def test_verified_us_funds_have_treaty_rate():
-    from etf_classification import get_foreign_tax_treaty_rate
+    from etf_classification import get_foreign_tax_treaty_rate, is_valid_isin
     # US-domizilierte InvStG-Fonds der Tabelle: DBA-USA 15 %
     assert get_foreign_tax_treaty_rate("US46090E1038") == 0.15  # QQQ
     assert get_foreign_tax_treaty_rate("US37954Y4834") == 0.15  # QYLD
@@ -154,15 +191,15 @@ def test_verified_us_funds_have_treaty_rate():
         "US46138K1034",  # FXE (Grantor Trust)
         "US74347Y7489",  # BOIL (ProShares Trust II, PTP)
         "US74347Y6804",  # UVXY (ProShares Trust II, PTP)
-        "US74347X8492",  # UVXY alt. ISIN
-        "US74347F8164",  # UGL (ProShares Trust II, PTP)
-        "US74347F8157",  # AGQ (ProShares Trust II, PTP)
+        "US74347W6012",  # UGL (ProShares Trust II, PTP)
+        "US74347W3530",  # AGQ (ProShares Trust II, PTP)
         "US92891H1014",  # SVIX (VS Trust, Commodity Pool)
     ):
         assert get_foreign_tax_treaty_rate(non_ric_isin) is None, non_ric_isin
     # ProShares Trust I (1940-Act-RICs) behalten den 15%-Satz
     assert get_foreign_tax_treaty_rate("US74347X8314") == 0.15  # TQQQ
     assert get_foreign_tax_treaty_rate("US74347G4405") == 0.15  # BITO
+    assert not is_valid_isin("US74347X8492")
     # unbekannte ISINs bleiben unbelegt
     assert get_foreign_tax_treaty_rate("IE00B4L5Y983") is None
 
@@ -241,7 +278,7 @@ def test_kap_inv_wht_refunds_keep_their_sign():
             "date": "2025-04-01",
             "amount": "50",
         },
-    ])["kap_inv"]
+    ], dba_beta=True)["kap_inv"]
     assert round(mixed["etf_wht_eur"], 2) == 100.00
     assert round(mixed["etf_wht_anrechenbar_eur"], 2) == 100.00
 
@@ -270,7 +307,7 @@ def test_kap_inv_wht_refunds_keep_their_sign():
             "date": "2025-05-01",
             "amount": "150",
         },
-    ])
+    ], dba_beta=True)
     excess_kap_inv = excess_refund["kap_inv"]
     assert round(excess_kap_inv["etf_wht_anrechenbar_eur"], 2) == 150.00
     assert round(excess_refund["zeile_41_withholding_tax_eur"], 2) == 150.00
@@ -304,7 +341,7 @@ def test_kap_inv_wht_refunds_keep_their_sign():
             "date": "2025-05-01",
             "amount": "200",
         },
-    ])["kap_inv"]
+    ], dba_beta=True)["kap_inv"]
     assert round(over_refund["etf_wht_anrechenbar_eur"], 2) == 100.00
 
     refund_only = calculate_for_funds([
@@ -322,7 +359,7 @@ def test_kap_inv_wht_refunds_keep_their_sign():
             "date": "2025-04-01",
             "amount": "20",
         },
-    ])["kap_inv"]
+    ], dba_beta=True)["kap_inv"]
     assert round(refund_only["etf_wht_eur"], 2) == -20.00
     assert round(refund_only["etf_wht_anrechenbar_eur"], 2) == -20.00
     assert round(get_kap_inv_wht_for_reporting(refund_only), 2) == -20.00
@@ -335,6 +372,7 @@ if __name__ == "__main__":
     test_creditable_tax_uses_caps_instead_of_proportional_tfs_reduction()
     test_kap_inv_wht_anrechenbar_uses_event_cap()
     test_kap_inv_wht_reporting_falls_back_for_legacy_data()
+    test_dba_beta_is_opt_in_and_legacy_mode_is_default()
     test_line_41_invstg_toggle_replaces_fund_tax_without_double_counting()
     test_multi_account_sums_finished_credits_without_global_recap()
     test_verified_us_funds_have_treaty_rate()

@@ -143,6 +143,7 @@ def test_kap_inv_form_aggregates_by_fund_type_and_blocks_unknowns():
         "isin": "UNKNOWN",
         "ticker": "UNK",
         "classification": "sonstiger_fonds",
+        "review_reason": "",
         "distribution_raw_eur": 5.0,
         "sale_raw_eur": 10.0,
         "tageskurs_raw_eur": 0.0,
