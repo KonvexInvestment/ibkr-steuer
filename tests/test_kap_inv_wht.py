@@ -147,10 +147,22 @@ def test_verified_us_funds_have_treaty_rate():
     assert get_foreign_tax_treaty_rate("US37954Y4834") == 0.15  # QYLD
     # no_invstg-Produkte (ETN) laufen nicht ueber den Fonds-QSt-Pfad
     assert get_foreign_tax_treaty_rate("US06748M1962") is None  # VXX
-    # Nicht-RIC-Strukturen (LP/Grantor Trust): keine Dividenden i.S.d.
-    # Art. 10 DBA-USA -> kein 15%-Blanket, bleiben dba_unverified
-    assert get_foreign_tax_treaty_rate("US91232N2071") is None  # USO (LP)
-    assert get_foreign_tax_treaty_rate("US46138K1034") is None  # FXE (Trust)
+    # Nicht-RIC-Strukturen (LP/Commodity Pool/Grantor Trust): keine
+    # Dividenden i.S.d. Art. 10 DBA-USA -> kein 15%-Blanket, dba_unverified
+    for non_ric_isin in (
+        "US91232N2071",  # USO (LP)
+        "US46138K1034",  # FXE (Grantor Trust)
+        "US74347Y7489",  # BOIL (ProShares Trust II, PTP)
+        "US74347Y6804",  # UVXY (ProShares Trust II, PTP)
+        "US74347X8492",  # UVXY alt. ISIN
+        "US74347F8164",  # UGL (ProShares Trust II, PTP)
+        "US74347F8157",  # AGQ (ProShares Trust II, PTP)
+        "US92891H1014",  # SVIX (VS Trust, Commodity Pool)
+    ):
+        assert get_foreign_tax_treaty_rate(non_ric_isin) is None, non_ric_isin
+    # ProShares Trust I (1940-Act-RICs) behalten den 15%-Satz
+    assert get_foreign_tax_treaty_rate("US74347X8314") == 0.15  # TQQQ
+    assert get_foreign_tax_treaty_rate("US74347G4405") == 0.15  # BITO
     # unbekannte ISINs bleiben unbelegt
     assert get_foreign_tax_treaty_rate("IE00B4L5Y983") is None
 

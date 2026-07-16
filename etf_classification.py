@@ -443,6 +443,14 @@ _NON_RIC_US_FUNDS = {
     'US88166A8707',  # WEAT alt. ISIN
     'US11410J2026',  # BDRY (LP, Commodity Pool)
     'US46138K1034',  # FXE  (Grantor Trust, Zinsertraege -> Art. 11 DBA-USA)
+    # ProShares Trust II: Commodity Pools / Publicly Traded Partnerships
+    # (steuerlich KEINE RICs, anders als ProShares Trust I wie TQQQ/SSO)
+    'US74347Y7489',  # BOIL (ProShares Trust II, PTP)
+    'US74347Y6804',  # UVXY (ProShares Trust II, PTP)
+    'US74347X8492',  # UVXY alt. ISIN
+    'US74347F8164',  # UGL  (ProShares Trust II, PTP)
+    'US74347F8157',  # AGQ  (ProShares Trust II, PTP)
+    'US92891H1014',  # SVIX (VS Trust, Commodity Pool / PTP)
 }
 _INVSTG_FUND_CLASSES = (
     'aktienfonds', 'mischfonds', 'immobilienfonds',
