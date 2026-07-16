@@ -381,7 +381,10 @@ def merge_report_data(reports):
     merged['zeile_7_kapitalertraege_mit_inlaendischem_steuerabzug_eur'] = merged['domestic_taxed_dividends_eur']
     merged['zeile_37_kapitalertragsteuer_eur'] = sum(r.get('zeile_37_kapitalertragsteuer_eur', 0) for r in reports)
     merged['zeile_38_solidaritaetszuschlag_eur'] = sum(r.get('zeile_38_solidaritaetszuschlag_eur', 0) for r in reports)
-    merged['zeile_41_withholding_tax_eur'] = merged['withholding_tax_eur']
+    merged['zeile_41_withholding_tax_eur'] = sum(
+        r.get('zeile_41_withholding_tax_eur', r.get('withholding_tax_eur', 0))
+        for r in reports
+    )
 
     # Scalars (from first report)
     merged['base_currency'] = reports[0].get('base_currency', 'EUR')
@@ -509,6 +512,7 @@ def merge_report_data(reports):
         'etf_dividends_raw_eur': 0, 'etf_dividends_taxable_eur': 0,
         'etf_wht_eur': 0, 'etf_wht_anrechenbar_eur': 0, 'etf_net_taxable_eur': 0,
         'etf_by_isin': {}, 'etf_unknown_isins': [],
+        'wht_events': [], 'wht_review_items': [],
         'etf_stillhalter_premium_eur': 0,
     }
     for r in reports:
@@ -517,22 +521,40 @@ def merge_report_data(reports):
                    'etf_loss_taxable_eur', 'etf_dividends_raw_eur', 'etf_dividends_taxable_eur',
                    'etf_wht_eur', 'etf_wht_anrechenbar_eur', 'etf_net_taxable_eur',
                    'etf_stillhalter_premium_eur']:
-            if k == 'etf_wht_anrechenbar_eur':
-                merged_kap[k] += calculate_tax_report.get_kap_inv_wht_for_reporting(ki)
-            else:
+            if k != 'etf_wht_anrechenbar_eur':
                 merged_kap[k] += ki.get(k, 0)
         for isin, data in ki.get('etf_by_isin', {}).items():
             if isin not in merged_kap['etf_by_isin']:
                 merged_kap['etf_by_isin'][isin] = dict(data)
+                merged_kap['etf_by_isin'][isin]['wht_events'] = list(
+                    data.get('wht_events', [])
+                )
             else:
                 existing = merged_kap['etf_by_isin'][isin]
                 for nk in ['gain', 'loss', 'div', 'wht', 'wht_anrechenbar',
                            'gain_taxable', 'loss_taxable', 'div_taxable']:
                     existing[nk] = existing.get(nk, 0) + data.get(nk, 0)
+                existing.setdefault('wht_events', []).extend(data.get('wht_events', []))
+        merged_kap['wht_events'].extend(ki.get('wht_events', []))
+        merged_kap['wht_review_items'].extend(ki.get('wht_review_items', []))
         for isin in ki.get('etf_unknown_isins', []):
             if isin not in merged_kap['etf_unknown_isins']:
                 merged_kap['etf_unknown_isins'].append(isin)
+    merged_kap['etf_wht_anrechenbar_eur'] = (
+        calculate_tax_report.merge_kap_inv_wht_for_reporting(
+            [r.get('kap_inv', {}) for r in reports]
+        )
+    )
     merged['kap_inv'] = merged_kap
+    merged['kap_inv_form'] = calculate_tax_report.build_kap_inv_form(
+        merged_kap['etf_by_isin'],
+        merged.get('fx_correction_kap_inv_by_isin', {}),
+        merged_kap['etf_unknown_isins'],
+        include_tageskurs=True,
+    )
+    merged['kap_inv_form']['kap_line_41_creditable_tax_eur'] = merged_kap[
+        'etf_wht_anrechenbar_eur'
+    ]
 
     # no_invstg income merge (Ausschüttungen/Quellensteuer je ISIN)
     merged_no_invstg_income = {}
@@ -898,7 +920,7 @@ zeile_23      = d.get('zeile_23_stock_losses_eur', abs(d.get('stocks_loss_eur', 
 zeile_7       = d.get('zeile_7_kapitalertraege_mit_inlaendischem_steuerabzug_eur', 0)
 zeile_37      = d.get('zeile_37_kapitalertragsteuer_eur', 0)
 zeile_38      = d.get('zeile_38_solidaritaetszuschlag_eur', 0)
-quellensteuer = d.get('withholding_tax_eur', 0)
+quellensteuer = calculate_tax_report.get_kap_line_41_for_reporting(d)
 
 # Zuflussprinzip data
 audit = d.get('audit', {})
@@ -1028,7 +1050,11 @@ if has_etf_data:
         adj_topf_2 += kap_inv.get('etf_dividends_raw_eur', 0)
         adj_zeile_19 += kap_inv.get('etf_dividends_raw_eur', 0)
         zeile_19 += kap_inv.get('etf_dividends_raw_eur', 0)
-        quellensteuer += kap_inv.get('etf_wht_eur', 0)
+        # Core Z. 41 already contains the capped InvStG amount. With InvStG
+        # disabled, replace that amount by the raw fund tax exactly once.
+        quellensteuer = calculate_tax_report.get_kap_line_41_for_reporting(
+            d, invstg_enabled=False
+        )
 
 # ── Tageskurs-Korrektur (§20 Abs. 4 S. 1 EStG) ──────────────────────────────
 
@@ -1548,6 +1574,7 @@ if has_etf_data and invstg_aktiv:
     etf_unknown = kap_inv.get('etf_unknown_isins', [])
     etf_stillhalter = kap_inv.get('etf_stillhalter_premium_eur', 0)
     kapinv_fx_by_isin = d.get('fx_correction_kap_inv_by_isin', {}) or {}
+    unconfirmed_unknown_isins = list(etf_unknown)
 
 if has_etf_data and invstg_aktiv:
     section_title("Anlage KAP-INV · Investmentfonds (InvStG)")
@@ -1567,20 +1594,25 @@ if has_etf_data and invstg_aktiv:
             name = info.get('name', '')
             label = f"{ticker} ({isin})" + (f": {name}" if name else "")
             choice = st.selectbox(label, list(cls_options.keys()), key=f"etf_cls_{isin}")
+            classification_confirmed = st.checkbox(
+                "Fondsart für die Formularzuordnung bestätigen",
+                value=False,
+                key=f"etf_cls_confirm_{isin}",
+            )
+            if classification_confirmed and isin in unconfirmed_unknown_isins:
+                unconfirmed_unknown_isins.remove(isin)
             new_tfs = cls_options[choice]
             old_tfs = info.get('tfs_rate', 0.0)
             if new_tfs != old_tfs:
                 raw_gain = info.get('gain', 0)
                 raw_loss = info.get('loss', 0)
                 raw_div = info.get('div', 0)
-                raw_wht = info.get('wht', 0)
                 old_gain_tax = info.get('gain_taxable', raw_gain)
                 old_loss_tax = info.get('loss_taxable', raw_loss)
                 old_div_tax = info.get('div_taxable', raw_div)
                 new_gain_tax = raw_gain * (1 - new_tfs)
                 new_loss_tax = raw_loss * (1 - new_tfs)
                 new_div_tax = raw_div * (1 - new_tfs)
-                new_wht_anrechenbar = raw_wht * (1 - new_tfs)
                 raw_tk_delta = kapinv_fx_by_isin.get(isin, {}).get('raw_delta', 0) if tageskurs_aktiv else 0
                 old_tk_tax = raw_tk_delta * (1 - old_tfs)
                 new_tk_tax = raw_tk_delta * (1 - new_tfs)
@@ -1598,29 +1630,78 @@ if has_etf_data and invstg_aktiv:
                 info['gain_taxable'] = new_gain_tax
                 info['loss_taxable'] = new_loss_tax
                 info['div_taxable'] = new_div_tax
-                info['wht_anrechenbar'] = new_wht_anrechenbar
                 cls_map = {0.30: 'aktienfonds', 0.15: 'mischfonds', 0.0: 'sonstiger_fonds'}
                 info['classification'] = cls_map.get(new_tfs, 'sonstiger_fonds')
-        etf_wht = calculate_tax_report.get_withholding_tax_for_reporting(
-            sum(info.get('wht_anrechenbar', info.get('wht', 0))
-                for info in etf_by_isin.values())
-        )
+        previous_etf_wht = etf_wht
+        wht_recalculation = calculate_tax_report.recalculate_kap_inv_wht(etf_by_isin)
+        etf_wht = wht_recalculation['creditable_tax_eur']
         kap_inv['etf_wht_anrechenbar_eur'] = etf_wht
+        kap_inv['wht_events'] = wht_recalculation['events']
+        kap_inv['wht_review_items'] = wht_recalculation['review_items']
+        final['quellensteuer'] += etf_wht - previous_etf_wht
+
+    kap_inv_form = calculate_tax_report.build_kap_inv_form(
+        etf_by_isin,
+        kapinv_fx_by_isin,
+        unconfirmed_unknown_isins,
+        include_tageskurs=tageskurs_aktiv,
+    )
+    kap_inv_form['kap_line_41_creditable_tax_eur'] = etf_wht
 
     # ETF-Overrides in final-Dict spiegeln
     final['etf_net_taxable'] = etf_net_taxable
     final['etf_wht'] = etf_wht
+    final['kap_inv_form'] = kap_inv_form
 
-    inv_hero_color = "#4ade80" if etf_net_taxable >= 0 else "#f87171"
+    kap_inv_raw_total = sum(
+        line.get('amount_raw_eur', 0) for line in kap_inv_form.get('lines', [])
+    )
+    inv_hero_color = "#4ade80" if kap_inv_raw_total >= 0 else "#f87171"
     st.markdown(f"""
 <div class="hero-card-inv">
-    <div class="hero-label">KAP-INV · Steuerpflichtige Erträge (nach Teilfreistellung)</div>
-    <div class="hero-value" style="color:{inv_hero_color}">{fmt(etf_net_taxable)}</div>
-    <div class="hero-formula">G/V stpfl. ({fmt(etf_gain_taxable + etf_loss_taxable)}) + Div stpfl. ({fmt(etf_div_taxable)}) - anr. QSt ({fmt(etf_wht)})</div>
+    <div class="hero-label">KAP-INV · ELSTER-Rohwerte vor Teilfreistellung</div>
+    <div class="hero-value" style="color:{inv_hero_color}">{fmt(kap_inv_raw_total)}</div>
+    <div class="hero-formula">Ausschüttungen und Veräußerungsergebnisse nach Fondsart; ausländische Steuer steht ausschließlich in Anlage KAP Zeile 41.</div>
 </div>
 """, unsafe_allow_html=True)
 
-    wht_metric_html = metric_card("ETF-QSt anrechenbar", etf_wht)
+    if kap_inv_form.get('warnings'):
+        for warning in kap_inv_form['warnings']:
+            st.warning(warning)
+
+    if kap_inv_form.get('blocked_details'):
+        blocked_table = "| Nicht zugeordnet | ISIN | Ausschüttung roh | G/V roh |\n"
+        blocked_table += "|-----------------|------|------------------:|---------:|\n"
+        for item in kap_inv_form['blocked_details']:
+            blocked_table += (
+                f"| {item.get('ticker', '')} | {item['isin']} | "
+                f"{fmt_de(item.get('distribution_raw_eur', 0))} | "
+                f"{fmt_de(item.get('sale_raw_eur', 0))} |\n"
+            )
+        st.markdown(blocked_table)
+
+    form_table = "| KAP-INV | Fondsart | ELSTER-Betrag vor TFS | Steuerpflichtiger Kontrollwert* |\n"
+    form_table += "|---------|----------|-----------------------:|-------------------------------:|\n"
+    for line in kap_inv_form.get('lines', []):
+        form_table += (
+            f"| Zeile {line['line']} | {line['fund_type']} | "
+            f"{fmt_de(line['amount_raw_eur'])} | "
+            f"{fmt_de(line['taxable_control_eur'])} |\n"
+        )
+    if kap_inv_form.get('lines'):
+        st.markdown(form_table)
+        st.caption(
+            "* Kontrollrechnung nach Teilfreistellung – kein ELSTER-Eingabewert. "
+            "Veräußerungszeilen sind bis zur späteren Berücksichtigung bereits "
+            "angesetzter Vorabpauschalen ausdrücklich noch nicht final."
+        )
+
+    st.info(
+        f"Anrechenbare ausländische Fonds-Quellensteuer: {fmt_de(etf_wht)} EUR – "
+        "bereits in Anlage KAP Zeile 41 enthalten; KAP-INV hat dafür keine eigene Zeile."
+    )
+
+    wht_metric_html = metric_card("Fonds-QSt → KAP Z. 41", etf_wht)
     if abs(etf_wht_raw - etf_wht) > 0.01:
         wht_metric_html = metric_card("ETF-QSt roh", etf_wht_raw) + wht_metric_html
     tk_metric_html = ""
@@ -1633,13 +1714,41 @@ if has_etf_data and invstg_aktiv:
         + metric_card("ETF-Gewinne (roh)", etf_gain_raw, "gain")
         + metric_card("ETF-Verluste (roh)", etf_loss_raw, "loss")
         + metric_card("Teilfreistellung", etf_gain_raw - etf_gain_taxable + etf_loss_raw - etf_loss_taxable, "info")
-        + metric_card("ETF-Netto (stpfl.)", etf_gain_taxable + etf_loss_taxable, "saldo")
-        + metric_card("ETF-Div. (stpfl.)", etf_div_taxable)
+        + metric_card("G/V Kontrollwert*", etf_gain_taxable + etf_loss_taxable, "saldo")
+        + metric_card("Div. Kontrollwert*", etf_div_taxable)
         + tk_metric_html
         + wht_metric_html
         + '</div>',
         unsafe_allow_html=True
     )
+
+    wht_review_items = kap_inv.get('wht_review_items', []) or []
+    if wht_review_items:
+        with st.expander(
+            f"Quellensteuer-Prüffälle ({len(wht_review_items)})",
+            expanded=False,
+        ):
+            st.caption(
+                "DBA-Sätze werden nicht aus dem ISIN-Länderpräfix geraten. "
+                "Unbelegte DBA-Fälle und zeitversetzte Erstattungen bleiben sichtbar."
+            )
+            review_table = (
+                "| ISIN | Datum | Rohsteuer | DE-Höchstbetrag | DBA-Limit | "
+                "Anrechenbar | Status |\n"
+                "|------|-------|-----------:|-----------------:|----------:|"
+                "------------:|--------|\n"
+            )
+            for event in wht_review_items:
+                treaty_cap = event.get('treaty_cap_eur')
+                treaty_text = fmt_de(treaty_cap) if treaty_cap is not None else "prüfen"
+                review_table += (
+                    f"| {event.get('isin', '')} | {event.get('date', '') or '–'} | "
+                    f"{fmt_de(event.get('net_foreign_tax_eur', 0))} | "
+                    f"{fmt_de(event.get('german_cap_eur', 0))} | {treaty_text} | "
+                    f"{fmt_de(event.get('creditable_tax_eur', 0))} | "
+                    f"{event.get('status', '')} |\n"
+                )
+            st.markdown(review_table)
 
     with st.expander("ETF-Details nach ISIN"):
         etf_table = "| Ticker | Typ | TFS | G/V roh | G/V stpfl. | Div roh | Div stpfl. |\n"
@@ -1916,6 +2025,7 @@ if d:
 
         f = export_context['final']
         has_etf = export_context['has_etf_data'] and export_context['invstg_aktiv']
+        kap_inv_form_export = export_context.get('kap_inv_form', {})
         has_so = export_context['has_so_data']
         special_products = export_context['no_invstg_summary']
         so_taxable = export_context['so_taxable']
@@ -1975,10 +2085,33 @@ if d:
             ("Anlage KAP", "Zeile 41 - ausl. Quellensteuer", f['quellensteuer'], ""),
         ]
         if has_etf:
-            summary_rows.extend([
-                ("Anlage KAP-INV", "Erträge nach Teilfreistellung", f['etf_net_taxable'], ""),
-                ("Anlage KAP-INV", "Anrechenbare Quellensteuer ETF", f['etf_wht'], ""),
-            ])
+            for line in kap_inv_form_export.get('lines', []):
+                note = (
+                    "Bruttowert vor TFS; steuerpflichtiger Kontrollwert "
+                    f"{fmt_de(line.get('taxable_control_eur', 0))} EUR"
+                )
+                if line.get('kind') == 'sale':
+                    note += "; vor Abzug bereits angesetzter Vorabpauschalen"
+                summary_rows.append((
+                    "Anlage KAP-INV",
+                    f"Zeile {line['line']} - {line['fund_type']}",
+                    line['amount_raw_eur'],
+                    note,
+                ))
+            for item in kap_inv_form_export.get('blocked_details', []):
+                summary_rows.append((
+                    "Anlage KAP-INV Prüffall",
+                    f"{item.get('ticker', '')} ({item['isin']}) - Ausschüttung roh",
+                    item.get('distribution_raw_eur', 0),
+                    "keine Formularzeile bis zur bestätigten Fondsart; "
+                    f"G/V roh {fmt_de(item.get('sale_raw_eur', 0))} EUR",
+                ))
+            summary_rows.append((
+                "Anlage KAP-INV",
+                "Fonds-QSt: enthalten in Anlage KAP Zeile 41",
+                f['etf_wht'],
+                "keine eigene KAP-INV-Zeile",
+            ))
         for isin, info in sorted(special_products.items(), key=lambda x: x[1].get('ticker', '')):
             summary_rows.append((
                 "Topf 2 Sonderprodukte",
@@ -2172,6 +2305,7 @@ if d:
         'created_at': created_at,
         'has_etf_data': has_etf_data,
         'invstg_aktiv': invstg_aktiv,
+        'kap_inv_form': kap_inv_form if (has_etf_data and invstg_aktiv) else {},
         'no_invstg_summary': no_invstg_summary,
         'has_so_data': has_so_data,
         'so_taxable': so_taxable_export,
@@ -2361,8 +2495,17 @@ kap_rows_html += (
 
 if has_etf_data and invstg_aktiv:
     kap_rows_html += '<div class="section-title" style="margin-top:1.5rem;">Anlage KAP-INV</div>'
-    kap_rows_html += kap_row("KAP-INV", "Erträge nach Teilfreistellung", final['etf_net_taxable'], highlight=True)
-    kap_rows_html += kap_row("KAP-INV", "Anrechenbare Quellensteuer (ETF)", final['etf_wht'])
+    for line in kap_inv_form.get('lines', []):
+        kind_label = (
+            "Ausschüttungen" if line.get('kind') == 'distribution'
+            else "Veräußerungsergebnis vor Abzug von Vorabpauschalen"
+        )
+        kap_rows_html += kap_row(
+            f"Z. {line['line']}",
+            f"{kind_label} · {line['fund_type']} (vor TFS)",
+            line['amount_raw_eur'],
+            highlight=True,
+        )
 
 if has_so_data:
     so_taxable_for_row = anlage_so.get('taxable_gain', 0) + anlage_so.get('taxable_loss', 0)
@@ -2394,7 +2537,10 @@ if n_accounts > 1:
             z19 = rep.get('zeile_19_netto_eur', t1 + t2)
             z37 = rep.get('zeile_37_kapitalertragsteuer_eur', 0)
             z38 = rep.get('zeile_38_solidaritaetszuschlag_eur', 0)
-            z41 = rep.get('withholding_tax_eur', 0)
+            z41 = calculate_tax_report.get_kap_line_41_for_reporting(
+                rep,
+                invstg_enabled=invstg_aktiv,
+            )
             if de_kest_variante_b and abs(z7) > 0.01:
                 t2 += z7
                 z19 += z7
@@ -2748,19 +2894,24 @@ Zeile 19 = Topf 1 + Topf 2 (Nettobetrag)
 Zeile 20 = Aktiengewinne (brutto, ohne Verluste)
 Zeile 22 = |Verluste ohne Aktien| (positiver Betrag)
 Zeile 23 = |Aktienverluste| (positiver Betrag)
-Zeile 41 = |Quellensteuer| (anrechenbar, positiver Betrag)
+Zeile 41 = anrechenbare ausländische Quellensteuer
+           (Erstattungsüberschüsse bleiben als negative Korrektur erhalten)
 ```
 
 **Anlage KAP-INV (wenn InvStG aktiviert):**
 
 ```
-ETF-Gewinne/-Verluste und ETF-Dividenden werden auf KAP-INV gemeldet.
-Teilfreistellung wird pro ISIN angewendet:
+ETF-Gewinne/-Verluste und ETF-Dividenden werden vor Teilfreistellung und
+einschließlich ausländischen Steuerabzugs nach Fondsart auf KAP-INV gemeldet.
+Die Teilfreistellung wird pro ISIN nur als steuerlicher Kontrollwert berechnet:
   Aktienfonds (≥51% Aktienquote): 30% steuerfrei
   Sonstiger Fonds:                 0% steuerfrei
 
-KAP-INV Netto = (ETF-G/V × (1 − TFS)) + (ETF-Div × (1 − TFS))
-ETF-Quellensteuer wird um die Teilfreistellung gekürzt und als anrechenbare QSt auf KAP-INV ausgewiesen.
+KAP-INV-Zeilen = Rohbeträge vor TFS nach Fondsart (Z. 4–8 und 14/17/20/23/26)
+Kontrollwert = (ETF-G/V + ETF-Div) × (1 − TFS); kein ELSTER-Eingabewert
+ETF-Quellensteuer wird ereignisbezogen begrenzt und in Anlage KAP Zeile 41 ausgewiesen.
+Veräußerungswerte sind bis zur Berücksichtigung bereits angesetzter
+Vorabpauschalen ausdrücklich noch nicht final.
 ```
 
 **Tageskurs-Korrektur (wenn aktiviert):**
@@ -2768,7 +2919,8 @@ ETF-Quellensteuer wird um die Teilfreistellung gekürzt und als anrechenbare QSt
 ```
 Korrektur = Σ |Anschaffungskosten| × (FX_Verkauf − FX_Kauf) pro CLOSED_LOT
 Futures ausgeschlossen (Kostenbasis = Notional, kein realer Cashflow).
-Wird auf Topf 1, Topf 2 und KAP-INV aufgeteilt; KAP-INV-Delta wird pro ISIN um die Teilfreistellung gekürzt.
+Wird auf Topf 1, Topf 2 und KAP-INV aufgeteilt. In die KAP-INV-Formularzeile
+fließt das rohe Delta; das teilfreigestellte Delta dient nur der Kontrollrechnung.
 ```
 """)
 
@@ -2816,22 +2968,54 @@ if sh_count > 0:
     sh_export += f"  (Von Topf 1 nach Topf 2 verschoben)\n"
 
 inv_export = ""
+kap_inv_entries_export = ""
 if has_etf_data and invstg_aktiv:
     inv_export = f"\nANLAGE KAP-INV: INVESTMENTFONDS (InvStG)\n"
-    inv_export += f"  ETF-Gewinne (roh):     {fmt_de(etf_gain_raw):>14} EUR\n"
-    inv_export += f"  ETF-Verluste (roh):    {fmt_de(etf_loss_raw):>14} EUR\n"
-    inv_export += f"  ETF-Gewinne (stpfl.):  {fmt_de(etf_gain_taxable):>14} EUR\n"
-    inv_export += f"  ETF-Verluste (stpfl.): {fmt_de(etf_loss_taxable):>14} EUR\n"
-    inv_export += f"  ETF-Dividenden (roh):  {fmt_de(etf_div_raw):>14} EUR\n"
-    inv_export += f"  ETF-Dividenden (stpfl.):{fmt_de(etf_div_taxable):>13} EUR\n"
-    if abs(etf_wht_raw - etf_wht) > 0.01:
-        inv_export += f"  ETF-QSt (roh):         {fmt_de(etf_wht_raw):>14} EUR\n"
-    inv_export += f"  ETF-QSt anrechenbar:   {fmt_de(etf_wht):>14} EUR\n"
-    inv_export += f"  ─────────────────────────────────────────────────\n"
-    inv_export += f"  KAP-INV Netto (stpfl.):{fmt_de(etf_net_taxable):>14} EUR\n"
-    for isin, info in sorted(etf_by_isin.items(), key=lambda x: x[1].get('ticker', '')):
-        gv_tax = info.get('gain_taxable', 0) + info.get('loss_taxable', 0)
-        inv_export += f"    {info.get('ticker', isin):8s} TFS {info.get('tfs_rate', 0)*100:.0f}%  G/V stpfl. {fmt_de(gv_tax):>10} EUR\n"
+    kap_inv_entries_export = "\nANLAGE KAP-INV EINTRAGUNGEN\n"
+    for line in kap_inv_form.get('lines', []):
+        suffix = (
+            " (vor Abzug bereits angesetzter Vorabpauschalen)"
+            if line.get('kind') == 'sale' else ""
+        )
+        form_row = (
+            f"  Zeile {line['line']:>2}: {fmt_de(line['amount_raw_eur']):>12} EUR  "
+            f"{line['fund_type']} · vor TFS{suffix}\n"
+        )
+        inv_export += form_row
+        kap_inv_entries_export += form_row
+        inv_export += (
+            f"             Kontrollwert nach TFS: "
+            f"{fmt_de(line['taxable_control_eur']):>10} EUR "
+            "(kein ELSTER-Eingabewert)\n"
+        )
+    inv_export += (
+        f"  Fonds-QSt anrechenbar: {fmt_de(etf_wht):>12} EUR  "
+        "→ bereits in Anlage KAP Zeile 41 enthalten\n"
+    )
+    kap_inv_entries_export += (
+        f"  Fonds-QSt: {fmt_de(etf_wht):>12} EUR  "
+        "→ Anlage KAP Zeile 41, keine KAP-INV-Zeile\n"
+    )
+    for warning in kap_inv_form.get('warnings', []):
+        inv_export += f"  ACHTUNG: {warning}\n"
+        kap_inv_entries_export += f"  ACHTUNG: {warning}\n"
+    for item in kap_inv_form.get('blocked_details', []):
+        blocked_row = (
+            f"  PRUEFFALL {item.get('ticker', '')} ({item['isin']}): "
+            f"Aussch. roh {fmt_de(item.get('distribution_raw_eur', 0))} EUR, "
+            f"G/V roh {fmt_de(item.get('sale_raw_eur', 0))} EUR; "
+            "keine Formularzeile ohne bestaetigte Fondsart\n"
+        )
+        inv_export += blocked_row
+        kap_inv_entries_export += blocked_row
+    inv_export += "  Details je ISIN:\n"
+    for detail in kap_inv_form.get('details', []):
+        inv_export += (
+            f"    {detail.get('ticker', detail['isin']):8s} "
+            f"Aussch. roh {fmt_de(detail['distribution_raw_eur']):>10} EUR  "
+            f"G/V roh {fmt_de(detail['sale_raw_eur']):>10} EUR  "
+            f"TFS {detail['tfs_rate']*100:.0f}%\n"
+        )
 
 topf2_detail_export = ""
 if topf2_cats:
@@ -2920,7 +3104,7 @@ ANLAGE KAP EINTRAGUNGEN
   Zeile 22 (Verluste o. Aktien): {fmt_de(final['zeile_22']):>8} EUR
   Zeile 23 (Aktienverluste): {fmt_de(final['zeile_23']):>11} EUR
   Zeile 41 (ausl. Quellensteuer): {fmt_de(final['quellensteuer']):>8} EUR
-{de_kest_export}{"" if not (has_etf_data and invstg_aktiv) else chr(10) + "ANLAGE KAP-INV EINTRAGUNGEN" + chr(10) + f"  KAP-INV Erträge (nach TFS): {fmt_de(final['etf_net_taxable']):>8} EUR" + chr(10) + f"  KAP-INV QSt anrechenbar: {fmt_de(final['etf_wht']):>10} EUR" + chr(10)}{"" if not has_so_data else chr(10) + "ANLAGE SO (§23 EStG): PRIVATE VERÄUSSERUNGSGESCHÄFTE" + chr(10) + f"  Physische Gold-ETCs (BFH VIII R 4/15)" + chr(10) + f"  Steuerpflichtig (≤ 1J): {fmt_de(so_taxable_for_row):>12} EUR  → Anlage SO" + chr(10) + f"  Steuerfrei (> 1J):      {fmt_de(so_free_for_row):>12} EUR" + chr(10)}═══════════════════════════════════════════════════
+{de_kest_export}{kap_inv_entries_export}{"" if not has_so_data else chr(10) + "ANLAGE SO (§23 EStG): PRIVATE VERÄUSSERUNGSGESCHÄFTE" + chr(10) + f"  Physische Gold-ETCs (BFH VIII R 4/15)" + chr(10) + f"  Steuerpflichtig (≤ 1J): {fmt_de(so_taxable_for_row):>12} EUR  → Anlage SO" + chr(10) + f"  Steuerfrei (> 1J):      {fmt_de(so_free_for_row):>12} EUR" + chr(10)}═══════════════════════════════════════════════════
 """
 
 st.download_button(

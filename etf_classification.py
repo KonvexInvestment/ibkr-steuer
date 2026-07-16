@@ -21,9 +21,22 @@ ISINs verifiziert via cbonds.com (April 2026). Jede ISIN wurde einzeln geprueft.
 TEILFREISTELLUNG = {
     'aktienfonds':     0.30,   # 30 % — ss 20 Abs. 1 S. 1 InvStG
     'mischfonds':      0.15,   # 15 % — ss 20 Abs. 1 S. 2 InvStG
+    'immobilienfonds': 0.60,   # 60 % — ss 20 Abs. 3 S. 1 InvStG
+    'auslands_immobilienfonds': 0.80,  # 80 % — ss 20 Abs. 3 S. 2 InvStG
     'sonstiger_fonds': 0.00,   # 0 %  — keine Teilfreistellung
     'no_invstg':       None,   # kein Investmentfonds → normale Besteuerung nach ss 20 EStG
     'anlage_so':       None,   # privates Veräußerungsgeschäft → ss 23 EStG (nicht ss 20)
+}
+
+
+# Belastbar hinterlegte DBA-Hoechstsaetze fuer Ausschüttungen einzelner Fonds.
+# Absichtlich keine Ableitung aus dem ISIN-Laenderpraefix: Sitz, Ertragsart und
+# Erstattungsanspruch muessen je Produkt belegt sein. Fehlt ein Eintrag, kann
+# die Steuerberechnung nur den deutschen 25-%-Hoechstbetrag anwenden und weist
+# den Vorgang sichtbar zur DBA-Pruefung aus.
+FOREIGN_TAX_TREATY_RATES = {
+    'US37954Y4834': 0.15,  # QYLD: US-Fonds, DBA-USA Dividenden-Hoechstsatz
+    'US78462F1030': 0.15,  # SPY: US-Fonds, DBA-USA Dividenden-Hoechstsatz
 }
 
 
@@ -453,6 +466,11 @@ def get_classification(isin: str):
     if entry is None:
         return None
     return entry[2]
+
+
+def get_foreign_tax_treaty_rate(isin: str):
+    """Return an explicitly verified treaty cap for fund distributions."""
+    return FOREIGN_TAX_TREATY_RATES.get(isin)
 
 
 def lookup_by_ticker(ticker: str):

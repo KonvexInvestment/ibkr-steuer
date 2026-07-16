@@ -1,4 +1,4 @@
-"""Regression tests for QYLD and no-InvStG per-ISIN reporting."""
+"""Regression tests for QYLD, GLD and no-InvStG per-ISIN reporting."""
 import contextlib
 import csv
 import io
@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from calculate_tax_report import calculate_tax, get_no_invstg_summary
 from etf_classification import (
+    get_classification,
     get_etf_info,
     get_teilfreistellung,
     is_investment_fund,
@@ -18,9 +19,10 @@ from etf_classification import (
 
 QYLD_ISIN = "US37954Y4834"
 GLD_ISIN = "US78463V1070"
+VXX_ISIN = "US06748M1962"
 
 
-def calculate_fixture(trades=None, funds=None):
+def calculate_fixture(trades=None, funds=None, anlage_so_overrides=None):
     trades = trades or []
     funds = funds or []
     with tempfile.TemporaryDirectory() as tmp:
@@ -49,7 +51,7 @@ def calculate_fixture(trades=None, funds=None):
                 writer.writeheader()
                 writer.writerows(funds)
         with contextlib.redirect_stdout(io.StringIO()):
-            return calculate_tax(tmp)
+            return calculate_tax(tmp, anlage_so_overrides=anlage_so_overrides)
 
 
 def test_qyld_is_aktienfonds_with_30_percent_tfs():
@@ -110,52 +112,68 @@ def test_qyld_sale_and_distribution_route_to_kap_inv():
     assert round(kap_inv["etf_dividends_raw_eur"], 2) == 50.00
     assert round(qyld["gain_taxable"], 2) == 70.00
     assert round(qyld["div_taxable"], 2) == 35.00
-    assert round(qyld["wht_anrechenbar"], 2) == -5.25
+    assert round(qyld["wht_anrechenbar"], 2) == -7.50
+    assert round(kap_inv["etf_wht_anrechenbar_eur"], 2) == 7.50
+    assert round(rd["zeile_41_withholding_tax_eur"], 2) == 7.50
     assert round(kap_inv["etf_net_taxable_eur"], 2) == 105.00
+    form_lines = {line["line"]: line for line in rd["kap_inv_form"]["lines"]}
+    assert round(form_lines[4]["amount_raw_eur"], 2) == 50.00
+    assert round(form_lines[4]["taxable_control_eur"], 2) == 35.00
+    assert round(form_lines[14]["amount_raw_eur"], 2) == 100.00
+    assert rd["kap_inv_form"]["status"] == "advance_lump_sum_review_required"
+
+
+def test_gld_remains_no_invstg_pending_classification_decision():
+    # Die InvStG-Einordnung von GLD (Grantor-Trust ohne Retail-Lieferanspruch)
+    # ist bewusst zurueckgestellt; bis zur Entscheidung bleibt GLD no_invstg
+    # wie IAU/GLDM/SLV.
+    assert get_classification(GLD_ISIN) == "no_invstg"
+    assert get_teilfreistellung(GLD_ISIN) == 0.0
+    assert not is_investment_fund(GLD_ISIN)
 
 
 def test_no_invstg_summary_is_reconciled_by_isin():
     summary = get_no_invstg_summary({
-        "all_traded_etf_isins": [GLD_ISIN],
+        "all_traded_etf_isins": [VXX_ISIN],
         "trade_details": [
             {
                 "assetCategory": "STK", "topf": "Topf2",
-                "isin": GLD_ISIN, "pnl_eur": 100,
+                "isin": VXX_ISIN, "pnl_eur": 100,
             },
             {
                 "assetCategory": "STK", "topf": "Topf2",
-                "isin": GLD_ISIN, "pnl_eur": -30,
+                "isin": VXX_ISIN, "pnl_eur": -30,
             },
         ],
         "fx_correction_details": [
-            {"topf": "Topf2", "isin": GLD_ISIN, "delta_eur": 5},
+            {"topf": "Topf2", "isin": VXX_ISIN, "delta_eur": 5},
         ],
         "no_invstg_income_by_isin": {
-            GLD_ISIN: {"div": 2, "wht": -0.3},
+            VXX_ISIN: {"div": 2, "wht": -0.3},
         },
     }, include_tageskurs=True)
 
-    gld = summary[GLD_ISIN]
-    assert gld["ticker"] == "GLD"
-    assert gld["gain"] == 100
-    assert gld["loss"] == -30
-    assert gld["tageskurs"] == 5
-    assert gld["div"] == 2
-    assert gld["wht_reported"] == 0.3
-    assert gld["trade_net"] == 75
-    assert gld["total"] == 77
+    vxx = summary[VXX_ISIN]
+    assert vxx["ticker"] == "VXX"
+    assert vxx["gain"] == 100
+    assert vxx["loss"] == -30
+    assert vxx["tageskurs"] == 5
+    assert vxx["div"] == 2
+    assert vxx["wht_reported"] == 0.3
+    assert vxx["trade_net"] == 75
+    assert vxx["total"] == 77
 
 
 def test_no_invstg_sale_and_distribution_route_to_topf2_summary():
     rd = calculate_fixture(
         trades=[{
-            "tradeID": "GLD_SELL",
+            "tradeID": "VXX_SELL",
             "assetCategory": "STK",
             "subCategory": "ETF",
             "transactionType": "ExchTrade",
             "buySell": "SELL",
-            "symbol": "GLD",
-            "isin": GLD_ISIN,
+            "symbol": "VXX",
+            "isin": VXX_ISIN,
             "quantity": "-10",
             "fifoPnlRealized": "100",
             "fxRateToBase": "1",
@@ -172,8 +190,8 @@ def test_no_invstg_sale_and_distribution_route_to_topf2_summary():
                 "amount": "20",
                 "currency": "EUR",
                 "subCategory": "ETF",
-                "isin": GLD_ISIN,
-                "symbol": "GLD",
+                "isin": VXX_ISIN,
+                "symbol": "VXX",
             },
             {
                 "activityCode": "WHT",
@@ -182,20 +200,20 @@ def test_no_invstg_sale_and_distribution_route_to_topf2_summary():
                 "amount": "-3",
                 "currency": "EUR",
                 "subCategory": "ETF",
-                "isin": GLD_ISIN,
-                "symbol": "GLD",
+                "isin": VXX_ISIN,
+                "symbol": "VXX",
             },
         ],
     )
 
     summary = get_no_invstg_summary(rd)
-    gld = summary[GLD_ISIN]
+    vxx = summary[VXX_ISIN]
     assert round(rd["zeile_19_netto_eur"], 2) == 120.00
-    assert GLD_ISIN not in rd["kap_inv"]["etf_by_isin"]
-    assert round(gld["gain"], 2) == 100.00
-    assert round(gld["div"], 2) == 20.00
-    assert round(gld["wht_reported"], 2) == 3.00
-    assert round(gld["total"], 2) == 120.00
+    assert VXX_ISIN not in rd["kap_inv"]["etf_by_isin"]
+    assert round(vxx["gain"], 2) == 100.00
+    assert round(vxx["div"], 2) == 20.00
+    assert round(vxx["wht_reported"], 2) == 3.00
+    assert round(vxx["total"], 2) == 120.00
 
 
 def test_no_invstg_withholding_tax_refunds_keep_their_sign():
@@ -207,8 +225,8 @@ def test_no_invstg_withholding_tax_refunds_keep_their_sign():
             "amount": "-10",
             "currency": "EUR",
             "subCategory": "ETF",
-            "isin": GLD_ISIN,
-            "symbol": "GLD",
+            "isin": VXX_ISIN,
+            "symbol": "VXX",
         },
         {
             "activityCode": "WHT",
@@ -217,14 +235,14 @@ def test_no_invstg_withholding_tax_refunds_keep_their_sign():
             "amount": "4",
             "currency": "EUR",
             "subCategory": "ETF",
-            "isin": GLD_ISIN,
-            "symbol": "GLD",
+            "isin": VXX_ISIN,
+            "symbol": "VXX",
         },
     ])
 
     summary = get_no_invstg_summary(rd)
     assert round(rd["zeile_41_withholding_tax_eur"], 2) == 6.00
-    assert round(summary[GLD_ISIN]["wht_reported"], 2) == 6.00
+    assert round(summary[VXX_ISIN]["wht_reported"], 2) == 6.00
 
     refund_only = calculate_fixture(funds=[{
         "activityCode": "WHT",
@@ -233,21 +251,21 @@ def test_no_invstg_withholding_tax_refunds_keep_their_sign():
         "amount": "5",
         "currency": "EUR",
         "subCategory": "ETF",
-        "isin": GLD_ISIN,
-        "symbol": "GLD",
+        "isin": VXX_ISIN,
+        "symbol": "VXX",
     }])
     refund_summary = get_no_invstg_summary(refund_only)
     assert round(refund_only["zeile_41_withholding_tax_eur"], 2) == -5.00
-    assert round(refund_summary[GLD_ISIN]["wht_reported"], 2) == -5.00
+    assert round(refund_summary[VXX_ISIN]["wht_reported"], 2) == -5.00
 
 
 def test_no_invstg_summary_excludes_anlage_so_overrides():
     summary = get_no_invstg_summary({
-        "all_traded_etf_isins": [GLD_ISIN],
-        "anlage_so_overrides_applied": [GLD_ISIN],
+        "all_traded_etf_isins": [VXX_ISIN],
+        "anlage_so_overrides_applied": [VXX_ISIN],
         "trade_details": [{
             "assetCategory": "STK", "topf": "Anlage SO",
-            "isin": GLD_ISIN, "pnl_eur": 100,
+            "isin": VXX_ISIN, "pnl_eur": 100,
         }],
     })
 
@@ -257,6 +275,7 @@ def test_no_invstg_summary_excludes_anlage_so_overrides():
 if __name__ == "__main__":
     test_qyld_is_aktienfonds_with_30_percent_tfs()
     test_qyld_sale_and_distribution_route_to_kap_inv()
+    test_gld_remains_no_invstg_pending_classification_decision()
     test_no_invstg_summary_is_reconciled_by_isin()
     test_no_invstg_sale_and_distribution_route_to_topf2_summary()
     test_no_invstg_withholding_tax_refunds_keep_their_sign()

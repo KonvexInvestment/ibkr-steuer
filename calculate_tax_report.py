@@ -36,12 +36,296 @@ def get_withholding_tax_for_reporting(signed_cash_amount):
     return 0.0 if signed_cash_amount == 0 else -signed_cash_amount
 
 def get_kap_inv_wht_for_reporting(kap_inv):
-    """Return KAP-INV withholding tax after Teilfreistellung, with legacy fallback."""
+    """Return creditable fund withholding tax, with legacy fallback."""
     if not kap_inv:
         return 0.0
     if 'etf_wht_anrechenbar_eur' in kap_inv:
         return safe_float(kap_inv.get('etf_wht_anrechenbar_eur'))
     return safe_float(kap_inv.get('etf_wht_eur'))
+
+
+def get_kap_line_41_for_reporting(report_data, invstg_enabled=True):
+    """Return Anlage KAP line 41 without double-counting fund tax."""
+    report_data = report_data or {}
+    kap_inv = report_data.get('kap_inv') or {}
+    fund_credit = get_kap_inv_wht_for_reporting(kap_inv)
+    if 'zeile_41_withholding_tax_eur' in report_data:
+        total = safe_float(report_data.get('zeile_41_withholding_tax_eur'))
+    else:
+        # Legacy reports stored only non-fund tax in withholding_tax_eur.
+        total = safe_float(report_data.get('withholding_tax_eur')) + fund_credit
+    if invstg_enabled:
+        return total
+    return (
+        total
+        - fund_credit
+        + safe_float(kap_inv.get('etf_wht_eur'))
+    )
+
+
+def merge_kap_inv_wht_for_reporting(kap_inv_reports):
+    """Sum finished per-account fund credits without a new global cap."""
+    return sum(
+        get_kap_inv_wht_for_reporting(kap_inv)
+        for kap_inv in (kap_inv_reports or ())
+    )
+
+
+def calculate_creditable_foreign_tax(gross_distribution, tax_withheld,
+                                     tax_refunded=0.0, tfs_rate=0.0,
+                                     treaty_rate=None):
+    """Calculate creditable foreign tax for one fund distribution event.
+
+    Inputs use positive amounts for the gross distribution, tax withheld and
+    tax refunded. The returned credit uses the tax-report sign convention:
+    positive for creditable tax and negative for a refund surplus.
+    """
+    gross_distribution = max(safe_float(gross_distribution), 0.0)
+    tax_withheld = max(safe_float(tax_withheld), 0.0)
+    tax_refunded = max(safe_float(tax_refunded), 0.0)
+    tfs_rate = min(max(safe_float(tfs_rate), 0.0), 1.0)
+    treaty_rate = None if treaty_rate is None else max(safe_float(treaty_rate), 0.0)
+
+    taxable_distribution = gross_distribution * (1.0 - tfs_rate)
+    german_cap = taxable_distribution * 0.25
+    treaty_cap = gross_distribution * treaty_rate if treaty_rate is not None else None
+    net_foreign_tax = tax_withheld - tax_refunded
+
+    if net_foreign_tax < 0:
+        # A refund surplus corrects prior credited tax in the refund year. It
+        # must stay negative and must never become a new positive tax credit.
+        creditable_tax = net_foreign_tax
+    elif gross_distribution <= 0:
+        # With no matched positive income there is no defensible current-event
+        # cap for a tax deduction. Keep the raw row visible for manual review.
+        creditable_tax = 0.0
+    else:
+        caps = [net_foreign_tax, german_cap]
+        if treaty_cap is not None:
+            caps.append(treaty_cap)
+        creditable_tax = min(caps)
+
+    excess_tax = max(net_foreign_tax - max(creditable_tax, 0.0), 0.0)
+    if gross_distribution <= 0 and net_foreign_tax < 0:
+        status = 'unmatched_refund'
+    elif gross_distribution <= 0 and net_foreign_tax > 0:
+        status = 'unmatched_withholding'
+    elif net_foreign_tax < 0:
+        status = 'refund_exceeds_withholding'
+    elif net_foreign_tax == 0:
+        status = 'fully_refunded'
+    elif treaty_rate is None:
+        status = 'dba_unverified'
+    elif excess_tax > 0.005:
+        status = 'capped_review_refund'
+    else:
+        status = 'matched'
+
+    return {
+        'gross_distribution_eur': gross_distribution,
+        'taxable_distribution_eur': taxable_distribution,
+        'tax_withheld_eur': tax_withheld,
+        'tax_refunded_eur': tax_refunded,
+        'net_foreign_tax_eur': net_foreign_tax,
+        'german_cap_eur': german_cap,
+        'treaty_rate': treaty_rate,
+        'treaty_cap_eur': treaty_cap,
+        'creditable_tax_eur': creditable_tax,
+        'excess_tax_eur': excess_tax,
+        'status': status,
+        'review_required': status not in ('matched', 'fully_refunded'),
+    }
+
+
+def recalculate_kap_inv_wht(etf_by_isin, treaty_rate_getter=None):
+    """Recalculate event-level fund tax after a TFS/classification change.
+
+    The function mutates the per-ISIN dictionaries so the UI manual override
+    and the core calculation use exactly the same cap logic.
+    """
+    if treaty_rate_getter is None:
+        from etf_classification import get_foreign_tax_treaty_rate
+        treaty_rate_getter = get_foreign_tax_treaty_rate
+
+    total_creditable = 0.0
+    all_events = []
+    review_items = []
+    for isin, data in (etf_by_isin or {}).items():
+        tfs_rate = safe_float(data.get('tfs_rate'))
+        events = data.get('wht_events') or []
+        isin_creditable = 0.0
+        for event in events:
+            result = calculate_creditable_foreign_tax(
+                event.get('gross_distribution_eur'),
+                event.get('tax_withheld_eur'),
+                event.get('tax_refunded_eur'),
+                tfs_rate,
+                treaty_rate_getter(isin),
+            )
+            event.update(result)
+            event['isin'] = isin
+            isin_creditable += result['creditable_tax_eur']
+            all_events.append(event)
+            if result['review_required']:
+                review_items.append(event)
+        # Per-ISIN legacy field retains IBKR's signed-cash convention.
+        data['wht_anrechenbar'] = -isin_creditable
+        total_creditable += isin_creditable
+
+    return {
+        'creditable_tax_eur': total_creditable,
+        'events': all_events,
+        'review_items': review_items,
+    }
+
+
+KAP_INV_FORM_MAPPING = {
+    'aktienfonds': {
+        'label': 'Aktienfonds', 'tfs_rate': 0.30,
+        'distribution_line': 4, 'advance_lump_sum_line': 9, 'sale_line': 14,
+    },
+    'mischfonds': {
+        'label': 'Mischfonds', 'tfs_rate': 0.15,
+        'distribution_line': 5, 'advance_lump_sum_line': 10, 'sale_line': 17,
+    },
+    'immobilienfonds': {
+        'label': 'Immobilienfonds', 'tfs_rate': 0.60,
+        'distribution_line': 6, 'advance_lump_sum_line': 11, 'sale_line': 20,
+    },
+    'auslands_immobilienfonds': {
+        'label': 'Auslands-Immobilienfonds', 'tfs_rate': 0.80,
+        'distribution_line': 7, 'advance_lump_sum_line': 12, 'sale_line': 23,
+    },
+    'sonstiger_fonds': {
+        'label': 'Sonstige Investmentfonds', 'tfs_rate': 0.00,
+        'distribution_line': 8, 'advance_lump_sum_line': 13, 'sale_line': 26,
+    },
+}
+
+
+def build_kap_inv_form(etf_by_isin, fx_by_isin=None, unknown_isins=None,
+                       include_tageskurs=True):
+    """Build the single source of truth for KAP-INV form lines.
+
+    Form amounts are gross amounts before partial exemption. Taxable amounts
+    are included only as a control calculation and are never ELSTER inputs.
+    Sale amounts are explicitly preliminary until accumulated advance lump
+    sums (Vorabpauschalen) are supplied in the later implementation phase.
+    """
+    fx_by_isin = fx_by_isin or {}
+    unknown_isins = set(unknown_isins or ())
+    line_totals = {}
+    details = []
+    blocked_isins = []
+    blocked_details = []
+    has_sale_activity = False
+
+    def add_line(line, kind, classification, mapping, raw_amount, taxable_control):
+        if abs(raw_amount) <= 0.005:
+            return
+        entry = line_totals.setdefault(line, {
+            'line': line,
+            'kind': kind,
+            'fund_classification': classification,
+            'fund_type': mapping['label'],
+            'amount_raw_eur': 0.0,
+            'taxable_control_eur': 0.0,
+            'is_elster_input': kind == 'distribution',
+            'requires_advance_lump_sum_review': kind == 'sale',
+        })
+        entry['amount_raw_eur'] += raw_amount
+        entry['taxable_control_eur'] += taxable_control
+
+    for isin, data in sorted((etf_by_isin or {}).items()):
+        classification = data.get('classification') or 'sonstiger_fonds'
+        mapping = KAP_INV_FORM_MAPPING.get(classification)
+        raw_distribution = safe_float(data.get('div'))
+        raw_fx_delta = (
+            safe_float((fx_by_isin.get(isin) or {}).get('raw_delta'))
+            if include_tageskurs else 0.0
+        )
+        raw_sale = (
+            safe_float(data.get('gain'))
+            + safe_float(data.get('loss'))
+            + raw_fx_delta
+        )
+        if not mapping or isin in unknown_isins:
+            blocked_isins.append(isin)
+            blocked_details.append({
+                'isin': isin,
+                'ticker': data.get('ticker', isin[:12]),
+                'classification': classification,
+                'distribution_raw_eur': raw_distribution,
+                'sale_raw_eur': raw_sale,
+                'tageskurs_raw_eur': raw_fx_delta,
+            })
+            continue
+
+        tfs_rate = safe_float(data.get('tfs_rate'), mapping['tfs_rate'])
+        taxable_distribution = raw_distribution * (1.0 - tfs_rate)
+        taxable_sale = raw_sale * (1.0 - tfs_rate)
+        sale_activity = (
+            abs(safe_float(data.get('gain'))) > 0.005
+            or abs(safe_float(data.get('loss'))) > 0.005
+        )
+        has_sale_activity = has_sale_activity or sale_activity
+
+        detail = {
+            'isin': isin,
+            'ticker': data.get('ticker', isin[:12]),
+            'name': data.get('name', ''),
+            'classification': classification,
+            'fund_type': mapping['label'],
+            'tfs_rate': tfs_rate,
+            'distribution_line': mapping['distribution_line'],
+            'advance_lump_sum_line': mapping['advance_lump_sum_line'],
+            'sale_line': mapping['sale_line'],
+            'distribution_raw_eur': raw_distribution,
+            'distribution_taxable_control_eur': taxable_distribution,
+            'sale_raw_eur': raw_sale,
+            'sale_taxable_control_eur': taxable_sale,
+            'tageskurs_raw_eur': raw_fx_delta,
+            'sale_before_advance_lump_sum_deduction': sale_activity,
+        }
+        details.append(detail)
+        add_line(
+            mapping['distribution_line'], 'distribution', classification, mapping,
+            raw_distribution, taxable_distribution,
+        )
+        add_line(
+            mapping['sale_line'], 'sale', classification, mapping, raw_sale, taxable_sale,
+        )
+
+    warnings = []
+    if blocked_isins:
+        warnings.append(
+            'Fondsart muss vor einer ELSTER-Uebernahme bestaetigt werden: '
+            + ', '.join(blocked_isins)
+        )
+    if has_sale_activity:
+        warnings.append(
+            'Veraeusserungswerte sind vor Abzug bereits angesetzter '
+            'Vorabpauschalen und daher noch nicht als final freigegeben.'
+        )
+
+    if blocked_isins:
+        status = 'classification_review_required'
+    elif has_sale_activity:
+        status = 'advance_lump_sum_review_required'
+    else:
+        status = 'complete_for_distributions'
+
+    return {
+        'lines': [line_totals[key] for key in sorted(line_totals)],
+        'details': details,
+        'blocked_isins': blocked_isins,
+        'blocked_details': blocked_details,
+        'status': status,
+        'warnings': warnings,
+        'includes_tageskurs': bool(include_tageskurs),
+        'withholding_tax_form': 'Anlage KAP Zeile 41',
+        'sale_values_final': not has_sale_activity,
+    }
 
 def get_kap_inv_tageskurs_delta_for_reporting(report_data):
     """Return KAP-INV Tageskurs delta after Teilfreistellung, with legacy fallback."""
@@ -1609,7 +1893,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         print(f"Base currency is {base_currency} — no USD→EUR rate map needed.")
 
     # 2b. Build ETF lookup from financial_instruments.csv
-    from etf_classification import get_classification, get_etf_info, get_teilfreistellung, is_known_etf, ETF_CLASSIFICATION
+    from etf_classification import (
+        ETF_CLASSIFICATION,
+        get_classification,
+        get_etf_info,
+        get_foreign_tax_treaty_rate,
+        get_teilfreistellung,
+        is_known_etf,
+    )
 
     anlage_so_overrides_set = set(anlage_so_overrides or ())
 
@@ -1678,7 +1969,52 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     etf_dividends_eur = 0.0     # InvStG fund dividends
     etf_wht_eur = 0.0           # InvStG fund withholding tax (sum, negative)
     etf_by_isin = {}            # per-ISIN tracking for Teilfreistellung
+    etf_wht_event_buckets = {}  # event-level DIV/PIL and WHT/FRTAX matching
     debug_rows = []             # per-trade debug export
+
+    def ensure_etf_fund_entry(isin, classification=None):
+        if isin not in etf_by_isin:
+            info = get_etf_info(isin)
+            etf_by_isin[isin] = {
+                'ticker': info['ticker'] if info else isin[:12],
+                'name': info['name'] if info else '',
+                'classification': classification or 'sonstiger_fonds',
+                'gain': 0.0,
+                'loss': 0.0,
+                'div': 0.0,
+                'wht': 0.0,
+                'wht_events': [],
+            }
+        return etf_by_isin[isin]
+
+    def get_etf_wht_event(isin, event_date, currency):
+        date_key = event_date.isoformat() if event_date else ''
+        currency_key = currency or base_currency
+        key = (isin, date_key, currency_key)
+        if key not in etf_wht_event_buckets:
+            etf_wht_event_buckets[key] = {
+                'event_key': '|'.join(key),
+                'date': date_key,
+                'currency': currency_key,
+                'gross_distribution_eur': 0.0,
+                'tax_withheld_eur': 0.0,
+                'tax_refunded_eur': 0.0,
+                'transaction_ids': [],
+                'descriptions': [],
+                'report_dates': [],
+            }
+        return etf_wht_event_buckets[key]
+
+    def add_etf_wht_source(event, row, report_date):
+        transaction_id = (row.get('transactionID') or '').strip()
+        description = (row.get('activityDescription') or '').strip()
+        report_date_value = report_date.isoformat() if report_date else ''
+        if transaction_id and transaction_id not in event['transaction_ids']:
+            event['transaction_ids'].append(transaction_id)
+        if description and description not in event['descriptions']:
+            event['descriptions'].append(description)
+        if report_date_value and report_date_value not in event['report_dates']:
+            event['report_dates'].append(report_date_value)
 
     for t in trades:
         # Use reportDate for tax year assignment (Settlement/Buchungsdatum)
@@ -1745,9 +2081,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     else:
                         etf_invstg_loss += pnl_eur
                     # Per-ISIN tracking
-                    if isin not in etf_by_isin:
-                        info = get_etf_info(isin)
-                        etf_by_isin[isin] = {'ticker': info['ticker'] if info else isin[:12], 'name': info['name'] if info else '', 'classification': cls or 'sonstiger_fonds', 'gain': 0.0, 'loss': 0.0, 'div': 0.0, 'wht': 0.0}
+                    ensure_etf_fund_entry(isin, cls)
                     if pnl_eur > 0:
                         etf_by_isin[isin]['gain'] += pnl_eur
                     else:
@@ -3133,6 +3467,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         if f.get('subCategory') == 'ETF' or (_fund_isin_raw and is_known_etf(_fund_isin_raw)):
             fund_isin = _fund_isin_raw
             if fund_isin:
+                etf_isins.add(fund_isin)
                 fund_cls = _effective_classification(fund_isin)
                 is_no_invstg = fund_cls == 'no_invstg'
                 if fund_cls not in ('no_invstg', 'anlage_so'):
@@ -3141,10 +3476,11 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         if code == 'DIV':
             if is_etf_fund:
                 etf_dividends_eur += amount_eur
-                if fund_isin not in etf_by_isin:
-                    info = get_etf_info(fund_isin)
-                    etf_by_isin[fund_isin] = {'ticker': info['ticker'] if info else fund_isin[:12], 'name': info['name'] if info else '', 'classification': fund_cls or 'sonstiger_fonds', 'gain': 0.0, 'loss': 0.0, 'div': 0.0, 'wht': 0.0}
-                etf_by_isin[fund_isin]['div'] += amount_eur
+                entry = ensure_etf_fund_entry(fund_isin, fund_cls)
+                entry['div'] += amount_eur
+                event = get_etf_wht_event(fund_isin, date, curr)
+                event['gross_distribution_eur'] += max(amount_eur, 0.0)
+                add_etf_wht_source(event, f, report_date)
             elif is_de_isin(f) and funds_match_key(f) in german_dividend_tax_keys:
                 domestic_taxed_dividends_eur += amount_eur
             else:
@@ -3157,10 +3493,11 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             # Net with dividends as per German tax law
             if is_etf_fund:
                 etf_dividends_eur += amount_eur
-                if fund_isin not in etf_by_isin:
-                    info = get_etf_info(fund_isin)
-                    etf_by_isin[fund_isin] = {'ticker': info['ticker'] if info else fund_isin[:12], 'name': info['name'] if info else '', 'classification': fund_cls or 'sonstiger_fonds', 'gain': 0.0, 'loss': 0.0, 'div': 0.0, 'wht': 0.0}
-                etf_by_isin[fund_isin]['div'] += amount_eur
+                entry = ensure_etf_fund_entry(fund_isin, fund_cls)
+                entry['div'] += amount_eur
+                event = get_etf_wht_event(fund_isin, date, curr)
+                event['gross_distribution_eur'] += max(amount_eur, 0.0)
+                add_etf_wht_source(event, f, report_date)
             elif is_de_isin(f) and funds_match_key(f) in german_dividend_tax_keys:
                 domestic_taxed_dividends_eur += amount_eur
             else:
@@ -3182,8 +3519,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 domestic_withholding_tax_eur += amount_eur
             elif is_etf_fund:
                 etf_wht_eur += amount_eur
-                if fund_isin in etf_by_isin:
-                    etf_by_isin[fund_isin]['wht'] += amount_eur
+                entry = ensure_etf_fund_entry(fund_isin, fund_cls)
+                entry['wht'] += amount_eur
+                event = get_etf_wht_event(fund_isin, date, curr)
+                if amount_eur < 0:
+                    event['tax_withheld_eur'] += -amount_eur
+                else:
+                    event['tax_refunded_eur'] += amount_eur
+                add_etf_wht_source(event, f, report_date)
             else:
                 withholding_tax_eur += amount_eur
                 if is_no_invstg:
@@ -3359,9 +3702,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                             summary_topf = 'KAP-INV'
                             etf_invstg_gain += gain_eur
                             etf_invstg_loss += loss_eur
-                            if isin not in etf_by_isin:
-                                info = get_etf_info(isin)
-                                etf_by_isin[isin] = {'ticker': info['ticker'] if info else isin[:12], 'name': info['name'] if info else '', 'classification': cls or 'sonstiger_fonds', 'gain': 0.0, 'loss': 0.0, 'div': 0.0, 'wht': 0.0}
+                            ensure_etf_fund_entry(isin, cls)
                             etf_by_isin[isin]['gain'] += gain_eur
                             etf_by_isin[isin]['loss'] += loss_eur
                         else:
@@ -3842,23 +4183,27 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         if not is_known_etf(isin) and isin in etf_by_isin:
             etf_unknown_isins.append(isin)
 
+    for (isin, _date_key, _currency), event in sorted(etf_wht_event_buckets.items()):
+        ensure_etf_fund_entry(isin, _effective_classification(isin))['wht_events'].append(event)
+
     for isin, data in etf_by_isin.items():
         tfs_rate = get_teilfreistellung(isin)
+        if tfs_rate is None:
+            tfs_rate = 0.0
         data['tfs_rate'] = tfs_rate
         data['gain_taxable'] = data['gain'] * (1 - tfs_rate)
         data['loss_taxable'] = data['loss'] * (1 - tfs_rate)
         data['div_taxable'] = data['div'] * (1 - tfs_rate)
-        data['wht_anrechenbar'] = data['wht'] * (1 - tfs_rate)
         etf_gain_taxable += data['gain_taxable']
         etf_loss_taxable += data['loss_taxable']
         etf_div_taxable += data['div_taxable']
 
     etf_wht_reported = get_withholding_tax_for_reporting(etf_wht_eur)
-    # §56 Abs. 6 InvStG: anrechenbare QSt um Teilfreistellung kürzen
-    etf_wht_anrechenbar = get_withholding_tax_for_reporting(
-        sum(data.get('wht_anrechenbar', data.get('wht', 0))
-            for data in etf_by_isin.values())
+    etf_wht_calculation = recalculate_kap_inv_wht(
+        etf_by_isin,
+        treaty_rate_getter=get_foreign_tax_treaty_rate,
     )
+    etf_wht_anrechenbar = etf_wht_calculation['creditable_tax_eur']
     etf_net_taxable = etf_gain_taxable + etf_loss_taxable + etf_div_taxable
 
     if etf_by_isin:
@@ -4398,6 +4743,17 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         | set(t.get('isin', '') for t in anlage_so_trades if t.get('isin'))
     )
 
+    # Foreign tax on fund distributions is entered on Anlage KAP line 41,
+    # not on KAP-INV. Keep the legacy non-fund field separate for reconciliation.
+    zeile_41_withholding_tax_eur = withholding_tax_eur + etf_wht_anrechenbar
+    kap_inv_form = build_kap_inv_form(
+        etf_by_isin,
+        fx_correction_kap_inv_by_isin,
+        etf_unknown_isins,
+        include_tageskurs=True,
+    )
+    kap_inv_form['kap_line_41_creditable_tax_eur'] = etf_wht_anrechenbar
+
     report_data = {
         "zeile_7_kapitalertraege_mit_inlaendischem_steuerabzug_eur": domestic_taxed_dividends_eur,
         "zeile_19_netto_eur": zeile_19_netto,
@@ -4406,7 +4762,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         "zeile_23_stock_losses_eur": zeile_23_stock_losses,
         "zeile_37_kapitalertragsteuer_eur": zeile_37_kapitalertragsteuer_eur,
         "zeile_38_solidaritaetszuschlag_eur": zeile_38_solidaritaetszuschlag_eur,
-        "zeile_41_withholding_tax_eur": withholding_tax_eur,
+        "zeile_41_withholding_tax_eur": zeile_41_withholding_tax_eur,
         # Pool details
         "topf_1_aktien_netto": topf_1_aktien,
         "topf_2_sonstiges_netto": topf_2_sonstiges,
@@ -4460,11 +4816,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             "etf_dividends_taxable_eur": etf_div_taxable,
             "etf_wht_eur": etf_wht_reported,
             "etf_wht_anrechenbar_eur": etf_wht_anrechenbar,
+            "wht_events": etf_wht_calculation['events'],
+            "wht_review_items": etf_wht_calculation['review_items'],
             "etf_net_taxable_eur": etf_net_taxable,
             "etf_by_isin": etf_by_isin,
             "etf_unknown_isins": etf_unknown_isins,
             "etf_stillhalter_premium_eur": etf_stillhalter_premium_eur,
         },
+        "kap_inv_form": kap_inv_form,
         # Anlage SO (§23 EStG — physische Gold-ETCs)
         "anlage_so": anlage_so_result,
         # Alle ETF-ISINs, die im Report auftauchen (für GUI-Override-Auswahl)
@@ -4575,7 +4934,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             print(f"    Teilfreistellung:      {-tfs_reduction:>12,.2f} EUR")
         print(f"    ETF-Netto (stpfl.):    {etf_net_taxable:>12,.2f} EUR")
         print(f"    ETF-QSt (roh):         {etf_wht_reported:>12,.2f} EUR")
-        print(f"    ETF-QSt anrechenbar:   {etf_wht_anrechenbar:>12,.2f} EUR")
+        print(f"    ETF-QSt anrechenbar (Anlage KAP Z. 41): {etf_wht_anrechenbar:>12,.2f} EUR")
 
     if anlage_so_result['details'] or anlage_so_result['total_gain'] != 0 or anlage_so_result['total_loss'] != 0:
         print("-" * 60)
@@ -4607,7 +4966,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     print(f"ZEILE 20 (Davon: Aktiengewinne):   {zeile_20_stock_gains:>12,.2f} EUR")
     print(f"ZEILE 22 (Verluste ohne Aktien):   {zeile_22_other_losses:>12,.2f} EUR")
     print(f"ZEILE 23 (Aktienverluste):         {zeile_23_stock_losses:>12,.2f} EUR")
-    print(f"ZEILE 41 (ausländische Quellensteuer): {withholding_tax_eur:>12,.2f} EUR")
+    print(f"ZEILE 41 (ausländische Quellensteuer): {zeile_41_withholding_tax_eur:>12,.2f} EUR")
 
     if abs(fx_correction_total) > 0.01:
         corrected_z19 = zeile_19_netto + fx_correction_total

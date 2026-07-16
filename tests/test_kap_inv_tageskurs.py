@@ -8,7 +8,11 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from calculate_tax_report import calculate_tax, get_kap_inv_tageskurs_delta_for_reporting
+from calculate_tax_report import (
+    build_kap_inv_form,
+    calculate_tax,
+    get_kap_inv_tageskurs_delta_for_reporting,
+)
 
 
 def calculate_for_trades(trades, closed_lots, conversion_rates):
@@ -97,8 +101,56 @@ def test_kap_inv_tageskurs_delta_applies_tfs_per_isin():
     assert round(by_isin["US78462F1030"]["taxable_delta"], 2) == 70.00
     assert round(by_isin["US4642874576"]["taxable_delta"], 2) == 100.00
     assert round(taxable_kap_inv_delta, 2) == 170.00
+    form_lines = {line["line"]: line for line in rd["kap_inv_form"]["lines"]}
+    assert round(form_lines[14]["amount_raw_eur"], 2) == 190.00
+    assert round(form_lines[14]["taxable_control_eur"], 2) == 133.00
+    assert round(form_lines[26]["amount_raw_eur"], 2) == 190.00
+    assert round(form_lines[26]["taxable_control_eur"], 2) == 190.00
+
+
+def test_kap_inv_form_aggregates_by_fund_type_and_blocks_unknowns():
+    form = build_kap_inv_form(
+        {
+            "EQ1": {
+                "ticker": "EQ1", "classification": "aktienfonds",
+                "tfs_rate": 0.30, "gain": 100, "loss": 0, "div": 20,
+            },
+            "EQ2": {
+                "ticker": "EQ2", "classification": "aktienfonds",
+                "tfs_rate": 0.30, "gain": 0, "loss": -40, "div": 30,
+            },
+            "PROP": {
+                "ticker": "PROP", "classification": "auslands_immobilienfonds",
+                "tfs_rate": 0.80, "gain": 50, "loss": 0, "div": 100,
+            },
+            "UNKNOWN": {
+                "ticker": "UNK", "classification": "sonstiger_fonds",
+                "tfs_rate": 0.0, "gain": 10, "loss": 0, "div": 5,
+            },
+        },
+        fx_by_isin={"EQ1": {"raw_delta": 10}},
+        unknown_isins=["UNKNOWN"],
+    )
+    lines = {line["line"]: line for line in form["lines"]}
+    assert round(lines[4]["amount_raw_eur"], 2) == 50.00
+    assert round(lines[14]["amount_raw_eur"], 2) == 70.00
+    assert round(lines[14]["taxable_control_eur"], 2) == 49.00
+    assert round(lines[7]["amount_raw_eur"], 2) == 100.00
+    assert round(lines[23]["amount_raw_eur"], 2) == 50.00
+    assert round(lines[23]["taxable_control_eur"], 2) == 10.00
+    assert "UNKNOWN" in form["blocked_isins"]
+    assert form["blocked_details"] == [{
+        "isin": "UNKNOWN",
+        "ticker": "UNK",
+        "classification": "sonstiger_fonds",
+        "distribution_raw_eur": 5.0,
+        "sale_raw_eur": 10.0,
+        "tageskurs_raw_eur": 0.0,
+    }]
+    assert form["status"] == "classification_review_required"
 
 
 if __name__ == "__main__":
     test_kap_inv_tageskurs_delta_applies_tfs_per_isin()
+    test_kap_inv_form_aggregates_by_fund_type_and_blocks_unknowns()
     print("OK: KAP-INV Tageskurs TFS")
