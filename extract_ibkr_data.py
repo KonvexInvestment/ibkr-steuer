@@ -1,5 +1,6 @@
 import xml.etree.ElementTree as ET
 import csv
+import json
 import os
 import sys
 
@@ -8,6 +9,99 @@ FX_FIELDS = ['date', 'settleDate', 'currency', 'fxRateToBase', 'activityCode',
               'transactionID', 'levelOfDetail', 'assetCategory', 'symbol',
               'buySell', 'tradeQuantity', 'tradePrice', 'tradeGross',
               'tradeCommission']
+
+OPTION_CATEGORIES = {'OPT', 'FOP', 'FSFOP'}
+
+
+def build_import_control(root):
+    """Count broker execution rows without deduplicating partial fills."""
+    trades_node = root.find('.//Trades')
+    rows = []
+    if trades_node is not None:
+        rows = [
+            row for row in trades_node
+            if row.tag == 'Trade'
+            and row.attrib.get('levelOfDetail', '') in ('', 'EXECUTION')
+        ]
+
+    by_category = {}
+    option_realized = 0
+    option_zero = 0
+    for row in rows:
+        category = row.attrib.get('assetCategory', '') or 'UNBEKANNT'
+        by_category[category] = by_category.get(category, 0) + 1
+        if category in OPTION_CATEGORIES:
+            try:
+                pnl = float(row.attrib.get('fifoPnlRealized') or 0)
+            except (TypeError, ValueError):
+                pnl = 0.0
+            if abs(pnl) < 1e-12:
+                option_zero += 1
+            else:
+                option_realized += 1
+
+    stmt = root.find('.//FlexStatement')
+    account = root.find('.//AccountInformation')
+    to_date = stmt.attrib.get('toDate', '') if stmt is not None else ''
+    return {
+        'schema_version': 1,
+        'account_id': (
+            (stmt.attrib.get('accountId', '') if stmt is not None else '')
+            or (account.attrib.get('accountId', '') if account is not None else '')
+        ),
+        'tax_year': to_date[:4],
+        'source_xml_count': 1,
+        'xml_execution_rows': len(rows),
+        'xml_execution_by_asset_category': dict(sorted(by_category.items())),
+        'xml_option_fifo_realized_rows': option_realized,
+        'xml_option_fifo_zero_rows': option_zero,
+        'extracted_execution_rows': 0,
+    }
+
+
+def merge_import_controls(controls, extracted_execution_rows):
+    """Aggregate same-year XML controls while preserving their physical rows."""
+    controls = list(controls or [])
+    merged = {
+        'schema_version': 1,
+        'account_id': '',
+        'tax_year': '',
+        'source_xml_count': 0,
+        'xml_execution_rows': 0,
+        'xml_execution_by_asset_category': {},
+        'xml_option_fifo_realized_rows': 0,
+        'xml_option_fifo_zero_rows': 0,
+        'extracted_execution_rows': int(extracted_execution_rows),
+    }
+    for control in controls:
+        if not merged['account_id']:
+            merged['account_id'] = control.get('account_id', '')
+        if not merged['tax_year']:
+            merged['tax_year'] = control.get('tax_year', '')
+        merged['source_xml_count'] += int(control.get('source_xml_count', 1))
+        merged['xml_execution_rows'] += int(control.get('xml_execution_rows', 0))
+        merged['xml_option_fifo_realized_rows'] += int(
+            control.get('xml_option_fifo_realized_rows', 0)
+        )
+        merged['xml_option_fifo_zero_rows'] += int(
+            control.get('xml_option_fifo_zero_rows', 0)
+        )
+        for category, count in control.get(
+                'xml_execution_by_asset_category', {}).items():
+            merged['xml_execution_by_asset_category'][category] = (
+                merged['xml_execution_by_asset_category'].get(category, 0)
+                + int(count)
+            )
+    merged['xml_execution_by_asset_category'] = dict(sorted(
+        merged['xml_execution_by_asset_category'].items()
+    ))
+    return merged
+
+
+def write_import_control(output_dir, control):
+    path = os.path.join(output_dir, 'import_control.json')
+    with open(path, 'w', encoding='utf-8') as handle:
+        json.dump(control, handle, ensure_ascii=False, indent=2, sort_keys=True)
 
 
 def extract_conversion_rates(root):
@@ -50,6 +144,8 @@ def extract_trades_from_root(root):
     headers = set()
     rows = []
     for row in trades_node:
+        if row.tag != 'Trade':
+            continue
         attrib = row.attrib
         lod = attrib.get('levelOfDetail', '')
         if lod and lod != 'EXECUTION':
@@ -288,6 +384,7 @@ def extract_quarterly_xmls(xml_files, output_dir):
     tax_year = None
     acct_data = None
     fx_trans_count = 0
+    import_controls = []
 
     for xml_path in xml_files:
         try:
@@ -295,6 +392,8 @@ def extract_quarterly_xmls(xml_files, output_dir):
         except Exception as e:
             print(f"  FEHLER beim Parsen von {xml_path}: {e}")
             continue
+
+        import_controls.append(build_import_control(root))
 
         stmt = root.find('.//FlexStatement')
         from_date = stmt.get('fromDate', '') if stmt is not None else ''
@@ -574,6 +673,11 @@ def extract_quarterly_xmls(xml_files, output_dir):
             writer.writeheader()
             writer.writerow(acct_data)
 
+    write_import_control(
+        output_dir,
+        merge_import_controls(import_controls, len(trades_rows)),
+    )
+
     print(f"Quartals-Merge abgeschlossen: {len(trades_rows)} Trades, {len(funds_rows)} StmtFunds, "
           f"{len(fx_pnl_rows)} FX-PnL, {len(deduped_conv)} ConversionRates")
 
@@ -586,6 +690,9 @@ def parse_ibkr_xml(xml_file_path, output_dir):
     except Exception as e:
         print(f"Error parsing XML: {e}")
         return
+
+    import_control = build_import_control(root)
+    extracted_execution_rows = 0
 
     # Multi-account check: the parser only reads the first FlexStatement
     # (root.find(...) returns the first match). Warn loudly if the export
@@ -641,6 +748,9 @@ def parse_ibkr_xml(xml_file_path, output_dir):
                     closed_lot_rows.append(attrib.copy())
                     skipped += 1
                     continue
+                elif row.tag != 'Trade':
+                    skipped += 1
+                    continue
                 elif lod and lod != 'EXECUTION':
                     skipped += 1
                     continue
@@ -667,6 +777,8 @@ def parse_ibkr_xml(xml_file_path, output_dir):
             writer.writerows(data_rows)
             
         print(f"Saved {len(data_rows)} rows to {output_path}")
+        if section_tag == 'Trades':
+            extracted_execution_rows = len(data_rows)
 
     # Extract FX transactions from StmtFunds (levelOfDetail="Currency", non-base currency)
     # These are needed for FIFO-based foreign currency gain/loss calculation
@@ -805,6 +917,9 @@ def parse_ibkr_xml(xml_file_path, output_dir):
             writer.writeheader()
             writer.writerow(acct_data)
         print(f"Saved account info (base currency: {acct_data.get('currency', '?')}) to {acct_path}")
+
+    import_control['extracted_execution_rows'] = extracted_execution_rows
+    write_import_control(output_dir, import_control)
 
 if __name__ == "__main__":
     if len(sys.argv) > 2:

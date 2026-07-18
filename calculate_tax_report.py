@@ -1,6 +1,7 @@
 
 import csv
 import io
+import json
 import os
 import sys
 from datetime import datetime, timedelta
@@ -24,6 +25,179 @@ def safe_float(val, default=0.0):
     if val is None or val == '':
         return default
     return float(val)
+
+
+def calculate_tageskurs_gross_adjustment(pnl_before_tageskurs, fx_delta):
+    """Split one lot's FX delta after all prior lot corrections.
+
+    The returned gain/loss adjustments always add up to ``fx_delta``. Losses
+    use the internal negative sign convention.
+    """
+    pnl_before_tageskurs = safe_float(pnl_before_tageskurs)
+    fx_delta = safe_float(fx_delta)
+    pnl_after_tageskurs = pnl_before_tageskurs + fx_delta
+    gain_adjustment = (
+        max(pnl_after_tageskurs, 0.0)
+        - max(pnl_before_tageskurs, 0.0)
+    )
+    loss_adjustment = (
+        min(pnl_after_tageskurs, 0.0)
+        - min(pnl_before_tageskurs, 0.0)
+    )
+    return {
+        'pnl_before_tageskurs': pnl_before_tageskurs,
+        'pnl_after_tageskurs': pnl_after_tageskurs,
+        'gain_adjustment': gain_adjustment,
+        'loss_adjustment': loss_adjustment,
+    }
+
+
+def validate_tageskurs_gross_adjustments(by_topf, gain_adjustments,
+                                         loss_adjustments, tolerance=1e-7):
+    """Raise when a topf's gross adjustments no longer reconcile to its net."""
+    for topf in set(by_topf) | set(gain_adjustments) | set(loss_adjustments):
+        net = safe_float(by_topf.get(topf, 0.0))
+        gross_sum = (
+            safe_float(gain_adjustments.get(topf, 0.0))
+            + safe_float(loss_adjustments.get(topf, 0.0))
+        )
+        if abs(gross_sum - net) > tolerance:
+            raise RuntimeError(
+                f'Tageskurs-Bruttoaufteilung inkonsistent für {topf}: '
+                f'Gewinnkorrektur {gain_adjustments.get(topf, 0.0):.8f} + '
+                f'Verlustkorrektur {loss_adjustments.get(topf, 0.0):.8f} '
+                f'!= Nettokorrektur {net:.8f}'
+            )
+
+
+def build_completeness_control(report_data, include_tageskurs=True):
+    """Build one shared XML-to-report control for UI, TXT and Excel."""
+    report_data = report_data or {}
+    accounts = report_data.get('completeness_accounts')
+    if accounts is None:
+        control = report_data.get('completeness_control')
+        accounts = [control] if control else []
+
+    normalized = []
+    total_categories = {}
+    total_derived = {}
+    total = {
+        'account_id': 'Gesamt',
+        'account_label': 'Gesamt',
+        'xml_execution_rows': 0,
+        'extracted_execution_rows': 0,
+        'xml_execution_by_asset_category': total_categories,
+        'xml_option_fifo_realized_rows': 0,
+        'xml_option_fifo_zero_rows': 0,
+        'tax_detail_original_rows': 0,
+        'tax_detail_option_realized_rows': 0,
+        'derived_rows_by_type': total_derived,
+        'warnings': [],
+    }
+    for raw in accounts:
+        if not raw:
+            continue
+        account = dict(raw)
+        categories = dict(account.get('xml_execution_by_asset_category') or {})
+        derived = dict(account.get('derived_rows_by_type') or {})
+        if not include_tageskurs:
+            derived.pop('tageskurs_korrektur', None)
+        account['xml_execution_by_asset_category'] = categories
+        account['derived_rows_by_type'] = derived
+        warnings = []
+        xml_rows = account.get('xml_execution_rows')
+        extracted_rows = account.get('extracted_execution_rows')
+        if xml_rows is not None and extracted_rows is not None \
+                and int(xml_rows) != int(extracted_rows):
+            warnings.append(
+                'XML-Ausführungen und extrahierte Originalzeilen stimmen nicht überein.'
+            )
+        option_rows = account.get('xml_option_fifo_realized_rows')
+        reported_option_rows = account.get('tax_detail_option_realized_rows')
+        if option_rows is not None and reported_option_rows is not None \
+                and int(option_rows) != int(reported_option_rows):
+            warnings.append(
+                'Nicht alle Optionsausführungen mit realisiertem FIFO-Ergebnis '
+                'erscheinen in den steuerlichen Trade-Details.'
+            )
+        account['warnings'] = warnings
+        account['status'] = 'warning' if warnings else 'ok'
+        normalized.append(account)
+
+        for key in (
+            'xml_execution_rows', 'extracted_execution_rows',
+            'xml_option_fifo_realized_rows', 'xml_option_fifo_zero_rows',
+            'tax_detail_original_rows', 'tax_detail_option_realized_rows',
+        ):
+            value = account.get(key)
+            if value is not None:
+                total[key] += int(value)
+        for category, count in categories.items():
+            total_categories[category] = total_categories.get(category, 0) + int(count)
+        for source, count in derived.items():
+            total_derived[source] = total_derived.get(source, 0) + int(count)
+        total['warnings'].extend(warnings)
+
+    total['status'] = 'warning' if total['warnings'] else 'ok'
+    return {
+        'accounts': normalized,
+        'totals': total,
+        'has_import_warning': bool(total['warnings']),
+    }
+
+
+def format_completeness_control_text(control):
+    """Render the shared completeness structure for the text report."""
+    control = control or {}
+    accounts = control.get('accounts') or []
+    totals = control.get('totals') or {}
+    rows = []
+    if len(accounts) > 1:
+        rows.extend(accounts)
+    if totals:
+        rows.append(totals)
+    if not rows:
+        return ''
+
+    labels = {
+        'stillhalter_korrektur': 'Stillhalter',
+        'zufluss': 'Zufluss',
+        'zufluss_korrektur': 'Zuflusskorrektur',
+        'cross_year_put_korrektur': 'Cross-Year-Put',
+        'pnl_summary': 'PnL-Summary-Fallback',
+        'tageskurs_korrektur': 'Tageskurs',
+    }
+    lines = ['VOLLSTÄNDIGKEITSKONTROLLE XML-IMPORT']
+    for row in rows:
+        label = row.get('account_label') or row.get('account_id') or 'Konto'
+        categories = ', '.join(
+            f'{category} {count}' for category, count in sorted(
+                (row.get('xml_execution_by_asset_category') or {}).items()
+            )
+        ) or 'keine'
+        derived = ', '.join(
+            f'{labels.get(source, source)} {count}' for source, count in sorted(
+                (row.get('derived_rows_by_type') or {}).items()
+            ) if count
+        ) or 'keine'
+        lines.extend([
+            f'  {label}: {row.get("xml_execution_rows", 0)} XML-Ausführungen '
+            f'({categories})',
+            f'    Optionen: {row.get("xml_option_fifo_realized_rows", 0)} mit / '
+            f'{row.get("xml_option_fifo_zero_rows", 0)} ohne realisiertes FIFO-Ergebnis',
+            f'    Steuerliche Originalzeilen: {row.get("tax_detail_original_rows", 0)}; '
+            f'abgeleitete Zeilen: {derived}',
+        ])
+        for warning in row.get('warnings') or []:
+            lines.append(f'    WARNUNG: {warning}')
+    lines.extend([
+        '  XML-Ausführungen sind importierte Brokerzeilen; das realisierte '
+        'FIFO-Ergebnis ist eine IBKR-Eigenschaft der jeweiligen Zeile.',
+        '  Berichtsergebniszeilen sind keine 1:1-Kopie aller Eröffnungsbuchungen; '
+        'Stillhalter-, Zufluss- und Tageskurszeilen sind abgeleitete steuerliche '
+        'Korrekturen.',
+    ])
+    return '\n'.join(lines) + '\n'
 
 def get_withholding_tax_for_reporting(signed_cash_amount):
     """Convert IBKR's signed tax cash flow to the report sign convention.
@@ -1985,11 +2159,24 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     # 0. Detect base currency, tax year, and XML metadata from account_info.csv
     base_currency = 'EUR'  # default — most IBKR accounts for German tax filers are EUR-based
     xml_has_fx_data = False
+    account_id = ''
+    import_control = None
+    import_control_path = os.path.join(ib_tax_dir, 'import_control.json')
+    if os.path.exists(import_control_path):
+        try:
+            with open(import_control_path, 'r', encoding='utf-8') as handle:
+                import_control = json.load(handle)
+        except (OSError, ValueError, TypeError) as exc:
+            print(f'WARNUNG: Import-Kontrollwerte konnten nicht gelesen werden: {exc}')
     acct_path = os.path.join(ib_tax_dir, 'account_info.csv')
     if os.path.exists(acct_path):
         acct_rows = load_csv(acct_path)
         if acct_rows:
             base_currency = acct_rows[0].get('currency', 'EUR')
+            account_id = (
+                acct_rows[0].get('accountId', '')
+                or acct_rows[0].get('account_id', '')
+            )
             fx_count = int(acct_rows[0].get('fx_transactions_count', '-1'))
             xml_has_fx_data = fx_count > 0
             if tax_year is None:
@@ -2787,6 +2974,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 else:
                     row['cost'] -= total_correction_raw
                 row['fifoPnlRealized'] -= total_correction_raw
+                row['stillhalter_adjustment_raw'] = (
+                    safe_float(row.get('stillhalter_adjustment_raw'), 0.0)
+                    + total_correction_raw
+                )
                 fx = row.get('fxRateToBase', 1.0)
                 if base_currency == 'EUR':
                     row['pnl_eur'] = round(row['fifoPnlRealized'] * fx, 5)
@@ -3510,6 +3701,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     else:
                         row['cost'] -= total_correction_raw
                     row['fifoPnlRealized'] -= total_correction_raw
+                    row['stillhalter_adjustment_raw'] = (
+                        safe_float(row.get('stillhalter_adjustment_raw'), 0.0)
+                        + total_correction_raw
+                    )
                     fx = row.get('fxRateToBase', 1.0)
                     if base_currency == 'EUR':
                         row['pnl_eur'] = round(row['fifoPnlRealized'] * fx, 5)
@@ -4484,6 +4679,74 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     for sym in _tageskurs_put_adj:
         _tageskurs_put_adj[sym] = deque(sorted(_tageskurs_put_adj[sym], key=lambda x: x['date']))
 
+    # Gross gain/loss buckets must use the premium correction that was actually
+    # applied to the tax trade row. Cost-basis restoration above is related but
+    # not identical: IBKR may already report strike basis, or a call adjustment
+    # may affect proceeds instead of cost. Map final corrected trade rows to
+    # CLOSED_LOTs and consume their corrections quantity-proportionally.
+    _tageskurs_pnl_adj_exact = {}
+    _tageskurs_pnl_adj_date = {}
+
+    def _tageskurs_close_timestamp(row):
+        value = (row.get('dateTime') or row.get('reportDate') or '').replace(';', ' ')
+        return value[:19]
+
+    for row in debug_rows:
+        adjustment_raw = safe_float(row.get('stillhalter_adjustment_raw'), 0.0)
+        if row.get('source') != 'trades' or row.get('assetCategory') != 'STK' \
+                or adjustment_raw <= 0:
+            continue
+        quantity = abs(safe_float(row.get('quantity'), 0.0))
+        symbol = _symbol_root(row.get('underlyingSymbol') or row.get('symbol'))
+        close_timestamp = _tageskurs_close_timestamp(row)
+        side = (row.get('buySell') or '').upper()
+        if quantity <= 0 or not symbol or not close_timestamp:
+            continue
+        entry = {
+            'remaining_shares': quantity,
+            'adjustment_per_share_raw': adjustment_raw / quantity,
+        }
+        exact_key = (symbol, close_timestamp, side)
+        date_key = (symbol, close_timestamp[:10], side)
+        _tageskurs_pnl_adj_exact.setdefault(exact_key, []).append(entry)
+        _tageskurs_pnl_adj_date.setdefault(date_key, []).append(entry)
+
+    def _consume_tageskurs_pnl_adjustment(lot):
+        quantity_signed = safe_float(lot.get('quantity'), 0.0)
+        remaining = abs(quantity_signed)
+        if remaining <= 0:
+            return 0.0
+        symbol = _symbol_root(lot.get('underlyingSymbol') or lot.get('symbol'))
+        close_timestamp = _tageskurs_close_timestamp(lot)
+        side = (lot.get('buySell') or '').upper()
+        if not side:
+            side = 'SELL' if quantity_signed >= 0 else 'BUY'
+        exact_key = (symbol, close_timestamp, side)
+        date_key = (symbol, close_timestamp[:10], side)
+        adjustment = 0.0
+
+        def consume(entries):
+            nonlocal adjustment, remaining
+            for entry in entries:
+                if remaining <= 0:
+                    break
+                available = entry['remaining_shares']
+                if available <= 0:
+                    continue
+                consumed = min(remaining, available)
+                adjustment += consumed * entry['adjustment_per_share_raw']
+                entry['remaining_shares'] -= consumed
+                remaining -= consumed
+
+        # Prefer the exact execution timestamp. If IBKR consolidates several
+        # executions into a larger CLOSED_LOT, consume the still-open same-day
+        # correction rows as a fallback. Both maps hold the same entry objects,
+        # so an exact slice cannot be consumed twice.
+        consume(_tageskurs_pnl_adj_exact.get(exact_key, []))
+        if remaining > 0:
+            consume(_tageskurs_pnl_adj_date.get(date_key, []))
+        return adjustment
+
     fx_correction_total = 0.0
     fx_correction_details = []
     fx_corr_by_topf = {'Topf1': 0.0, 'Topf2': 0.0, 'KAP-INV': 0.0}
@@ -4583,6 +4846,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     continue
 
             cost_raw = safe_float(lot.get('cost'), 0)
+            cost_basis_adjustment_raw = 0.0
 
             # dateTime = actual trade date; reportDate = settlement/booking date.
             # Use trade date for FX lookup (§20 Abs. 4 S. 1 EStG: "Veräußerungszeitpunkt").
@@ -4617,7 +4881,11 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                         if adj_lot['date'] and lot_open_date and adj_lot['date'] != lot_open_date:
                             continue
                         consumed = min(remaining, adj_lot['shares_remaining'])
-                        cost_raw += consumed * adj_lot['premium_per_share_raw']
+                        premium_adjustment = (
+                            consumed * adj_lot['premium_per_share_raw']
+                        )
+                        cost_raw += premium_adjustment
+                        cost_basis_adjustment_raw += premium_adjustment
                         adj_lot['shares_remaining'] -= consumed
                         remaining -= consumed
                         if remaining <= 0:
@@ -4680,6 +4948,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 'delta_eur': round(delta, 5),
                 'topf': topf,
                 'underlyingSymbol': lot.get('underlyingSymbol', ''),
+                'cost_basis_adjustment_raw': round(
+                    cost_basis_adjustment_raw, 5
+                ),
             }
             if topf == 'KAP-INV':
                 detail['tfs_rate'] = kap_inv_tfs_rate if kap_inv_tfs_rate is not None else get_teilfreistellung(isin)
@@ -4688,19 +4959,34 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
 
             # Track gain/loss shift per lot for consistent Zeilen 20/22/23
             pnl_raw = safe_float(lot.get('fifoPnlRealized'), 0)
+            pnl_stillhalter_adjustment_raw = (
+                _consume_tageskurs_pnl_adjustment(lot)
+                if category == 'STK' else 0.0
+            )
+            detail['stillhalter_adjustment_raw'] = round(
+                pnl_stillhalter_adjustment_raw, 5
+            )
+            # The base pools already exclude an assigned-put premium when that
+            # premium was actually removed from the tax trade. Classify the FX
+            # delta from that same corrected basis, not from IBKR's uncorrected
+            # fifoPnlRealized value.
+            pnl_before_tageskurs_raw = pnl_raw - pnl_stillhalter_adjustment_raw
             if base_currency == 'EUR':
-                original_pnl = pnl_raw * fx_close
+                original_pnl = pnl_before_tageskurs_raw * fx_close
             else:
-                original_pnl = pnl_raw * get_rate_for_date(report_date, usd_to_eur_rates)
-            corrected_pnl = original_pnl + delta
+                original_pnl = (
+                    pnl_before_tageskurs_raw
+                    * get_rate_for_date(report_date, usd_to_eur_rates)
+                )
+            gross_adjustment = calculate_tageskurs_gross_adjustment(
+                original_pnl, delta
+            )
+            fx_corr_gain_adj[topf] += gross_adjustment['gain_adjustment']
+            fx_corr_loss_adj[topf] += gross_adjustment['loss_adjustment']
 
-            # How did gains/losses shift?
-            orig_gain = max(original_pnl, 0)
-            orig_loss = min(original_pnl, 0)
-            corr_gain = max(corrected_pnl, 0)
-            corr_loss = min(corrected_pnl, 0)
-            fx_corr_gain_adj[topf] += corr_gain - orig_gain
-            fx_corr_loss_adj[topf] += corr_loss - orig_loss
+        validate_tageskurs_gross_adjustments(
+            fx_corr_by_topf, fx_corr_gain_adj, fx_corr_loss_adj
+        )
 
         if lots_processed > 0:
             print(f"\nTageskurs-Korrektur (CLOSED_LOT): {lots_processed} Lots analysiert.")
@@ -4959,6 +5245,58 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     # Sort trade details chronologically for reporting
     debug_rows.sort(key=lambda r: r.get('dateTime', '') or r.get('reportDate', '') or 'zzzz')
 
+    source_counts = {}
+    for row in debug_rows:
+        source = row.get('source', '')
+        if source and source != 'trades':
+            source_counts[source] = source_counts.get(source, 0) + 1
+    tageskurs_rows = sum(
+        1 for row in fx_correction_details
+        if abs(safe_float(row.get('delta_eur'), 0.0)) >= 0.005
+    )
+    if tageskurs_rows:
+        source_counts['tageskurs_korrektur'] = tageskurs_rows
+
+    if import_control:
+        completeness_control = dict(import_control)
+    else:
+        # Compatibility for direct CSV fixtures and older extracted folders.
+        # Normal app imports always carry import_control.json from the extractor.
+        completeness_control = {
+            'schema_version': 1,
+            'account_id': account_id,
+            'tax_year': str(tax_year),
+            'source_xml_count': 0,
+            'xml_execution_rows': len(all_trades),
+            'xml_execution_by_asset_category': {},
+            'xml_option_fifo_realized_rows': sum(
+                1 for row in all_trades
+                if row.get('assetCategory') in ('OPT', 'FOP', 'FSFOP')
+                and abs(safe_float(row.get('fifoPnlRealized'), 0.0)) >= 1e-12
+            ),
+            'xml_option_fifo_zero_rows': sum(
+                1 for row in all_trades
+                if row.get('assetCategory') in ('OPT', 'FOP', 'FSFOP')
+                and abs(safe_float(row.get('fifoPnlRealized'), 0.0)) < 1e-12
+            ),
+            'extracted_execution_rows': len(all_trades),
+            'source': 'legacy_csv_fallback',
+        }
+    completeness_control['account_id'] = (
+        completeness_control.get('account_id') or account_id
+    )
+    completeness_control['tax_detail_original_rows'] = sum(
+        1 for row in debug_rows if row.get('source') == 'trades'
+    )
+    completeness_control['tax_detail_option_realized_rows'] = sum(
+        1 for row in debug_rows
+        if row.get('source') == 'trades'
+        and row.get('assetCategory') in ('OPT', 'FOP', 'FSFOP')
+    )
+    completeness_control['derived_rows_by_type'] = dict(sorted(
+        source_counts.items()
+    ))
+
     # Alle je in diesem Report vorkommenden ETF-ISINs (unabhängig von Bucket) —
     # wird von der GUI für die Anlage-SO-Override-Auswahl gebraucht (Issue #51).
     all_traded_etf_isins = sorted(
@@ -5071,6 +5409,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         "classification_review_items": classification_review_items,
         # Trade-level details for FA reporting (Issue #17)
         "trade_details": debug_rows,
+        "completeness_control": completeness_control,
         # Plausibility Metadata
         "has_trade_price": has_trade_price,
         "audit": {

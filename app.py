@@ -663,6 +663,13 @@ def merge_report_data(reports):
         merged['trade_details'].extend(r.get('trade_details', []))
     merged['trade_details'].sort(key=lambda r: r.get('dateTime', '') or r.get('reportDate', '') or 'zzzz')
 
+    # Vollständigkeitskontrollen bleiben pro Konto abgeschlossen; der spätere
+    # GUI-/Export-Schritt addiert nur die bereits ermittelten Zählwerte.
+    merged['completeness_accounts'] = [
+        copy.deepcopy(r.get('completeness_control'))
+        for r in reports if r.get('completeness_control')
+    ]
+
     return merged
 
 # inline color vars for kap_row values
@@ -953,6 +960,8 @@ with st.spinner("Berechne Steuerreport…"):
                     fx_margin_correction_enabled=fx_margin_correction_enabled,
                     dba_wht_beta_enabled=dba_wht_beta_enabled,
                 )
+                if d_acct.get('completeness_control'):
+                    d_acct['completeness_control']['account_label'] = acct_label
 
                 # Validate base currency consistency
                 if reports and d_acct.get('base_currency') != reports[0].get('base_currency'):
@@ -1276,6 +1285,12 @@ created_at = _dt.now().strftime('%d.%m.%Y %H:%M')
 no_invstg_summary = calculate_tax_report.get_no_invstg_summary(
     d, include_tageskurs=tageskurs_aktiv
 )
+completeness_control = calculate_tax_report.build_completeness_control(
+    d, include_tageskurs=tageskurs_aktiv
+)
+completeness_export = calculate_tax_report.format_completeness_control_text(
+    completeness_control
+)
 
 # ── Basiswährung ────────────────────────────────────────────────────────────
 
@@ -1293,6 +1308,65 @@ if n_accounts > 1:
     <strong style="color: #fbbf24;">{n_accounts} Konten zusammengeführt</strong>: Jedes Konto wurde separat berechnet, die Ergebnisse wurden addiert.
 </div>
 """, unsafe_allow_html=True)
+
+section_title("Vollständigkeitskontrolle XML-Import")
+control_rows = completeness_control.get('accounts') or [
+    completeness_control.get('totals', {})
+]
+control_table = (
+    "| Konto | XML-Ausführungen | Kategorien | OPT mit/ohne FIFO-Ergebnis | "
+    "Steuerliche Originalzeilen | Abgeleitete Zeilen |\n"
+    "|---|---:|---|---:|---:|---|\n"
+)
+derived_labels = {
+    'stillhalter_korrektur': 'Stillhalter',
+    'zufluss': 'Zufluss',
+    'zufluss_korrektur': 'Zuflusskorrektur',
+    'cross_year_put_korrektur': 'Cross-Year-Put',
+    'pnl_summary': 'PnL-Summary',
+    'tageskurs_korrektur': 'Tageskurs',
+}
+for control_row in control_rows:
+    categories = ", ".join(
+        f"{category}: {count}" for category, count in sorted(
+            (control_row.get('xml_execution_by_asset_category') or {}).items()
+        )
+    ) or "–"
+    derived = ", ".join(
+        f"{derived_labels.get(source, source)}: {count}"
+        for source, count in sorted(
+            (control_row.get('derived_rows_by_type') or {}).items()
+        ) if count
+    ) or "–"
+    account_label = (
+        control_row.get('account_label')
+        or control_row.get('account_id')
+        or 'Konto'
+    )
+    control_table += (
+        f"| {account_label} | {control_row.get('xml_execution_rows', 0)} | "
+        f"{categories} | {control_row.get('xml_option_fifo_realized_rows', 0)} / "
+        f"{control_row.get('xml_option_fifo_zero_rows', 0)} | "
+        f"{control_row.get('tax_detail_original_rows', 0)} | {derived} |\n"
+    )
+st.markdown(control_table)
+if completeness_control.get('has_import_warning'):
+    for control_row in control_rows:
+        label = control_row.get('account_label') or control_row.get('account_id') or 'Konto'
+        for warning in control_row.get('warnings') or []:
+            st.error(f"Vollständigkeitswarnung {label}: {warning}")
+else:
+    st.success(
+        "Alle XML-Ausführungen wurden als Originalzeilen extrahiert; alle "
+        "Optionsausführungen mit realisiertem IBKR-FIFO-Ergebnis sind in den "
+        "steuerlichen Trade-Details enthalten."
+    )
+st.caption(
+    "XML-Ausführungen sind die importierten Brokerzeilen. Das realisierte "
+    "FIFO-Ergebnis ist eine IBKR-Eigenschaft der Zeile. Berichtsergebniszeilen "
+    "sind keine 1:1-Kopie aller Eröffnungsbuchungen; Stillhalter-, Zufluss- und "
+    "Tageskurszeilen sind abgeleitete steuerliche Korrekturen."
+)
 
 classification_review_items = d.get('classification_review_items', []) or []
 if classification_review_items:
@@ -2266,6 +2340,7 @@ if d:
         kap_inv_form_export = export_context.get('kap_inv_form', {})
         has_so = export_context['has_so_data']
         special_products = export_context['no_invstg_summary']
+        completeness = export_context.get('completeness_control') or {}
         so_taxable = export_context['so_taxable']
         so_free = export_context['so_free']
         trade_sums = {
@@ -2280,7 +2355,7 @@ if d:
             trade_topf1_reconciled += kap_inv_trade_total
             kap_inv_reintegration_note = "KAP-INV-Detailwerte wurden wegen deaktivierter InvStG-Klassifizierung in Topf 1 reintegriert."
 
-        summary_cols = ["Bereich", "Position", "Wert EUR", "Hinweis"]
+        summary_cols = ["Bereich", "Position", "Wert EUR / Anzahl", "Hinweis"]
         for i, width in enumerate([22, 44, 16, 60], 1):
             ws.column_dimensions[get_column_letter(i)].width = width
         ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(summary_cols))
@@ -2322,6 +2397,46 @@ if d:
             ("Anlage KAP", "Zeile 38 - Solidaritätszuschlag", f['zeile_38'], ""),
             ("Anlage KAP", "Zeile 41 - ausl. Quellensteuer", f['quellensteuer'], ""),
         ]
+        completeness_rows = completeness.get('accounts') or [
+            completeness.get('totals', {})
+        ]
+        if len(completeness.get('accounts') or []) > 1:
+            completeness_rows = list(completeness_rows) + [
+                completeness.get('totals', {})
+            ]
+        for control_row in completeness_rows:
+            if not control_row:
+                continue
+            label = (
+                control_row.get('account_label')
+                or control_row.get('account_id')
+                or 'Konto'
+            )
+            categories = ", ".join(
+                f"{key} {value}" for key, value in sorted(
+                    (control_row.get('xml_execution_by_asset_category') or {}).items()
+                )
+            ) or "keine"
+            derived = ", ".join(
+                f"{derived_labels.get(key, key)} {value}"
+                for key, value in sorted(
+                    (control_row.get('derived_rows_by_type') or {}).items()
+                ) if value
+            ) or "keine"
+            warning_note = ""
+            if control_row.get('warnings'):
+                warning_note = " WARNUNG: " + " ".join(control_row['warnings'])
+            summary_rows.append((
+                "Vollständigkeitskontrolle",
+                f"{label} - XML-Ausführungen",
+                f"{control_row.get('xml_execution_rows', 0)} Zeilen",
+                f"Kategorien: {categories}; OPT mit/ohne FIFO-Ergebnis "
+                f"{control_row.get('xml_option_fifo_realized_rows', 0)}/"
+                f"{control_row.get('xml_option_fifo_zero_rows', 0)}; "
+                f"steuerliche Originalzeilen "
+                f"{control_row.get('tax_detail_original_rows', 0)}; "
+                f"abgeleitet: {derived}.{warning_note}",
+            ))
         if has_etf:
             for line in kap_inv_form_export.get('lines', []):
                 note = (
@@ -2459,7 +2574,18 @@ if d:
         col_widths = [12, 12, 42, 15, 10, 6, 8, 11, 13, 13, 13, 11, 6, 11, 14, 40]
         eur_col = 15
         for i, w in enumerate(col_widths, 1): ws.column_dimensions[get_column_letter(i)].width = w
-        row_num = 1
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(cols))
+        notice = ws.cell(
+            row=1,
+            column=1,
+            value=(
+                "Hinweis: IBKR-/OCC-Bezeichnungen können vom geläufigen "
+                "Basiswert abweichen, z. B. BRKB/BRK B und ODAX für DAX."
+            ),
+        )
+        notice.font = Font(italic=True, size=9, color="7f6000")
+        notice.fill = korr_fill
+        row_num = 3
         for topf_key in ['Topf1', 'Topf2', 'KAP-INV', 'Anlage SO']:
             topf_rows = trades_by_topf.get(topf_key, [])
             if not topf_rows: continue
@@ -2538,7 +2664,7 @@ if d:
             for ci in range(1, len(cols) + 1): ws.cell(row=row_num, column=ci).fill = total_fill
             cell = ws.cell(row=row_num, column=eur_col, value=topf_total); cell.number_format = num_fmt_eur; cell.font = total_font; cell.fill = total_fill
             row_num += 2
-        ws.freeze_panes = 'A2'
+        ws.freeze_panes = 'A4'
         buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
     so_taxable_export = 0
@@ -2557,6 +2683,7 @@ if d:
         'has_so_data': has_so_data,
         'so_taxable': so_taxable_export,
         'so_free': so_free_export,
+        'completeness_control': completeness_control,
     }
     try:
         xlsx_data = _build_excel(trade_details, trades_by_topf, export_context)
@@ -3363,6 +3490,7 @@ Erstellt: {created_at}
 Basiswährung: {d.get('base_currency', 'USD')}
 {multi_acct_export}
 {classification_review_export}
+{completeness_export}
 ═══════════════════════════════════════════════════
 TOPF 1: AKTIEN (ohne ETF-Fonds)
   Aktiengewinne:         {fmt_de(final['stocks_gain']):>14} EUR

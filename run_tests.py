@@ -38,6 +38,8 @@ FIELDS = ['zeile_19', 'zeile_20', 'zeile_22', 'zeile_23', 'zeile_41',
           'etf_net_taxable', 'etf_wht', 'kap_inv_tageskurs']
 
 SYNTHETIC_TESTS = [
+    ("Tageskurs-Bruttozuordnung", "tests/test_tageskurs_gross_bucket.py"),
+    ("XML-Vollständigkeitskontrolle", "tests/test_import_completeness.py"),
     ("Cross-Year-Series-Tests", "tests/test_cross_year_series.py"),
     ("Quarterly-History-Extraction", "tests/test_quarterly_history_extraction.py"),
     ("KAP-INV-WHT", "tests/test_kap_inv_wht.py"),
