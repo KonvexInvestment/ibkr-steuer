@@ -17,7 +17,7 @@ def parse_date(date_str):
     # Formats: 2025-01-01 or 2025-01-01 20:20:00
     try:
         return datetime.strptime(date_str[:10], '%Y-%m-%d').date()
-    except:
+        except Exception:
         return None
 
 def safe_float(val, default=0.0):
@@ -840,7 +840,7 @@ def get_exchange_rates(trades, funds):
                 eur_per_usd = 1.0 / rate
                 if RATE_MIN < eur_per_usd < RATE_MAX:
                     rates[d] = eur_per_usd
-            except:
+        except Exception:
                 pass
 
     # trades second — overwrite any fund rate for the same date (trades are more reliable)
@@ -855,7 +855,7 @@ def get_exchange_rates(trades, funds):
                 eur_per_usd = 1.0 / rate
                 if RATE_MIN < eur_per_usd < RATE_MAX:
                     rates[d] = eur_per_usd
-            except:
+        except Exception:
                 pass
 
     return rates
