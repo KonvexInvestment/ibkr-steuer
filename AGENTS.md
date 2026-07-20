@@ -6,7 +6,7 @@ This repository is a Python/Streamlit tool for calculating German Anlage KAP/KAP
 
 - `app.py` is the Streamlit UI and user-facing orchestration layer.
 - `calculate_tax_report.py` contains the main tax calculation logic.
-- `extract_ibkr_data.py` converts IBKR XML exports into CSV inputs and writes an `import_control.json` with completeness counters (the app compares XML execution counts against extracted and reported rows).
+- `extract_ibkr_data.py` converts IBKR XML exports into CSV inputs.
 - `etf_classification.py` maintains the InvStG fund classification table (Teilfreistellung rates) and documented treaty withholding-tax rates; `ecb_rates.py` and helper scripts provide FX, audit, and comparison utilities.
 - `tests/` contains focused regression tests; `test_data/` is local and gitignored because it may contain real IBKR data.
 - `Grundlage/` stores reference tax PDFs; root CSV/TXT/XML files are sample, generated, or local working data unless explicitly tracked.

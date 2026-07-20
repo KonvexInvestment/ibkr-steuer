@@ -1,7 +1,6 @@
 
 import csv
 import io
-import json
 import os
 import sys
 from datetime import datetime, timedelta
@@ -69,135 +68,6 @@ def validate_tageskurs_gross_adjustments(by_topf, gain_adjustments,
                 f'!= Nettokorrektur {net:.8f}'
             )
 
-
-def build_completeness_control(report_data, include_tageskurs=True):
-    """Build one shared XML-to-report control for UI, TXT and Excel."""
-    report_data = report_data or {}
-    accounts = report_data.get('completeness_accounts')
-    if accounts is None:
-        control = report_data.get('completeness_control')
-        accounts = [control] if control else []
-
-    normalized = []
-    total_categories = {}
-    total_derived = {}
-    total = {
-        'account_id': 'Gesamt',
-        'account_label': 'Gesamt',
-        'xml_execution_rows': 0,
-        'extracted_execution_rows': 0,
-        'xml_execution_by_asset_category': total_categories,
-        'xml_option_fifo_realized_rows': 0,
-        'xml_option_fifo_zero_rows': 0,
-        'tax_detail_original_rows': 0,
-        'tax_detail_option_realized_rows': 0,
-        'derived_rows_by_type': total_derived,
-        'warnings': [],
-    }
-    for raw in accounts:
-        if not raw:
-            continue
-        account = dict(raw)
-        categories = dict(account.get('xml_execution_by_asset_category') or {})
-        derived = dict(account.get('derived_rows_by_type') or {})
-        if not include_tageskurs:
-            derived.pop('tageskurs_korrektur', None)
-        account['xml_execution_by_asset_category'] = categories
-        account['derived_rows_by_type'] = derived
-        warnings = []
-        xml_rows = account.get('xml_execution_rows')
-        extracted_rows = account.get('extracted_execution_rows')
-        if xml_rows is not None and extracted_rows is not None \
-                and int(xml_rows) != int(extracted_rows):
-            warnings.append(
-                'XML-Ausführungen und extrahierte Originalzeilen stimmen nicht überein.'
-            )
-        option_rows = account.get('xml_option_fifo_realized_rows')
-        reported_option_rows = account.get('tax_detail_option_realized_rows')
-        if option_rows is not None and reported_option_rows is not None \
-                and int(option_rows) != int(reported_option_rows):
-            warnings.append(
-                'Nicht alle Optionsausführungen mit realisiertem FIFO-Ergebnis '
-                'erscheinen in den steuerlichen Trade-Details.'
-            )
-        account['warnings'] = warnings
-        account['status'] = 'warning' if warnings else 'ok'
-        normalized.append(account)
-
-        for key in (
-            'xml_execution_rows', 'extracted_execution_rows',
-            'xml_option_fifo_realized_rows', 'xml_option_fifo_zero_rows',
-            'tax_detail_original_rows', 'tax_detail_option_realized_rows',
-        ):
-            value = account.get(key)
-            if value is not None:
-                total[key] += int(value)
-        for category, count in categories.items():
-            total_categories[category] = total_categories.get(category, 0) + int(count)
-        for source, count in derived.items():
-            total_derived[source] = total_derived.get(source, 0) + int(count)
-        total['warnings'].extend(warnings)
-
-    total['status'] = 'warning' if total['warnings'] else 'ok'
-    return {
-        'accounts': normalized,
-        'totals': total,
-        'has_import_warning': bool(total['warnings']),
-    }
-
-
-def format_completeness_control_text(control):
-    """Render the shared completeness structure for the text report."""
-    control = control or {}
-    accounts = control.get('accounts') or []
-    totals = control.get('totals') or {}
-    rows = []
-    if len(accounts) > 1:
-        rows.extend(accounts)
-    if totals:
-        rows.append(totals)
-    if not rows:
-        return ''
-
-    labels = {
-        'stillhalter_korrektur': 'Stillhalter',
-        'zufluss': 'Zufluss',
-        'zufluss_korrektur': 'Zuflusskorrektur',
-        'cross_year_put_korrektur': 'Cross-Year-Put',
-        'pnl_summary': 'PnL-Summary-Fallback',
-        'tageskurs_korrektur': 'Tageskurs',
-    }
-    lines = ['VOLLSTÄNDIGKEITSKONTROLLE XML-IMPORT']
-    for row in rows:
-        label = row.get('account_label') or row.get('account_id') or 'Konto'
-        categories = ', '.join(
-            f'{category} {count}' for category, count in sorted(
-                (row.get('xml_execution_by_asset_category') or {}).items()
-            )
-        ) or 'keine'
-        derived = ', '.join(
-            f'{labels.get(source, source)} {count}' for source, count in sorted(
-                (row.get('derived_rows_by_type') or {}).items()
-            ) if count
-        ) or 'keine'
-        lines.extend([
-            f'  {label}: {row.get("xml_execution_rows", 0)} XML-Ausführungen '
-            f'({categories})',
-            f'    Optionen: {row.get("xml_option_fifo_realized_rows", 0)} mit / '
-            f'{row.get("xml_option_fifo_zero_rows", 0)} ohne realisiertes FIFO-Ergebnis',
-            f'    Steuerliche Originalzeilen: {row.get("tax_detail_original_rows", 0)}; '
-            f'abgeleitete Zeilen: {derived}',
-        ])
-        for warning in row.get('warnings') or []:
-            lines.append(f'    WARNUNG: {warning}')
-    lines.extend([
-        '  XML-Ausführungen sind importierte Brokerzeilen; das realisierte '
-        'FIFO-Ergebnis ist eine IBKR-Eigenschaft der jeweiligen Zeile.',
-        '  Berichtsergebniszeilen sind keine 1:1-Kopie aller Eröffnungsbuchungen; '
-        'Stillhalter-, Zufluss- und Tageskurszeilen sind abgeleitete steuerliche '
-        'Korrekturen.',
-    ])
-    return '\n'.join(lines) + '\n'
 
 def get_withholding_tax_for_reporting(signed_cash_amount):
     """Convert IBKR's signed tax cash flow to the report sign convention.
@@ -2156,27 +2026,14 @@ def _put_assignment_lot_cost_correction_per_share(closed_lots, det, underlying, 
 def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrides=None,
                   fx_margin_correction_enabled=True,
                   dba_wht_beta_enabled=False):
-    # 0. Detect base currency, tax year, and XML metadata from account_info.csv
+    # 0. Detect base currency and tax year from account_info.csv
     base_currency = 'EUR'  # default — most IBKR accounts for German tax filers are EUR-based
     xml_has_fx_data = False
-    account_id = ''
-    import_control = None
-    import_control_path = os.path.join(ib_tax_dir, 'import_control.json')
-    if os.path.exists(import_control_path):
-        try:
-            with open(import_control_path, 'r', encoding='utf-8') as handle:
-                import_control = json.load(handle)
-        except (OSError, ValueError, TypeError) as exc:
-            print(f'WARNUNG: Import-Kontrollwerte konnten nicht gelesen werden: {exc}')
     acct_path = os.path.join(ib_tax_dir, 'account_info.csv')
     if os.path.exists(acct_path):
         acct_rows = load_csv(acct_path)
         if acct_rows:
             base_currency = acct_rows[0].get('currency', 'EUR')
-            account_id = (
-                acct_rows[0].get('accountId', '')
-                or acct_rows[0].get('account_id', '')
-            )
             fx_count = int(acct_rows[0].get('fx_transactions_count', '-1'))
             xml_has_fx_data = fx_count > 0
             if tax_year is None:
@@ -5245,58 +5102,6 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     # Sort trade details chronologically for reporting
     debug_rows.sort(key=lambda r: r.get('dateTime', '') or r.get('reportDate', '') or 'zzzz')
 
-    source_counts = {}
-    for row in debug_rows:
-        source = row.get('source', '')
-        if source and source != 'trades':
-            source_counts[source] = source_counts.get(source, 0) + 1
-    tageskurs_rows = sum(
-        1 for row in fx_correction_details
-        if abs(safe_float(row.get('delta_eur'), 0.0)) >= 0.005
-    )
-    if tageskurs_rows:
-        source_counts['tageskurs_korrektur'] = tageskurs_rows
-
-    if import_control:
-        completeness_control = dict(import_control)
-    else:
-        # Compatibility for direct CSV fixtures and older extracted folders.
-        # Normal app imports always carry import_control.json from the extractor.
-        completeness_control = {
-            'schema_version': 1,
-            'account_id': account_id,
-            'tax_year': str(tax_year),
-            'source_xml_count': 0,
-            'xml_execution_rows': len(all_trades),
-            'xml_execution_by_asset_category': {},
-            'xml_option_fifo_realized_rows': sum(
-                1 for row in all_trades
-                if row.get('assetCategory') in ('OPT', 'FOP', 'FSFOP')
-                and abs(safe_float(row.get('fifoPnlRealized'), 0.0)) >= 1e-12
-            ),
-            'xml_option_fifo_zero_rows': sum(
-                1 for row in all_trades
-                if row.get('assetCategory') in ('OPT', 'FOP', 'FSFOP')
-                and abs(safe_float(row.get('fifoPnlRealized'), 0.0)) < 1e-12
-            ),
-            'extracted_execution_rows': len(all_trades),
-            'source': 'legacy_csv_fallback',
-        }
-    completeness_control['account_id'] = (
-        completeness_control.get('account_id') or account_id
-    )
-    completeness_control['tax_detail_original_rows'] = sum(
-        1 for row in debug_rows if row.get('source') == 'trades'
-    )
-    completeness_control['tax_detail_option_realized_rows'] = sum(
-        1 for row in debug_rows
-        if row.get('source') == 'trades'
-        and row.get('assetCategory') in ('OPT', 'FOP', 'FSFOP')
-    )
-    completeness_control['derived_rows_by_type'] = dict(sorted(
-        source_counts.items()
-    ))
-
     # Alle je in diesem Report vorkommenden ETF-ISINs (unabhängig von Bucket) —
     # wird von der GUI für die Anlage-SO-Override-Auswahl gebraucht (Issue #51).
     all_traded_etf_isins = sorted(
@@ -5409,7 +5214,6 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         "classification_review_items": classification_review_items,
         # Trade-level details for FA reporting (Issue #17)
         "trade_details": debug_rows,
-        "completeness_control": completeness_control,
         # Plausibility Metadata
         "has_trade_price": has_trade_price,
         "audit": {
