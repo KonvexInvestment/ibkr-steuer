@@ -641,9 +641,15 @@ def merge_report_data(reports):
         'stk_correction_cy': sum(r.get('audit', {}).get('stk_correction_cy', 0) for r in reports),
         'etf_correction_cy': sum(r.get('audit', {}).get('etf_correction_cy', 0) for r in reports),
         'put_nosell_premium_eur': sum(r.get('audit', {}).get('put_nosell_premium_eur', 0) for r in reports),
+        'underlying_symbol_aliases': {},
     }
     for r in reports:
         a = r.get('audit', {})
+        for _canon, _members in a.get('underlying_symbol_aliases', {}).items():
+            _existing = merged_audit['underlying_symbol_aliases'].setdefault(_canon, [])
+            for _m in _members:
+                if _m not in _existing:
+                    _existing.append(_m)
         merged_audit['stillhalter_unmatched'].extend(a.get('stillhalter_unmatched', []))
         merged_audit['stillhalter_details'].extend(a.get('stillhalter_details', []))
         merged_audit['cross_year_put_corrections'].extend(a.get('cross_year_put_corrections', []))
@@ -1064,6 +1070,20 @@ if occ_rename_matches:
     {action_summary}. Die veränderte Optionsserie wurde anhand der stabilen IBKR-Kontraktidentität und ihrer FIFO-Kostenbasis zugeordnet.
     Die Schließung wurde automatisch dem ursprünglichen Verkauf zugeordnet, damit die Stillhalterprämie nur einmal versteuert wird:<br>{occ_lines}<br>
     <span style="color: #64748b; font-size: 0.75rem;">Bitte prüfen: Falls es sich wider Erwarten um zwei verschiedene Kontrakte handelt, die Positionen in den Trade-Details kontrollieren.</span>
+</div>
+""", unsafe_allow_html=True)
+
+underlying_symbol_aliases = d.get('audit', {}).get('underlying_symbol_aliases', {})
+if underlying_symbol_aliases:
+    alias_rows = "<br>".join(
+        f"<strong>{', '.join(sorted(members))}</strong> = <strong>{canon}</strong>"
+        for canon, members in sorted(underlying_symbol_aliases.items())
+    )
+    st.markdown(f"""
+<div style="background: rgba(56,189,248,0.08); border: 1px solid rgba(56,189,248,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
+    <strong style="color: #38bdf8;">Symbol-Alias erkannt:</strong>
+    IBKR führt dieselbe Aktie unter verschiedenen Symbolen (Handelsplatz-Suffix oder Ticker-Umbenennung). Die Zuordnung von Optionsprämien zu Aktien-Trades läuft über die stabile IBKR-Kontraktidentität (conid/ISIN):<br>{alias_rows}<br>
+    <span style="color: #64748b; font-size: 0.75rem;">Betrifft die Stillhalter-Korrekturen der Aktien-Kostenbasis; die Trade-Details zeigen die korrigierten Werte.</span>
 </div>
 """, unsafe_allow_html=True)
 

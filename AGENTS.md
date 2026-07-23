@@ -5,7 +5,7 @@
 This repository is a Python/Streamlit tool for calculating German Anlage KAP/KAP-INV values from Interactive Brokers Flex Query exports.
 
 - `app.py` is the Streamlit UI and user-facing orchestration layer.
-- `calculate_tax_report.py` contains the main tax calculation logic.
+- `calculate_tax_report.py` contains the main tax calculation logic. Option-to-stock assignment matching resolves IBKR symbol variants (exchange-suffix symbols, ticker renames) via conid/ISIN-based symbol equivalence classes (Issue #83); regression coverage lives in `tests/test_underlying_symbol_matching.py`.
 - `extract_ibkr_data.py` converts IBKR XML exports into CSV inputs.
 - `etf_classification.py` maintains the InvStG fund classification table (Teilfreistellung rates) and documented treaty withholding-tax rates; `ecb_rates.py` and helper scripts provide FX, audit, and comparison utilities.
 - `tests/` contains focused regression tests; `test_data/` is local and gitignored because it may contain real IBKR data.

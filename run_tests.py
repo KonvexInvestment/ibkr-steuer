@@ -51,6 +51,7 @@ SYNTHETIC_TESTS = [
     ("FX-Rate-Parse-Ausfaelle", "tests/test_fx_rate_parse_failures.py"),
     ("Options-Event-Sammlung", "tests/test_option_event_collection.py"),
     ("Tageskurs-Korrektur-Maps", "tests/test_tageskurs_adjustment_maps.py"),
+    ("Underlying-Symbol-Aliasse", "tests/test_underlying_symbol_matching.py"),
 ]
 
 

@@ -1419,7 +1419,7 @@ def calculate_fx_gains(trades, fx_transactions, tax_year, base_currency='EUR'):
 
 
 def _get_open_option_sells(trades, a_cat, strike, expiry, pc, assignment_qty_for_series,
-                           underlying=None):
+                           underlying=None, alias_map=None):
     """Return only SELL trades still open after FIFO-consuming closed positions.
 
     IBKR may have multiple SELL ExchTrades for the same option series (strike/expiry/putCall).
@@ -1430,7 +1430,9 @@ def _get_open_option_sells(trades, a_cat, strike, expiry, pc, assignment_qty_for
 
     Wenn `underlying` angegeben ist, werden nur Sells fuer dieses Underlying
     beruecksichtigt — wichtig, weil verschiedene Aktien dieselbe strike/expiry-
-    Kombination haben koennen (z.B. KWEB P 30 exp 2024-12-20 vs FXI P 30 exp 2024-12-20).
+    Kombination haben koennen (z.B. KWEB P 30 exp 2024-12-20 vs FXI P 30 exp
+    2024-12-20). `alias_map` erlaubt dabei conid-/ISIN-belegte Tickerwechsel,
+    ohne auf unsicheres String-Raten zurueckzufallen.
     """
     all_sells = sorted(
         [t for t in trades
@@ -1440,7 +1442,9 @@ def _get_open_option_sells(trades, a_cat, strike, expiry, pc, assignment_qty_for
          and t.get('expiry') == expiry
          and t.get('putCall') == pc
          and t.get('buySell') == 'SELL'
-         and (underlying is None or t.get('underlyingSymbol', '') == underlying)],
+         and (underlying is None
+              or _symbols_equivalent(
+                  t.get('underlyingSymbol', ''), underlying, alias_map))],
         key=lambda t: t.get('dateTime', '') or t.get('tradeDate', '')
     )
     total_sell_qty = sum(abs(int(safe_float(t.get('quantity')))) for t in all_sells)
@@ -1661,6 +1665,8 @@ def _build_stillhalter_details_for_assignment(a, strike, expiry, pc, a_qty, mult
     for yr, part in sorted(detail_parts.items(), key=_detail_sort_key):
         details.append({
             'symbol': a.get('symbol') or a.get('description') or f"{strike} {expiry} {pc}",
+            'underlyingSymbol': a.get('underlyingSymbol', ''),
+            'currency': a.get('currency', ''),
             'strike': strike,
             'expiry': expiry,
             'putCall': pc,
@@ -1693,7 +1699,207 @@ def _symbol_root(value):
     return parts[0] if parts else ''
 
 
-def _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares, consumed=None):
+def _build_underlying_alias_map(trades, closed_lots=None, instruments=None):
+    """Symbol-Aequivalenzklassen fuer das Option↔Aktien-Matching (Issue #83).
+
+    IBKR fuehrt dieselbe Aktie unter verschiedenen Symbolen: Handelsplatz-
+    Suffix auf der STK-Row ('CONd') vs. Options-Underlying ('CON'), oder
+    Ticker-Umbenennung im Jahresverlauf (NYCB→FLG). Reines String-Matching
+    verfehlt dann die Andienungs-Korrekturen — die Praemie bliebe in der
+    Aktien-Kostenbasis eingebettet und wuerde doppelt versteuert. Die stabile
+    Identitaet ist die conid (STK-Row: conid, Options-Row: underlyingConid),
+    Fallback ISIN/CUSIP (isin/securityID vs. underlyingSecurityID). Symbole,
+    die eine conid oder Security-ID teilen, bilden eine Gruppe; jede Gruppe
+    erhaelt ein kanonisches Symbol (das haeufigste auf STK-Rows gesehene,
+    Tie-Break alphabetisch).
+
+    Symbole werden EXAKT wie im Feld registriert (kein _symbol_root):
+    Klassen-Aktien ('BRK A' vs. 'BRK B') haben verschiedene conids/ISINs und
+    duerfen nicht ueber ein manufakturiertes Wurzel-Symbol verschmelzen.
+
+    Reine Funktion: liefert {symbol: kanonisches_symbol} nur fuer Gruppen mit
+    mindestens zwei Symbolen und mindestens einem STK-seitigen Mitglied;
+    alle uebrigen Symbole bleiben ausserhalb der Map (Identitaet via
+    _canon_symbol-Fallback).
+    """
+    id_groups = {}      # ('C'|'I', wert) -> set(symbole)
+    stk_counts = {}     # symbol -> Anzahl STK-Row-Sichtungen
+    symbol_conids = {}  # symbol -> beobachtete conids
+    symbol_isins = {}   # symbol -> beobachtete ISINs/Security-IDs
+
+    def register(symbol, conid, isins, stk_side=False):
+        symbol = (symbol or '').strip()
+        if not symbol:
+            return
+        if stk_side:
+            stk_counts[symbol] = stk_counts.get(symbol, 0) + 1
+        conid = (conid or '').strip()
+        if conid:
+            id_groups.setdefault(('C', conid), set()).add(symbol)
+            symbol_conids.setdefault(symbol, set()).add(conid)
+        for isin in isins:
+            isin = (isin or '').strip()
+            if isin:
+                id_groups.setdefault(('I', isin), set()).add(symbol)
+                symbol_isins.setdefault(symbol, set()).add(isin)
+
+    for t in trades or []:
+        cat = t.get('assetCategory')
+        if cat == 'STK':
+            register(t.get('symbol'), t.get('conid'),
+                     (t.get('isin'), t.get('securityID')), stk_side=True)
+        elif cat == 'OPT':
+            # Nur OPT: FOP/FSFOP-Underlyings sind Futures, keine Aktien.
+            register(t.get('underlyingSymbol'), t.get('underlyingConid'),
+                     (t.get('underlyingSecurityID'),))
+    for lot in closed_lots or []:
+        if lot.get('assetCategory') == 'STK':
+            register(lot.get('symbol'), lot.get('conid'),
+                     (lot.get('isin'), lot.get('securityID')), stk_side=True)
+    for fi in instruments or []:
+        if fi.get('assetCategory') == 'STK':
+            register(fi.get('symbol'), fi.get('conid'), (fi.get('isin'),),
+                     stk_side=True)
+
+    # Ein wiederverwendetes Broker-Symbol darf nicht als transitive Bruecke
+    # zwischen verschiedenen Wertpapieren dienen. conid ist primaer; nur wenn
+    # sie fehlt, entscheidet eine mehrdeutige Security-ID-Zuordnung.
+    ambiguous_symbols = {
+        symbol
+        for symbol in set(symbol_conids) | set(symbol_isins)
+        if (len(symbol_conids.get(symbol, set())) > 1
+            or (not symbol_conids.get(symbol)
+                and len(symbol_isins.get(symbol, set())) > 1))
+    }
+
+    # Union-Find ueber eindeutige Symbole (Kanten: gemeinsame conid/Security-ID)
+    parent = {}
+
+    def find(sym):
+        parent.setdefault(sym, sym)
+        while parent[sym] != sym:
+            parent[sym] = parent[parent[sym]]
+            sym = parent[sym]
+        return sym
+
+    for members in id_groups.values():
+        ordered = sorted(members - ambiguous_symbols)
+        if not ordered:
+            continue
+        root = find(ordered[0])
+        for other in ordered[1:]:
+            other_root = find(other)
+            if other_root != root:
+                parent[other_root] = root
+
+    components = {}
+    for sym in parent:
+        components.setdefault(find(sym), set()).add(sym)
+
+    alias_map = {}
+    for members in components.values():
+        if len(members) < 2:
+            continue
+        stk_seen = [m for m in members if stk_counts.get(m)]
+        if not stk_seen:
+            continue  # keine Aktien-Row vorhanden — nichts, wogegen gematcht wuerde
+        canonical = min(stk_seen, key=lambda m: (-stk_counts[m], m))
+        for m in members:
+            alias_map[m] = canonical
+    return alias_map
+
+
+def _canon_symbol(sym, alias_map):
+    """Kanonisches Aktien-Symbol fuer das Option↔Aktien-Matching (Issue #83)."""
+    if not alias_map or not sym:
+        return sym
+    return alias_map.get(sym, sym)
+
+
+def _symbols_equivalent(sym, other, alias_map=None):
+    """True wenn zwei Symbole dieselbe Aktie bezeichnen (direkt oder via Alias)."""
+    if sym == other:
+        return True
+    if not alias_map:
+        return False
+    return alias_map.get(sym, sym) == alias_map.get(other, other)
+
+
+def _stock_symbol_for_matching(row, alias_map=None):
+    """Aktien-Symbol ohne Verlust belegter Klassen-/Alias-Information.
+
+    `underlyingSymbol` ist bereits ein reines Symbol und bleibt immer intakt.
+    Beim `symbol`-Fallback wird ein vollständiger, in der stabilen Alias-Map
+    belegter Ticker (z.B. ``BRK B``) ebenfalls erhalten. Nur unbekannte
+    Freitext-/Legacy-Werte fallen wie bisher auf das erste Token zurück.
+    """
+    underlying = (row.get('underlyingSymbol') or '').strip()
+    if underlying:
+        return underlying
+    symbol = (row.get('symbol') or '').strip()
+    if not symbol:
+        return ''
+    if alias_map and symbol in alias_map:
+        return symbol
+    return _symbol_root(symbol)
+
+
+def _detail_underlying_symbol(det, alias_map=None):
+    """Kanonisches Aktien-Underlying eines Stillhalter-Details."""
+    underlying = (det.get('underlyingSymbol') or '').strip()
+    if not underlying:
+        underlying = _symbol_root(det.get('symbol'))
+    return _canon_symbol(underlying, alias_map)
+
+
+def _alias_currency_ok(row_currency, option_currency):
+    """Waehrungs-Guard fuer Alias-vermittelte Matches (Issue #83, Review F1).
+
+    Die Alias-Map ueberbrueckt verschiedene Listings desselben Instruments.
+    Die Stillhalter-Korrektur subtrahiert die Praemie aber in der OPTIONS-
+    Waehrung von den Roh-Feldern der Aktien-Row (Row-Waehrung) — bei einem
+    Cross-Currency-Listing-Paar (z.B. US-Option, Verkauf ueber die EUR-
+    Listung) waere das ein Waehrungsmix (§20 Abs. 4 S. 1 EStG verlangt
+    EUR-Ermittlung mit tagesgenauen Kursen). Solche Matches werden
+    konservativ NICHT korrigiert (Verhalten wie vor Issue #83: Praemie
+    bleibt eigenstaendig in Topf 2, keine Basis-Korrektur). Fehlt eine der
+    beiden Waehrungsangaben, greift der Guard nicht.
+    """
+    row_currency = (row_currency or '').strip()
+    option_currency = (option_currency or '').strip()
+    if not row_currency or not option_currency:
+        return True
+    return row_currency == option_currency
+
+
+def _propagate_alias_isins(symbol_to_isin, alias_map):
+    """Traegt die ISIN eines Alias-Gruppenmitglieds fuer alle Mitglieder nach.
+
+    financial_instruments fuehrt nur das STK-Symbol ('CONd'); Lookups mit dem
+    Options-Underlying ('CON') liefen sonst ins Leere (ETF-/Anlage-SO-Routing
+    der Stillhalterpraemie). Mutiert symbol_to_isin in place, ueberschreibt
+    nie vorhandene Eintraege.
+    """
+    groups = {}
+    for member, canon in alias_map.items():
+        groups.setdefault(canon, set()).add(member)
+    for canon, members in groups.items():
+        members = set(members) | {canon}
+        # ISIN-Quelle: kanonisches Symbol zuerst (Review F3) — bei Gruppen mit
+        # legitim verschiedenen ISINs (z.B. ISIN-Wechsel bei Rename) soll das
+        # kanonische Listing gewinnen, nicht das alphabetisch erste Mitglied.
+        isin = ''
+        for m in [canon] + sorted(members - {canon}):
+            if symbol_to_isin.get(m):
+                isin = symbol_to_isin[m]
+                break
+        if isin:
+            for m in members:
+                symbol_to_isin.setdefault(m, isin)
+
+
+def _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares, consumed=None,
+                                       alias_map=None):
     """Return STK closed-lot slices that originate from this put assignment.
 
     `consumed` (optional dict, key: id(lot)) trackt bereits geclaimte Lot-Shares
@@ -1701,6 +1907,7 @@ def _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares, con
     Andienungen desselben Underlyings denselben Lot-Slice doppelt, die zweite
     Korrektur verfällt und der spätere Verkauf behält die eingebettete Prämie
     (Audit-Finding F3 / Codex-Review P2).
+    `alias_map`: Symbol-Aequivalenzklassen (Issue #83, 'CON' ↔ 'CONd').
     """
     if det.get('putCall') != 'P':
         return []
@@ -1710,15 +1917,23 @@ def _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares, con
         return []
 
     relevant_dates = _put_assignment_relevant_dates(det)
+    # Rohes Options-Underlying fuer die Alias-Erkennung: `underlying` kommt
+    # vom Aufrufer bereits kanonisiert an — nur der Vergleich mit dem ROHEN
+    # det-Underlying zeigt, ob das Match ueber die Alias-Bruecke laeuft.
+    det_raw_underlying = (det.get('underlyingSymbol') or '').strip() \
+        or _symbol_root(det.get('symbol'))
     matches = []
     for lot in sorted(closed_lots, key=lambda x: x.get('dateTime') or x.get('reportDate') or ''):
         if remaining <= 0:
             break
         if lot.get('assetCategory') != 'STK':
             continue
-        sym = _symbol_root(lot.get('underlyingSymbol') or lot.get('symbol'))
-        if sym != underlying:
+        sym = _stock_symbol_for_matching(lot, alias_map)
+        if not _symbols_equivalent(sym, underlying, alias_map):
             continue
+        if sym != det_raw_underlying and not _alias_currency_ok(lot.get('currency'),
+                                                                det.get('currency')):
+            continue  # Alias-Match mit Waehrungskonflikt (Review F1)
         open_date = (lot.get('openDateTime') or '')[:10]
         if relevant_dates and open_date not in relevant_dates:
             continue
@@ -1742,7 +1957,8 @@ def _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares, con
     return matches
 
 
-def _call_assignment_short_lot_matches(closed_lots, det, underlying, shares, consumed=None):
+def _call_assignment_short_lot_matches(closed_lots, det, underlying, shares, consumed=None,
+                                       alias_map=None):
     """Return STK short closed-lot slices opened by this call assignment.
 
     Call-Andienung ohne Long-Bestand eröffnet einen Aktien-Short (SELL mit PnL=0,
@@ -1762,15 +1978,21 @@ def _call_assignment_short_lot_matches(closed_lots, det, underlying, shares, con
         return []
 
     relevant_dates = _put_assignment_relevant_dates(det)
+    # Alias-Erkennung gegen das ROHE det-Underlying (s. Put-Matcher).
+    det_raw_underlying = (det.get('underlyingSymbol') or '').strip() \
+        or _symbol_root(det.get('symbol'))
     matches = []
     for lot in sorted(closed_lots, key=lambda x: x.get('dateTime') or x.get('reportDate') or ''):
         if remaining <= 0:
             break
         if lot.get('assetCategory') != 'STK':
             continue
-        sym = _symbol_root(lot.get('underlyingSymbol') or lot.get('symbol'))
-        if sym != underlying:
+        sym = _stock_symbol_for_matching(lot, alias_map)
+        if not _symbols_equivalent(sym, underlying, alias_map):
             continue
+        if sym != det_raw_underlying and not _alias_currency_ok(lot.get('currency'),
+                                                                det.get('currency')):
+            continue  # Alias-Match mit Waehrungskonflikt (Review F1)
         is_short_lot = (safe_float(lot.get('quantity'), 0) < 0
                         or (lot.get('buySell') or '').upper() == 'BUY')
         if not is_short_lot:
@@ -1797,7 +2019,9 @@ def _call_assignment_short_lot_matches(closed_lots, det, underlying, shares, con
     return matches
 
 
-def _call_short_cover_candidates_from_trades(trades, underlying, after_dates, shares, consumed=None):
+def _call_short_cover_candidates_from_trades(trades, underlying, after_dates, shares, consumed=None,
+                                             alias_map=None, option_currency=None,
+                                             raw_underlying=None):
     """Fallback ohne CLOSED_LOT-Daten: Short-Cover-Kandidaten direkt aus trades.
 
     Wenn closed_lots.csv fehlt oder das Short-Lot nicht enthält, ist der
@@ -1816,9 +2040,14 @@ def _call_short_cover_candidates_from_trades(trades, underlying, after_dates, sh
     for t in trades:
         if t.get('assetCategory') != 'STK':
             continue
-        sym = _symbol_root(t.get('symbol'))
-        if sym != underlying:
+        sym = _stock_symbol_for_matching(t, alias_map)
+        if not _symbols_equivalent(sym, underlying, alias_map):
             continue
+        # Alias-Erkennung gegen das ROHE Options-Underlying — `underlying`
+        # kommt vom Aufrufer bereits kanonisiert an (Review F1).
+        if (sym != (raw_underlying if raw_underlying is not None else underlying)
+                and not _alias_currency_ok(t.get('currency'), option_currency)):
+            continue  # Alias-Match mit Waehrungskonflikt (Review F1)
         if (t.get('buySell') or '').upper() != 'BUY':
             continue
         if abs(safe_float(t.get('fifoPnlRealized'))) < 0.01:
@@ -1847,7 +2076,9 @@ def _call_short_cover_candidates_from_trades(trades, underlying, after_dates, sh
     return matches
 
 
-def _consume_assignment_day_stock_sells(trades, underlying, day_dates, max_shares, consumed, realized):
+def _consume_assignment_day_stock_sells(trades, underlying, day_dates, max_shares, consumed, realized,
+                                        alias_map=None, option_currency=None,
+                                        raw_underlying=None):
     """Konsumiere STK-SELL-Rows am Andienungstag quantity-genau (FIFO).
 
     realized=True: Rows mit |fifoPnlRealized| ≥ 0.01 — der Long-Close-Anteil
@@ -1869,9 +2100,12 @@ def _consume_assignment_day_stock_sells(trades, underlying, day_dates, max_share
     for idx, t in enumerate(trades):
         if t.get('assetCategory') != 'STK':
             continue
-        sym = _symbol_root(t.get('symbol'))
-        if sym != underlying:
+        sym = _stock_symbol_for_matching(t, alias_map)
+        if not _symbols_equivalent(sym, underlying, alias_map):
             continue
+        if (sym != (raw_underlying if raw_underlying is not None else underlying)
+                and not _alias_currency_ok(t.get('currency'), option_currency)):
+            continue  # Alias-Match mit Waehrungskonflikt (Review F1)
         if (t.get('buySell') or '').upper() != 'SELL':
             continue
         has_pnl = abs(safe_float(t.get('fifoPnlRealized'))) >= 0.01
@@ -1905,7 +2139,8 @@ def _consume_assignment_day_stock_sells(trades, underlying, day_dates, max_share
 
 
 def _claim_stock_rows_for_date(trades, underlying, close_date, shares, consumed,
-                               buysell, prefer_cost=None, claim_side='C'):
+                               buysell, prefer_cost=None, claim_side='C', alias_map=None,
+                               option_currency=None, raw_underlying=None):
     """Beansprucht STK-Rows (PnL≠0) der Richtung `buysell` am close_date und
     liefert deren Row-Identitäten (id(trade)) zurück.
 
@@ -1928,9 +2163,12 @@ def _claim_stock_rows_for_date(trades, underlying, close_date, shares, consumed,
     for idx, t in enumerate(trades):
         if t.get('assetCategory') != 'STK':
             continue
-        sym = _symbol_root(t.get('symbol'))
-        if sym != underlying:
+        sym = _stock_symbol_for_matching(t, alias_map)
+        if not _symbols_equivalent(sym, underlying, alias_map):
             continue
+        if (sym != (raw_underlying if raw_underlying is not None else underlying)
+                and not _alias_currency_ok(t.get('currency'), option_currency)):
+            continue  # Alias-Match mit Waehrungskonflikt (Review F1)
         if (t.get('buySell') or '').upper() != buysell:
             continue
         if abs(safe_float(t.get('fifoPnlRealized'))) < 0.01:
@@ -1964,7 +2202,8 @@ def _claim_stock_rows_for_date(trades, underlying, close_date, shares, consumed,
     return claimed_oids
 
 
-def _resolve_call_assignment_targets(trades, closed_lots, det, underlying, total_shares, consumed):
+def _resolve_call_assignment_targets(trades, closed_lots, det, underlying, total_shares, consumed,
+                                     alias_map=None):
     """Löst eine Call-Andienung ANTEILIG in Korrektur-Ziele auf (kein binäres Gate).
 
     IBKR realisiert den Aktien-PnL einer Call-Andienung (inkl. eingebetteter
@@ -1998,12 +2237,18 @@ def _resolve_call_assignment_targets(trades, closed_lots, det, underlying, total
     # korrespondierenden Cover-Rows wandern mit ins Target, damit das Apply
     # exakt diese Rows trifft (und Stufe 3 anderer Details sie nicht doppelt
     # vergibt).
+    option_currency = det.get('currency')
+    det_raw_underlying = (det.get('underlyingSymbol') or '').strip() \
+        or _symbol_root(det.get('symbol'))
     for match in _call_assignment_short_lot_matches(closed_lots, det, underlying,
-                                                    rest, consumed=consumed):
+                                                    rest, consumed=consumed,
+                                                    alias_map=alias_map):
         row_oids = _claim_stock_rows_for_date(trades, underlying,
                                               match['close_date'],
                                               match['shares'], consumed,
-                                              buysell='BUY')
+                                              buysell='BUY', alias_map=alias_map,
+                                              option_currency=option_currency,
+                                              raw_underlying=det_raw_underlying)
         targets.append({'shares': match['shares'],
                         'close_dates': [match['close_date']],
                         'target_buysell': 'BUY',
@@ -2014,7 +2259,9 @@ def _resolve_call_assignment_targets(trades, closed_lots, det, underlying, total
     # fremde ExchTrades am selben Tag dürfen die Korrektur nicht erhalten).
     if rest > 0:
         long_qty, long_oids = _consume_assignment_day_stock_sells(
-            trades, underlying, call_dates, rest, consumed, realized=True)
+            trades, underlying, call_dates, rest, consumed, realized=True,
+            alias_map=alias_map, option_currency=option_currency,
+            raw_underlying=det_raw_underlying)
         if long_qty > 0:
             targets.append({'shares': long_qty,
                             'close_dates': call_dates,
@@ -2025,7 +2272,9 @@ def _resolve_call_assignment_targets(trades, closed_lots, det, underlying, total
     # Stufe 3: restliche Covers aus trades (closed_lots fehlt oder ist lückenhaft).
     if rest > 0:
         for match in _call_short_cover_candidates_from_trades(
-                trades, underlying, call_dates, rest, consumed=consumed):
+                trades, underlying, call_dates, rest, consumed=consumed,
+                alias_map=alias_map, option_currency=option_currency,
+                raw_underlying=det_raw_underlying):
             targets.append({'shares': match['shares'],
                             'close_dates': [match['close_date']],
                             'target_buysell': 'BUY',
@@ -2036,7 +2285,9 @@ def _resolve_call_assignment_targets(trades, closed_lots, det, underlying, total
     open_short = 0.0
     if rest > 0:
         open_short, _open_oids = _consume_assignment_day_stock_sells(
-            trades, underlying, call_dates, rest, consumed, realized=False)
+            trades, underlying, call_dates, rest, consumed, realized=False,
+            alias_map=alias_map, option_currency=option_currency,
+            raw_underlying=det_raw_underlying)
         rest -= open_short
 
     return targets, open_short, rest
@@ -2072,7 +2323,7 @@ def _correction_matches_row(corr, row):
 
 
 def _put_assignment_lot_cost_correction_per_share(closed_lots, det, underlying, shares, default_per_share,
-                                                  require_match=False, matches=None):
+                                                  require_match=False, matches=None, alias_map=None):
     """Use realized STK lot cost to decide whether IBKR embedded the put premium.
 
     `matches`: vorberechnete Lot-Matches durchreichen, wenn der Aufrufer bereits
@@ -2088,7 +2339,8 @@ def _put_assignment_lot_cost_correction_per_share(closed_lots, det, underlying, 
         return default_per_share
 
     if matches is None:
-        matches = _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares)
+        matches = _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares,
+                                                     alias_map=alias_map)
     lot_qty = sum(m['shares'] for m in matches)
     lot_cost = sum(m['cost'] for m in matches)
 
@@ -2207,11 +2459,34 @@ def _option_match_identity(t):
     return ('FAMILY',) + _occ_family_key(_option_key(t))
 
 
+def _option_contract_terms_equal(open_trade, close_trade):
+    """True bei reinem Tickerwechsel ohne geaenderte Kontrakt-Terme."""
+    open_key = _option_key(open_trade)
+    close_key = _option_key(close_trade)
+    if open_key[0] != close_key[0] or open_key[2:] != close_key[2:]:
+        return False
+    open_mult = safe_float(open_trade.get('multiplier'), 0.0)
+    close_mult = safe_float(close_trade.get('multiplier'), 0.0)
+    return (
+        open_mult <= 0
+        or close_mult <= 0
+        or abs(open_mult - close_mult) <= 0.0000001
+    )
+
+
 def _option_split_terms_compatible(open_trade, close_trade):
     """Konservative Plausibilitaet fuer conid-Matches mit geaenderten Terms."""
     if _option_match_identity(open_trade) != _option_match_identity(close_trade):
         return False
-    if _option_key(open_trade) == _option_key(close_trade):
+    open_key = _option_key(open_trade)
+    close_key = _option_key(close_trade)
+    if open_key == close_key:
+        return True
+    # Reiner Underlying-Tickerwechsel: Series-Terme sind unveraendert, die
+    # identische Options-conid reicht als stabile Identitaet. Ein cost-Feld ist
+    # dafuer nicht erforderlich (BookTrades enthalten es nicht immer).
+    if open_key[0] == close_key[0] == 'OPT' \
+            and _option_contract_terms_equal(open_trade, close_trade):
         return True
     if not (open_trade.get('cost') and close_trade.get('cost')):
         return False
@@ -2327,7 +2602,7 @@ def _detect_zufluss_unmatched(trades, tax_year, all_sell_open_keys):
     return zufluss_unmatched
 
 
-def _build_tageskurs_put_adjustments(stillhalter_details, xy_tageskurs_lots):
+def _build_tageskurs_put_adjustments(stillhalter_details, xy_tageskurs_lots, alias_map=None):
     """Baut die FIFO-Lots fuer den Put-Praemien-Restore der Aktien-Kostenbasis.
 
     IBKR bettet bei Put-Andienungen die Stillhalterpraemie in die Aktien-
@@ -2344,7 +2619,7 @@ def _build_tageskurs_put_adjustments(stillhalter_details, xy_tageskurs_lots):
     for det in stillhalter_details:
         if det.get('putCall') != 'P':
             continue  # Only put assignments embed premium in stock COST basis
-        underlying = det['symbol'].split()[0] if det['symbol'] else ''
+        underlying = _detail_underlying_symbol(det, alias_map)
         if not underlying:
             continue
         mult = det.get('multiplier', 100)
@@ -2356,6 +2631,9 @@ def _build_tageskurs_put_adjustments(stillhalter_details, xy_tageskurs_lots):
             'date': a_date,
             'shares_remaining': shares,
             'premium_per_share_raw': det['premium_raw'] / shares,
+            # Review F1: Options-Waehrung fuer den Guard beim CLOSED_LOT-Konsum
+            # (Praemien-Restore mischt sonst Waehrungen bei Alias-Listings).
+            'currency': det.get('currency', ''),
         })
     for sym, snap_lots in xy_tageskurs_lots.items():
         for snap in snap_lots:
@@ -2365,6 +2643,7 @@ def _build_tageskurs_put_adjustments(stillhalter_details, xy_tageskurs_lots):
                 'date': snap['date_str'],
                 'shares_remaining': snap['shares'],
                 'premium_per_share_raw': snap['premium_per_share_raw'],
+                'currency': snap.get('currency', ''),
             })
     # Sort each symbol's lots by date (FIFO)
     for sym in put_adj:
@@ -2378,7 +2657,7 @@ def _tageskurs_close_timestamp(row):
     return value[:19]
 
 
-def _build_tageskurs_pnl_adjustment_maps(debug_rows):
+def _build_tageskurs_pnl_adjustment_maps(debug_rows, alias_map=None):
     """Baut die Per-Share-Korrektur-Maps fuer die Tageskurs-Bruttozuordnung.
 
     Gross gain/loss buckets muessen die tatsaechlich auf die Trade-Row
@@ -2399,7 +2678,8 @@ def _build_tageskurs_pnl_adjustment_maps(debug_rows):
                 or adjustment_raw <= 0:
             continue
         quantity = abs(safe_float(row.get('quantity'), 0.0))
-        symbol = _symbol_root(row.get('underlyingSymbol') or row.get('symbol'))
+        symbol = _canon_symbol(
+            _stock_symbol_for_matching(row, alias_map), alias_map)
         close_timestamp = _tageskurs_close_timestamp(row)
         side = (row.get('buySell') or '').upper()
         if quantity <= 0 or not symbol or not close_timestamp:
@@ -2415,7 +2695,8 @@ def _build_tageskurs_pnl_adjustment_maps(debug_rows):
     return adj_exact, adj_date
 
 
-def _consume_tageskurs_pnl_adjustment(lot, adj_exact, adj_date):
+def _consume_tageskurs_pnl_adjustment(lot, adj_exact, adj_date,
+                                      alias_map=None):
     """Konsumiert die Stillhalter-Korrektur eines CLOSED_LOTs quantity-proportional.
 
     Exakter Timestamp zuerst; Same-Day-Fallback nur fuer den Rest (IBKR
@@ -2427,7 +2708,8 @@ def _consume_tageskurs_pnl_adjustment(lot, adj_exact, adj_date):
     remaining = abs(quantity_signed)
     if remaining <= 0:
         return 0.0
-    symbol = _symbol_root(lot.get('underlyingSymbol') or lot.get('symbol'))
+    symbol = _canon_symbol(
+        _stock_symbol_for_matching(lot, alias_map), alias_map)
     close_timestamp = _tageskurs_close_timestamp(lot)
     side = (lot.get('buySell') or '').upper()
     if not side:
@@ -2539,7 +2821,17 @@ def _run_zufluss_fifo(series_events, tax_year, on_prior_close, on_current_open,
                             and not _option_split_terms_compatible(lot['trade'], ev):
                         continue
 
-                    basis_match = conid_group and not exact_match
+                    # Ein reiner Tickerwechsel derselben Options-conid hat
+                    # unveraenderte Mengen-/Multiplier-Terme und wird normal
+                    # nach Kontraktzahl konsumiert. Nur echte Contract-
+                    # Adjustments/Splits brauchen den kostenbasierten Ratio-
+                    # Match.
+                    basis_match = (
+                        conid_group
+                        and not exact_match
+                        and not _option_contract_terms_equal(
+                            lot['trade'], ev)
+                    )
                     if basis_match:
                         if (lot['remaining_basis'] <= epsilon
                                 or remaining_close_basis <= epsilon):
@@ -2884,14 +3176,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     etf_isins = set()  # all ISINs that IBKR marks as ETF (subCategory)
     symbol_to_isin = {}  # for Stillhalter underlying lookup
     fi_path = os.path.join(ib_tax_dir, 'financial_instruments.csv')
-    if os.path.exists(fi_path):
-        for fi in load_csv(fi_path):
-            sym = fi.get('symbol', '').strip()
-            isin = fi.get('isin', '').strip()
-            if sym and isin:
-                symbol_to_isin[sym] = isin
-            if fi.get('assetCategory') == 'STK' and isin and (fi.get('subCategory') == 'ETF' or is_known_etf(isin)):
-                etf_isins.add(isin)
+    fi_rows = load_csv(fi_path) if os.path.exists(fi_path) else []
+    for fi in fi_rows:
+        sym = fi.get('symbol', '').strip()
+        isin = fi.get('isin', '').strip()
+        if sym and isin:
+            symbol_to_isin[sym] = isin
+        if fi.get('assetCategory') == 'STK' and isin and (fi.get('subCategory') == 'ETF' or is_known_etf(isin)):
+            etf_isins.add(isin)
     # Also pick up ETFs from trades themselves
     for t in trades:
         if t.get('assetCategory') == 'STK':
@@ -2900,6 +3192,26 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 etf_isins.add(isin)
     if etf_isins:
         print(f"ETF-Erkennung: {len(etf_isins)} ETF-ISINs gefunden (subCategory=ETF).")
+
+    # Issue #83: Symbol-Aequivalenzklassen fuer das Option↔Aktien-Matching.
+    # IBKR fuehrt dieselbe Aktie je nach Row unter verschiedenen Symbolen
+    # (Handelsplatz-Suffix 'CONd' vs. Options-Underlying 'CON'; Ticker-Rename
+    # NYCB→FLG). Stabile Identitaet: conid/underlyingConid, Fallback ISIN.
+    _alias_closed_lots = []
+    _alias_cl_path = os.path.join(ib_tax_dir, 'closed_lots.csv')
+    if os.path.exists(_alias_cl_path):
+        _alias_closed_lots = load_csv(_alias_cl_path)
+    underlying_alias_map = _build_underlying_alias_map(trades, _alias_closed_lots, fi_rows)
+    underlying_symbol_aliases = {}
+    for _member, _canon in underlying_alias_map.items():
+        if _member != _canon:
+            underlying_symbol_aliases.setdefault(_canon, []).append(_member)
+    if underlying_symbol_aliases:
+        _propagate_alias_isins(symbol_to_isin, underlying_alias_map)
+        for _canon, _members in sorted(underlying_symbol_aliases.items()):
+            _members.sort()
+            print(f"Symbol-Alias erkannt (conid/ISIN-Identitaet): "
+                  f"{', '.join(_members)} = {_canon}")
 
     # 3. Capital Gains (Stocks & Options)
     stocks_gain = 0.0
@@ -3190,7 +3502,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # underlyingSymbol einbeziehen — verschiedene Aktien koennen dieselbe
         # strike/expiry-Kombination haben (z.B. KWEB P 30 vs FXI P 30).
         a_underlying = a.get('underlyingSymbol', '')
-        series_key = (a_cat, a_underlying, strike, expiry, pc)
+        canonical_underlying = _canon_symbol(
+            a_underlying, underlying_alias_map)
+        series_key = (
+            a_cat, canonical_underlying, strike, expiry, pc)
         assignment_identity = _option_match_identity(a)
         uses_adjusted_terms = (
             assignment_identity in _adjusted_assignment_identities
@@ -3256,11 +3571,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 and t.get('strike') == strike
                 and t.get('expiry') == expiry
                 and t.get('putCall') == pc
-                and t.get('underlyingSymbol', '') == a_underlying
+                and _symbols_equivalent(
+                    t.get('underlyingSymbol', ''), a_underlying,
+                    underlying_alias_map)
                 and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01
             )
             state = _get_open_option_sells(
-                trades, a_cat, strike, expiry, pc, assign_qty_series, underlying=a_underlying
+                trades, a_cat, strike, expiry, pc, assign_qty_series,
+                underlying=a_underlying, alias_map=underlying_alias_map
             )
 
             # Issue #61: Pre-consume Vorjahres-Andienungen derselben Series, damit
@@ -3276,7 +3594,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                  and t.get('strike') == strike
                  and t.get('expiry') == expiry
                  and t.get('putCall') == pc
-                 and t.get('underlyingSymbol', '') == a_underlying
+                 and _symbols_equivalent(
+                     t.get('underlyingSymbol', ''), a_underlying,
+                     underlying_alias_map)
                  and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01
                  and (pd_ := parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))) is not None
                  and pd_.year < tax_year],
@@ -3353,7 +3673,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     for det in stillhalter_details:
         if det.get('putCall') != 'P':
             continue
-        u_sym = det['symbol'].split()[0] if det.get('symbol') else ''
+        u_sym = _detail_underlying_symbol(det, underlying_alias_map)
         u_isin = symbol_to_isin.get(u_sym, '')
         if not u_isin or _effective_classification(u_isin) != 'anlage_so':
             continue
@@ -3387,7 +3707,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # (id(trade), 'P'/'C') — dieselbe Row traegt im Wheel-Fall beide Praemien.
         _routing_lot_claims = {}
         for det in stillhalter_details:
-            underlying = det['symbol'].split()[0] if det['symbol'] else ''
+            # Kanonisches Aktien-Symbol (Issue #83): Options-Underlying 'CON'
+            # muss die STK-Rows 'CONd' treffen.
+            underlying = _detail_underlying_symbol(
+                det, underlying_alias_map)
             underlying_isin = symbol_to_isin.get(underlying, '')
             source_premium_eur = det['premium_eur']
 
@@ -3398,7 +3721,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 matched_shares = sum(
                     m['shares'] for m in _put_assignment_closed_lot_matches(
                         closed_lots_for_put_basis, det, underlying, total_shares,
-                        consumed=_routing_lot_claims
+                        consumed=_routing_lot_claims,
+                        alias_map=underlying_alias_map
                     )
                 )
                 if matched_shares <= 0:
@@ -3433,7 +3757,11 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # Lot-Sortierung wie oben → identische Zuordnung wie das Routing).
         _correction_lot_claims = {}
         for det in stillhalter_details:
-            underlying = det['symbol'].split()[0] if det['symbol'] else ''
+            underlying_raw = (
+                (det.get('underlyingSymbol') or '').strip()
+                or _symbol_root(det.get('symbol'))
+            )
+            underlying = _canon_symbol(underlying_raw, underlying_alias_map)
             u_isin = symbol_to_isin.get(underlying, '')
             pc_label = 'Call' if det['putCall'] == 'C' else 'Put'
             # Determine source topf
@@ -3442,7 +3770,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             if det['putCall'] == 'P':
                 put_lot_matches = _put_assignment_closed_lot_matches(
                     closed_lots_for_put_basis, det, underlying, total_shares_for_put,
-                    consumed=_correction_lot_claims
+                    consumed=_correction_lot_claims,
+                    alias_map=underlying_alias_map
                 )
             if det['putCall'] == 'P' and not put_lot_matches:
                 source_topf = 'Topf2'  # put_nosell: premium only in Topf 2, no subtraction
@@ -3479,7 +3808,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     premium_per_share_raw = _put_assignment_lot_cost_correction_per_share(
                         closed_lots_for_put_basis, det, underlying, total_shares,
                         premium_per_share_raw, require_match=True,
-                        matches=put_lot_matches
+                        matches=put_lot_matches, alias_map=underlying_alias_map
                     )
                     if premium_per_share_raw is None:
                         continue
@@ -3492,7 +3821,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                             trades, underlying, match['close_date'],
                             match['shares'], _correction_lot_claims,
                             buysell='SELL', prefer_cost=match.get('cost'),
-                            claim_side='P'
+                            claim_side='P', alias_map=underlying_alias_map,
+                            option_currency=det.get('currency'),
+                            raw_underlying=underlying_raw
                         )
                         pending_stk_corrections.setdefault(underlying, []).append({
                             'premium_per_share_raw': premium_per_share_raw,
@@ -3500,6 +3831,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                             'close_date': match['close_date'],
                             'side': 'P',
                             'row_oids': put_row_oids or None,
+                            'raw_underlying': underlying_raw,
+                            'currency': det.get('currency', ''),
                         })
                 else:
                     # Anteilige Quellen-Kaskade statt binärer Gates (Audit F1 +
@@ -3508,7 +3841,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     call_targets, open_short_shares, unresolved_shares = \
                         _resolve_call_assignment_targets(
                             trades, closed_lots_for_put_basis, det, underlying,
-                            total_shares, consumed=_correction_lot_claims
+                            total_shares, consumed=_correction_lot_claims,
+                            alias_map=underlying_alias_map
                         )
                     for tgt in call_targets:
                         pending_stk_corrections.setdefault(underlying, []).append({
@@ -3518,6 +3852,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                             'side': 'C',
                             'target_buysell': tgt['target_buysell'],
                             'row_oids': tgt.get('row_oids'),
+                            'raw_underlying': underlying_raw,
+                            'currency': det.get('currency', ''),
                         })
                     if open_short_shares > 0:
                         stillhalter_open_short.append({
@@ -3544,6 +3880,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                             'close_dates': call_dates,
                             'side': 'C',
                             'target_buysell': 'SELL',
+                            'raw_underlying': underlying_raw,
+                            'currency': det.get('currency', ''),
                         })
 
         # Apply pending corrections to stock trade debug_rows
@@ -3561,8 +3899,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         for row in debug_rows:
             if row.get('source') != 'trades' or row.get('assetCategory') != 'STK':
                 continue
-            sym_parts = (row.get('symbol', '') or '').split()
-            row_symbol = sym_parts[0] if sym_parts else ''
+            row_symbol_raw = _stock_symbol_for_matching(
+                row, underlying_alias_map)
+            row_symbol = _canon_symbol(row_symbol_raw, underlying_alias_map)
             if not row_symbol or row_symbol not in pending_stk_corrections:
                 continue
             qty = abs(safe_float(row.get('quantity', '0'), 0))
@@ -3580,6 +3919,13 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 if corr['remaining_shares'] <= 0 or remaining_by_side[side] <= 0:
                     continue
                 if not _correction_matches_row(corr, row):
+                    continue
+                # Review F1: OID-lose Korrekturen duerfen ueber die Alias-
+                # Bruecke keine Row in fremder Waehrung treffen (Praemie ist
+                # in Options-Waehrung; Roh-Feld-Mathe waere ein Waehrungsmix).
+                if (corr.get('row_oids') is None
+                        and row_symbol_raw != corr.get('raw_underlying', row_symbol_raw)
+                        and not _alias_currency_ok(row.get('currency'), corr.get('currency'))):
                     continue
                 shares = min(remaining_by_side[side], corr['remaining_shares'])
                 total_correction_raw += corr['premium_per_share_raw'] * shares
@@ -3934,8 +4280,11 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 continue
             # Key-Ableitung identisch zum trades-Loop und put_assignment_lots:
             # underlyingSymbol NICHT splitten (Klassen-Aktien wie 'BRK B'),
-            # nur der symbol-Fallback wird gesplittet.
-            sym = lot.get('underlyingSymbol') or lot.get('symbol', '').split()[0]
+            # nur der symbol-Fallback wird gesplittet. Kanonisierung (Issue #83)
+            # auf beiden Seiten, damit 'CONd'-Lots das Underlying 'CON' treffen.
+            sym = _canon_symbol(
+                _stock_symbol_for_matching(lot, underlying_alias_map),
+                underlying_alias_map)
             open_date = (lot.get('openDateTime') or '')[:10]
             qty = abs(safe_float(lot.get('quantity'), 0))
             if not sym or not open_date or qty <= 0:
@@ -3952,8 +4301,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         prior_put_assignments,
         key=lambda t: (t.get('dateTime', '') or t.get('tradeDate', '') or t.get('reportDate', '') or '')
     )
-    # series_key umfasst underlyingSymbol — verschiedene Aktien koennen dieselbe
-    # strike/expiry-Kombination haben (z.B. KWEB P 30 vs FXI P 30).
+    # series_key umfasst die stabile Underlying-Aliasgruppe — verschiedene
+    # Aktien mit gleicher strike/expiry-Kombination bleiben getrennt, ein
+    # belegter Tickerwechsel (OLD→NEW) dagegen teilt denselben FIFO-State.
     _prior_put_series_state = {}  # {(a_cat, underlying, strike, expiry): originals_state_list}
 
     for a in prior_put_assignments_sorted:
@@ -3966,7 +4316,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         if not strike or not underlying or a_qty == 0:
             continue
 
-        series_key = (a_cat, underlying, strike, expiry)
+        canonical_underlying = _canon_symbol(
+            underlying, underlying_alias_map)
+        series_key = (a_cat, canonical_underlying, strike, expiry)
         if series_key not in _prior_put_series_state:
             assign_qty_series = sum(
                 abs(int(safe_float(t.get('quantity'))))
@@ -3977,11 +4329,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 and t.get('strike') == strike
                 and t.get('expiry') == expiry
                 and t.get('putCall') == 'P'
-                and t.get('underlyingSymbol', '') == underlying
+                and _symbols_equivalent(
+                    t.get('underlyingSymbol', ''), underlying,
+                    underlying_alias_map)
                 and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01
             )
             _prior_put_series_state[series_key] = _get_open_option_sells(
-                trades, a_cat, strike, expiry, 'P', assign_qty_series, underlying=underlying)
+                trades, a_cat, strike, expiry, 'P', assign_qty_series,
+                underlying=underlying, alias_map=underlying_alias_map)
 
         originals_state = _prior_put_series_state[series_key]
         if not originals_state:
@@ -4001,6 +4356,11 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         a_date = parse_date(a.get('reportDate') or a.get('dateTime') or a.get('tradeDate'))
 
         premium_per_share_raw = net_premium_raw / assignment_shares if assignment_shares else 0
+        # Aktien-Seite laeuft ueber das kanonische Symbol (Issue #83): die
+        # STK-Rows/Lots tragen ggf. ein Handelsplatz-Suffix ('CONd'), das
+        # Options-Underlying nicht ('CON'). Auch die Options-Seite verwendet
+        # dieselbe belegte Aliasgruppe, damit Renames den Original-SELL finden.
+        underlying_stk = _canon_symbol(underlying, underlying_alias_map)
         lot_open_dates = [
             ((a.get('dateTime') or a.get('tradeDate') or '')[:10]),
             ((a.get('reportDate') or '')[:10]),
@@ -4012,7 +4372,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             closed_key = None
             closed_shares = 0
             for candidate_date in lot_open_dates:
-                candidate_key = (underlying, candidate_date)
+                candidate_key = (underlying_stk, candidate_date)
                 candidate_shares = _xy_closed_share_remaining.get(candidate_key, 0)
                 if candidate_shares > 0:
                     closed_key = candidate_key
@@ -4023,30 +4383,35 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 continue
             shares = min(assignment_shares, closed_shares)
             _xy_closed_share_remaining[closed_key] = closed_shares - shares
-        if underlying not in put_assignment_lots:
-            put_assignment_lots[underlying] = deque()
-        put_assignment_lots[underlying].append({
+        if underlying_stk not in put_assignment_lots:
+            put_assignment_lots[underlying_stk] = deque()
+        put_assignment_lots[underlying_stk].append({
             'date': a_date,
             'shares_remaining': shares,
             'premium_per_share_eur': premium_per_share_eur,
             'premium_per_share_raw': premium_per_share_raw,
             'strike': strike,
             'year': a_date.year if a_date else 0,
+            # Review F1: fuer den Waehrungs-Guard bei Alias-vermittelten
+            # Matches (Praemie ist in Options-Waehrung).
+            'currency': a.get('currency', ''),
+            'raw_underlying': underlying,
         })
         # Issue #55: Snapshot fuer _tageskurs_put_adj — bleibt erhalten auch wenn
         # put_assignment_lots durch Apply-Schleife geleert wird.
         # date_str nutzt das tatsaechlich in closed_lots gematchte Open-Datum.
         # IBKR kann bei Andienungen je nach Buchung tradeDate oder reportDate
         # als openDateTime fuehren.
-        _xy_tageskurs_lots.setdefault(underlying, []).append({
+        _xy_tageskurs_lots.setdefault(underlying_stk, []).append({
             'date_str': matched_open_date,
             'shares': shares,
             'premium_per_share_raw': premium_per_share_raw,
+            'currency': a.get('currency', ''),
         })
         # Anlage-SO-Lookup für cross-year (Issue #51)
-        u_isin_xy = symbol_to_isin.get(underlying, '')
+        u_isin_xy = symbol_to_isin.get(underlying_stk, '')
         if u_isin_xy and _effective_classification(u_isin_xy) == 'anlage_so' and a_date:
-            so_key = (underlying, a_date.strftime('%Y-%m-%d'))
+            so_key = (underlying_stk, a_date.strftime('%Y-%m-%d'))
             _so_premium_lookup.setdefault(so_key, {'shares': 0, 'premium_eur': 0.0})
             _so_premium_lookup[so_key]['shares'] += shares
             _so_premium_lookup[so_key]['premium_eur'] += premium_eur
@@ -4071,7 +4436,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             if not pnl_str or float(pnl_str) == 0:
                 continue
 
-            sym = t.get('underlyingSymbol') or t.get('symbol', '').split()[0]
+            sym_raw = _stock_symbol_for_matching(
+                t, underlying_alias_map)
+            sym = _canon_symbol(sym_raw, underlying_alias_map)
             if sym not in put_assignment_lots:
                 continue
 
@@ -4080,6 +4447,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
 
             while remaining > 0 and put_assignment_lots[sym]:
                 lot = put_assignment_lots[sym][0]
+                # Review F1: Alias-vermitteltes Match nur bei kompatibler
+                # Waehrung (Praemie in Options-Waehrung vs. Row-Rohfelder).
+                # Lots eines Underlyings teilen praktisch dieselbe Options-
+                # Waehrung, daher genuegt der Head-Lot-Vergleich.
+                if (sym_raw != lot.get('raw_underlying', sym_raw)
+                        and not _alias_currency_ok(t.get('currency'),
+                                                   lot.get('currency'))):
+                    break
                 consumed = min(remaining, lot['shares_remaining'])
                 # correction_eur wird erst in der debug_rows-Schleife unten gesetzt:
                 # der tatsaechliche EUR-Betrag haengt vom FX-Kurs des Aktienverkaufs
@@ -4090,6 +4465,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     'premium_per_share': lot['premium_per_share_eur'],
                     'premium_per_share_raw': lot['premium_per_share_raw'],
                     'correction_eur': 0.0,
+                    'currency': lot.get('currency', ''),
+                    'raw_underlying': lot.get('raw_underlying', ''),
                     'assignment_year': lot['year'],
                     'strike': lot['strike'],
                 })
@@ -4134,7 +4511,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 # Key-Ableitung identisch zum trades-Loop (sym) und put_assignment_lots:
                 # underlyingSymbol NICHT splitten, sonst verfehlt 'BRK B' den
                 # _xy_pending-Eintrag und die Korrektur bleibt stumm bei 0.
-                row_symbol = row.get('underlyingSymbol') or row.get('symbol', '').split()[0]
+                row_symbol_raw = _stock_symbol_for_matching(
+                    row, underlying_alias_map)
+                row_symbol = _canon_symbol(row_symbol_raw, underlying_alias_map)
                 if not row_symbol or row_symbol not in _xy_pending:
                     continue
                 qty = abs(safe_float(row.get('quantity', '0'), 0))
@@ -4146,6 +4525,13 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 _row_corr_refs = []  # [(cross_year_put_corrections-Eintrag, chunk_raw)]
                 for corr in _xy_pending[row_symbol]:
                     if corr['remaining_shares'] <= 0:
+                        continue
+                    # Review F1: keine Alias-Bruecke in fremde Waehrung
+                    # (analog zum Sell-Loop oben).
+                    _corr_ref = corr['corr_ref']
+                    if (row_symbol_raw != _corr_ref.get('raw_underlying', row_symbol_raw)
+                            and not _alias_currency_ok(row.get('currency'),
+                                                       _corr_ref.get('currency'))):
                         continue
                     consumed = min(remaining, corr['remaining_shares'])
                     chunk_raw = consumed * corr['premium_per_share_raw']
@@ -4440,6 +4826,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     underlying = sym.split()[0]
             if underlying:
                 put_assign_syms.add(underlying)
+                # Alias-Formen (Issue #83): pnl_summary fuehrt das STK-Symbol
+                # ('CONd'), die Andienung das Options-Underlying ('CON').
+                put_assign_syms.add(_canon_symbol(underlying, underlying_alias_map))
                 if underlying in symbol_to_isin:
                     put_assign_isins.add(symbol_to_isin[underlying])
             uid = a.get('underlyingSecurityID', '').strip()
@@ -5084,12 +5473,13 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     # Same-Year- + Cross-Year-Put-Praemien als FIFO-Lots (Issue #54/#55; Doku:
     # _build_tageskurs_put_adjustments).
     _tageskurs_put_adj = _build_tageskurs_put_adjustments(
-        stillhalter_details, _xy_tageskurs_lots)
+        stillhalter_details, _xy_tageskurs_lots, alias_map=underlying_alias_map)
 
     # Per-Share-Korrektur-Maps fuer die Bruttozuordnung (Mechanik + Doku:
     # _build_tageskurs_pnl_adjustment_maps / _consume_tageskurs_pnl_adjustment).
     _tageskurs_pnl_adj_exact, _tageskurs_pnl_adj_date = \
-        _build_tageskurs_pnl_adjustment_maps(debug_rows)
+        _build_tageskurs_pnl_adjustment_maps(
+            debug_rows, alias_map=underlying_alias_map)
 
     fx_correction_total = 0.0
     fx_correction_details = []
@@ -5214,7 +5604,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             # (cost = strike×qty - premium). Restore correct cost (= strike×qty)
             # so the Tageskurs formula uses the right basis.
             if category == 'STK' and _tageskurs_put_adj:
-                lot_sym = lot.get('symbol', '').split()[0]
+                lot_sym = _canon_symbol(
+                    _stock_symbol_for_matching(
+                        lot, underlying_alias_map),
+                    underlying_alias_map)
                 if lot_sym in _tageskurs_put_adj:
                     lot_open_date = open_dt[:10]
                     lot_qty = abs(safe_float(lot.get('quantity'), 0))
@@ -5223,6 +5616,12 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                         if adj_lot['shares_remaining'] <= 0:
                             continue
                         if adj_lot['date'] and lot_open_date and adj_lot['date'] != lot_open_date:
+                            continue
+                        # Review F1: Praemien-Restore nur in kompatibler
+                        # Waehrung (cost_raw ist in Lot-Waehrung; bei einem
+                        # Alias-Listing-Paar waere das ein Waehrungsmix).
+                        if not _alias_currency_ok(lot.get('currency'),
+                                                  adj_lot.get('currency')):
                             continue
                         consumed = min(remaining, adj_lot['shares_remaining'])
                         premium_adjustment = (
@@ -5305,7 +5704,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             pnl_raw = safe_float(lot.get('fifoPnlRealized'), 0)
             pnl_stillhalter_adjustment_raw = (
                 _consume_tageskurs_pnl_adjustment(
-                    lot, _tageskurs_pnl_adj_exact, _tageskurs_pnl_adj_date)
+                    lot, _tageskurs_pnl_adj_exact,
+                    _tageskurs_pnl_adj_date,
+                    alias_map=underlying_alias_map)
                 if category == 'STK' else 0.0
             )
             detail['stillhalter_adjustment_raw'] = round(
@@ -5395,7 +5796,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 # Prämie aus der PnL rausrechnen (sonst Double-Count — Prämie ist bereits
                 # separat in Topf 2 gebucht).
                 if open_dt and _so_premium_lookup:
-                    lot_sym = ((lot.get('symbol') or '').strip().split() or [''])[0]
+                    lot_sym = _canon_symbol(
+                        _stock_symbol_for_matching(
+                            lot, underlying_alias_map),
+                        underlying_alias_map)
                     open_date_str = str(open_dt)[:10]
                     so_entry = _so_premium_lookup.get((lot_sym, open_date_str))
                     if so_entry and so_entry['shares'] > 0:
@@ -5713,6 +6117,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             "usd_to_eur_rates_count": len(usd_to_eur_rates),
             "ecb_rates_used": ecb_rates_used,
             "fx_rate_parse_failures": fx_rate_parse_failures,
+            # Issue #83: erkannte Symbol-Aliasse (kanonisch → abweichende
+            # Schreibweisen), z.B. {'CONd': ['CON']} oder Ticker-Renames.
+            "underlying_symbol_aliases": underlying_symbol_aliases,
             "stillhalter_count": stillhalter_count,
             "stillhalter_premium_eur": stillhalter_premium_eur,
             "put_nosell_premium_eur": put_nosell_premium_eur,
