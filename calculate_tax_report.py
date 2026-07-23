@@ -1516,6 +1516,60 @@ def _consume_open_sells_fifo(originals_state, a_qty, mult, base_currency='EUR', 
     return premium_raw, commission_raw, fx_weighted, premium_eur, sells_consumed, consumed
 
 
+def _consume_assignment_fifo_matches(matches, assignment_multiplier,
+                                     base_currency='EUR',
+                                     usd_to_eur_rates=None):
+    """Berechnet die Prämie aus splitfaehig vorab zugeordneten SELL-Slices.
+
+    Die Praemie verwendet Menge und Multiplikator des urspruenglichen SELLs.
+    Fuer Aktienrouting und Detailausgabe wird dagegen die durch die
+    Kapitalmassnahme entstandene neue Assignment-Menge weitergereicht.
+
+    Returns dieselbe Aggregat-Struktur wie _consume_open_sells_fifo; Eintraege
+    in sells_consumed sind hier (sell, alte_menge, neue_menge).
+    """
+    premium_raw = 0.0
+    commission_raw = 0.0
+    fx_weighted = 0.0
+    premium_eur = 0.0
+    consumed_assignment_qty = 0.0
+    sells_consumed = []
+
+    for match in matches:
+        sell = match['sell']
+        sell_qty = safe_float(match.get('sell_quantity'), 0.0)
+        assignment_qty = safe_float(
+            match.get('assignment_quantity'), 0.0
+        )
+        if sell_qty <= 0 or assignment_qty <= 0:
+            continue
+        sell_multiplier_value = safe_float(sell.get('multiplier'), 0.0)
+        if sell_multiplier_value <= 0:
+            sell_multiplier_value = assignment_multiplier
+        sell_multiplier = int(sell_multiplier_value)
+        components = _premium_components_for_consumed_sell(
+            sell, sell_qty, sell_multiplier,
+            base_currency, usd_to_eur_rates,
+        )
+        if components is None:
+            continue
+        premium_raw += components['premium_raw']
+        commission_raw += components['commission_raw']
+        fx_weighted += components['fx_weighted']
+        premium_eur += components['premium_eur']
+        consumed_assignment_qty += assignment_qty
+        sells_consumed.append((sell, sell_qty, assignment_qty))
+
+    return (
+        premium_raw,
+        commission_raw,
+        fx_weighted,
+        premium_eur,
+        sells_consumed,
+        consumed_assignment_qty,
+    )
+
+
 def _premium_components_for_consumed_sell(orig, consume, mult, base_currency='EUR', usd_to_eur_rates=None):
     """Return premium components for a consumed SELL slice."""
     price = safe_float(orig.get('tradePrice')) or safe_float(orig.get('closePrice'))
@@ -1547,13 +1601,25 @@ def _build_stillhalter_details_for_assignment(a, strike, expiry, pc, a_qty, mult
                                               sells_consumed, premium_raw, commission_raw,
                                               premium_eur, base_currency='EUR',
                                               usd_to_eur_rates=None):
-    """Build assignment details split by original SELL year."""
+    """Build assignment details split by original SELL year.
+
+    sells_consumed akzeptiert (sell, sell_qty) fuer normale Serien und
+    (sell, sell_qty, assignment_qty) fuer Kapitalmassnahmen. So wird die
+    historische Praemie mit der alten Menge berechnet, aber auf die neue
+    Kontraktzahl und den neuen Assignment-Multiplikator verteilt.
+    """
     assignment_date = parse_date(a.get('dateTime') or a.get('tradeDate'))
     detail_parts = {}
-    for orig, consume_qty in sells_consumed:
+    for consumed in sells_consumed:
+        orig, consume_qty = consumed[:2]
+        assignment_qty = consumed[2] if len(consumed) > 2 else consume_qty
         od = parse_date(orig.get('dateTime') or orig.get('tradeDate'))
+        orig_mult_value = safe_float(orig.get('multiplier'), 0.0)
+        if orig_mult_value <= 0:
+            orig_mult_value = mult
+        orig_mult = int(orig_mult_value)
         components = _premium_components_for_consumed_sell(
-            orig, consume_qty, mult, base_currency, usd_to_eur_rates
+            orig, consume_qty, orig_mult, base_currency, usd_to_eur_rates
         )
         if components is None:
             continue
@@ -1573,7 +1639,7 @@ def _build_stillhalter_details_for_assignment(a, strike, expiry, pc, a_qty, mult
         part = detail_parts[yr]
         if od < part['orig_sell_date']:
             part['orig_sell_date'] = od
-        part['quantity'] += components['quantity']
+        part['quantity'] += assignment_qty
         part['premium_eur'] += components['premium_eur']
         part['premium_raw'] += components['net_premium_raw']
         part['commission_raw'] += components['commission_raw']
@@ -2389,7 +2455,8 @@ def _consume_tageskurs_pnl_adjustment(lot, adj_exact, adj_date):
     return adjustment
 
 
-def _run_zufluss_fifo(series_events, tax_year, on_prior_close, on_current_open):
+def _run_zufluss_fifo(series_events, tax_year, on_prior_close, on_current_open,
+                       on_consume=None):
     """FIFO ueber die vollstaendige Series-Historie bis zum Steuerjahresende.
 
     Aktuelle Rueckkaeufe verbrauchen zuerst noch offene Vorjahres-Sells; so
@@ -2412,7 +2479,10 @@ def _run_zufluss_fifo(series_events, tax_year, on_prior_close, on_current_open):
     Lots, die am Jahresende offen bleiben und im Steuerjahr verkauft wurden,
     melden on_current_open(key, sell_trade, remaining_qty) (Zufluss, §11 EStG).
 
-    Effekte laufen ausschliesslich ueber die beiden Callbacks; Rueckgabewert
+    Effekte laufen ueber die Callbacks. on_consume erhaelt fuer jeden FIFO-
+    Verbrauch (SELL, Close, alte und neue Kontraktmenge, Exact-Key-Flag);
+    damit kann der Assignment-Pfad dieselbe Split-Zuordnung wiederverwenden.
+    Rueckgabewert
     ist occ_rename_matches (Transparenz-Tracking fuer OCC-Umbenennungen und
     conid-basierte Split-Zuordnungen in Konsole/GUI).
     """
@@ -2503,6 +2573,10 @@ def _run_zufluss_fifo(series_events, tax_year, on_prior_close, on_current_open):
                             )
 
                     sell_date = parse_date(lot['trade'].get('reportDate') or lot['trade'].get('dateTime') or lot['trade'].get('tradeDate'))
+                    if on_consume is not None:
+                        on_consume(
+                            lot['trade'], ev, take, close_take, exact_match
+                        )
                     if is_buy_close and ev_date.year == tax_year and sell_date and sell_date.year < tax_year:
                         on_prior_close(lot['key'], lot['trade'], take)
                     if not exact_match:
@@ -2546,6 +2620,61 @@ def _run_zufluss_fifo(series_events, tax_year, on_prior_close, on_current_open):
                 on_current_open(lot['key'], lot['trade'], lot['remaining'])
 
     return occ_rename_matches
+
+
+def _collect_assignment_fifo_matches(trades, tax_year):
+    """Ermittelt splitfaehige FIFO-Slices fuer Andienungen im Steuerjahr.
+
+    Der Zufluss-FIFO kennt bereits Buybacks, Verfaelle und fruehere
+    Andienungen. Durch Wiederverwendung desselben Konsum-States kann eine
+    Andienung nach Kapitalmassnahme nicht dieselben Original-SELLs erneut
+    beanspruchen. Rueckgabe:
+      - {id(assignment_row): [{sell, sell_quantity, assignment_quantity}]}
+      - Set der conid-Identitaeten, deren Terms sich im Verlauf geaendert haben.
+    """
+    series_events, _ = _collect_option_series_events(trades, tax_year)
+    keys_by_identity = defaultdict(set)
+    for key, events in series_events.items():
+        for event in events:
+            keys_by_identity[_option_match_identity(event)].add(key)
+    adjusted_identities = {
+        identity for identity, keys in keys_by_identity.items()
+        if identity[0] == 'CONID' and len(keys) > 1
+    }
+
+    assignment_matches = defaultdict(list)
+
+    def _record_assignment_consume(sell, close, sell_qty, assignment_qty,
+                                   exact_match):
+        close_date = parse_date(
+            close.get('reportDate')
+            or close.get('dateTime')
+            or close.get('tradeDate')
+        )
+        is_assignment = (
+            close.get('transactionType') == 'BookTrade'
+            and close.get('buySell') == 'BUY'
+            and abs(safe_float(close.get('fifoPnlRealized'))) < 0.01
+            and close_date is not None
+            and close_date.year == tax_year
+        )
+        if not is_assignment:
+            return
+        assignment_matches[id(close)].append({
+            'sell': sell,
+            'sell_quantity': sell_qty,
+            'assignment_quantity': assignment_qty,
+            'exact_match': exact_match,
+        })
+
+    _run_zufluss_fifo(
+        series_events,
+        tax_year,
+        on_prior_close=lambda _key, _sell, _qty: None,
+        on_current_open=lambda _key, _sell, _qty: None,
+        on_consume=_record_assignment_consume,
+    )
+    return dict(assignment_matches), adjusted_identities
 
 
 def _collect_option_assignments(trades, tax_year):
@@ -3045,6 +3174,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         key=lambda t: (t.get('dateTime', '') or t.get('tradeDate', '') or t.get('reportDate', '') or '')
     )
     _current_year_series_state = {}  # {(a_cat, underlying, strike, expiry, putCall): originals_state}
+    _assignment_fifo_matches, _adjusted_assignment_identities = \
+        _collect_assignment_fifo_matches(trades, tax_year)
 
     for a in opt_assignments_sorted:
         strike = a.get('strike')
@@ -3060,6 +3191,60 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # strike/expiry-Kombination haben (z.B. KWEB P 30 vs FXI P 30).
         a_underlying = a.get('underlyingSymbol', '')
         series_key = (a_cat, a_underlying, strike, expiry, pc)
+        assignment_identity = _option_match_identity(a)
+        uses_adjusted_terms = (
+            assignment_identity in _adjusted_assignment_identities
+        )
+
+        if uses_adjusted_terms:
+            fifo_matches = _assignment_fifo_matches.get(id(a), [])
+            if not fifo_matches:
+                symbol = a.get('symbol', f"{strike} {expiry} {pc}")
+                print(f"  Stillhalter: Kein Original-SELL gefunden für {symbol} {expiry} {pc}")
+                stillhalter_unmatched.append({
+                    'symbol': symbol,
+                    'strike': strike,
+                    'expiry': expiry,
+                    'putCall': pc,
+                    'quantity': a_qty,
+                    'dateTime': a.get('dateTime', a.get('tradeDate', ''))
+                })
+                continue
+
+            # Fuer Aktienrouting zaehlt die neue Kontraktmenge der Andienung.
+            # Die Praemie selbst wird aus Menge und Multiplikator der alten
+            # SELL-Slices rekonstruiert.
+            mult_value = safe_float(a.get('multiplier'), 0.0)
+            if mult_value <= 0:
+                mult_value = safe_float(
+                    fifo_matches[0]['sell'].get('multiplier'), 100
+                )
+            mult = int(mult_value)
+            (
+                premium_raw,
+                commission_raw,
+                fx_weighted,
+                premium_eur,
+                sells_consumed,
+                consumed_qty,
+            ) = _consume_assignment_fifo_matches(
+                fifo_matches,
+                mult,
+                base_currency,
+                usd_to_eur_rates,
+            )
+            if consumed_qty == 0 or premium_raw == 0:
+                continue
+            stillhalter_premium_eur += premium_eur
+            stillhalter_count += 1
+            stillhalter_details.extend(
+                _build_stillhalter_details_for_assignment(
+                    a, strike, expiry, pc, a_qty, mult, tax_year,
+                    sells_consumed, premium_raw, commission_raw, premium_eur,
+                    base_currency, usd_to_eur_rates,
+                )
+            )
+            continue
 
         if series_key not in _current_year_series_state:
             assign_qty_series = sum(

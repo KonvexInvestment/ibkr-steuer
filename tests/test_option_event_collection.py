@@ -10,6 +10,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from calculate_tax_report import (
+    _collect_assignment_fifo_matches,
     _collect_option_assignments,
     _collect_option_series_events,
     _detect_zufluss_unmatched,
@@ -271,6 +272,61 @@ def test_fifo_cross_year_split_corrects_full_prior_premium():
     print("  OK  FIFO: Cross-Year-Split konsumiert die volle Vorjahrespraemie")
 
 
+def test_assignment_fifo_reuses_split_allocation():
+    """Eine Andienung erhaelt alte und neue Menge aus demselben Split-FIFO."""
+    sell, assignment = _xle_split_rows()
+    assignment.update({
+        'transactionType': 'BookTrade',
+        'fifoPnlRealized': '0',
+    })
+
+    matches_by_assignment, adjusted_identities = \
+        _collect_assignment_fifo_matches([sell, assignment], 2025)
+
+    assert len(adjusted_identities) == 1
+    matches = matches_by_assignment.get(id(assignment), [])
+    assert len(matches) == 1
+    assert matches[0]['sell'] is sell
+    assert abs(matches[0]['sell_quantity'] - 1.0) < 0.0000001
+    assert abs(matches[0]['assignment_quantity'] - 2.0) < 0.0000001
+    assert matches[0]['exact_match'] is False
+    print("  OK  Assignment-FIFO: 1 alter Kontrakt wird 2 neuen zugeordnet")
+
+
+def test_assignment_fifo_partial_assignments_share_original_lot():
+    """Zwei Teilandienungen duerfen den alten SELL zusammen nur einmal nutzen."""
+    sell, first = _xle_split_rows(
+        close_quantity='1',
+        close_cost='59.616555',
+    )
+    first.update({
+        'transactionType': 'BookTrade',
+        'fifoPnlRealized': '0',
+        'reportDate': '2025-12-29',
+    })
+    second = dict(first)
+    second['reportDate'] = '2025-12-30'
+
+    matches_by_assignment, adjusted_identities = \
+        _collect_assignment_fifo_matches([sell, first, second], 2025)
+
+    assert len(adjusted_identities) == 1
+    first_matches = matches_by_assignment.get(id(first), [])
+    second_matches = matches_by_assignment.get(id(second), [])
+    assert len(first_matches) == 1
+    assert len(second_matches) == 1
+    assert abs(first_matches[0]['sell_quantity'] - 0.5) < 0.0000001
+    assert abs(second_matches[0]['sell_quantity'] - 0.5) < 0.0000001
+    assert abs(first_matches[0]['assignment_quantity'] - 1.0) < 0.0000001
+    assert abs(second_matches[0]['assignment_quantity'] - 1.0) < 0.0000001
+    assert abs(sum(
+        match['sell_quantity']
+        for matches in matches_by_assignment.values()
+        for match in matches
+    ) - 1.0) < 0.0000001
+    print("  OK  Assignment-FIFO: Teilandienungen teilen sich den alten Lot")
+
+
 def test_fifo_same_terms_different_conid_stay_separate():
     """Gleiche Terms mit anderer conid duerfen nicht account-intern kollidieren."""
     sell = _series_row(
@@ -405,6 +461,8 @@ if __name__ == '__main__':
     test_fifo_split_uses_conid_and_cost_basis()
     test_fifo_split_partial_close_leaves_proportional_open_premium()
     test_fifo_cross_year_split_corrects_full_prior_premium()
+    test_assignment_fifo_reuses_split_allocation()
+    test_assignment_fifo_partial_assignments_share_original_lot()
     test_fifo_same_terms_different_conid_stay_separate()
     test_fifo_changed_terms_without_cost_evidence_do_not_match()
     test_fifo_exact_conid_uses_contract_quantity()

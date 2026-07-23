@@ -1928,6 +1928,114 @@ def test_option_split_matches_by_conid_and_cost_basis():
     print("    Kein falscher Zufluss und keine unmatched-Warnung")
 
 
+def test_split_call_assignment_reclassifies_premium_and_stock_pnl():
+    """TC37: Split-Andienung nutzt alte Praemie und neue Aktienmenge."""
+    sell = make_sell(
+        "2025-12-04", 1, 1.20, strike="88", expiry="2026-01-16",
+        pc="C", underlying="XLE", commission=-0.76689,
+    )
+    sell.update({
+        "accountId": "TEST",
+        "conid": "653278898",
+        "symbol": "XLE   260116C00088000",
+        "cost": "-119.23311",
+    })
+    assignment = make_assignment(
+        "2025-12-30", 2, strike="44", expiry="2026-01-16",
+        pc="C", underlying="XLE",
+    )
+    assignment.update({
+        "accountId": "TEST",
+        "conid": "653278898",
+        "symbol": "XLE   260116C00044000",
+        "cost": "119.23311",
+    })
+    stock_sale = _stock_sell_row(
+        "xle_split_call_sale", "XLE", "2025-12-30", 200,
+        319.23311, 8480.76689, 8800.0, transaction_type="BookTrade",
+    )
+
+    rd = calculate_for_trades(
+        [sell, assignment, stock_sale], tax_year=2025,
+    )
+    audit = rd.get("audit", {})
+
+    assert audit.get("stillhalter_unmatched", []) == []
+    assert audit.get("stillhalter_corrections_dropped", []) == []
+    details = audit.get("stillhalter_details", [])
+    assert len(details) == 1
+    assert_close(details[0]["quantity"], 2.0,
+                 label="TC37 neue Kontraktzahl")
+    assert_close(details[0]["premium_raw"], 119.23311,
+                 label="TC37 alte Gesamtpraemie")
+    assert_close(rd.get("options_gain_eur", 0), 119.23311,
+                 label="TC37 options_gain")
+    assert_close(rd.get("stocks_gain_eur", 0), 200.0,
+                 label="TC37 stocks_gain")
+
+    stock_rows = [
+        row for row in rd["trade_details"]
+        if row.get("symbol") == "XLE"
+        and row.get("source") == "trades"
+        and row.get("buySell") == "SELL"
+    ]
+    assert len(stock_rows) == 1
+    assert stock_rows[0].get("stillhalter_adjusted")
+    assert_close(stock_rows[0]["fifoPnlRealized"], 200.0,
+                 label="TC37 Aktien-PnL ohne Praemie")
+
+    matches = audit.get("occ_rename_matches", [])
+    assert len(matches) == 1 and matches[0].get("match_type") == "split"
+    assert_close(matches[0].get("ratio"), 2.0,
+                 label="TC37 Split-Verhaeltnis")
+
+    print("  TC37 Split-Call-Andienung: alte Praemie auf 2 neue Kontrakte verteilt: OK")
+    print("    Optionspraemie 119.23 EUR, Aktien-PnL 319.23 -> 200.00 EUR")
+
+
+def test_cross_year_split_put_assignment_uses_new_contract_quantity():
+    """TC38: Vorjahres-Praemie bleibt bei Split-Put-Andienung korrekt zugeordnet."""
+    sell = make_sell(
+        "2024-12-04", 1, 1.20, strike="88", expiry="2026-01-16",
+        pc="P", underlying="XLE", commission=-0.76689,
+    )
+    sell.update({
+        "accountId": "TEST",
+        "conid": "653278898",
+        "symbol": "XLE   260116P00088000",
+        "cost": "-119.23311",
+    })
+    assignment = make_assignment(
+        "2025-12-30", 2, strike="44", expiry="2026-01-16",
+        pc="P", underlying="XLE",
+    )
+    assignment.update({
+        "accountId": "TEST",
+        "conid": "653278898",
+        "symbol": "XLE   260116P00044000",
+        "cost": "119.23311",
+    })
+
+    rd = calculate_for_trades([sell, assignment], tax_year=2025)
+    audit = rd.get("audit", {})
+
+    assert audit.get("stillhalter_unmatched", []) == []
+    details = audit.get("stillhalter_details", [])
+    assert len(details) == 1
+    assert_close(details[0]["quantity"], 2.0,
+                 label="TC38 neue Put-Kontraktzahl")
+    assert details[0]["is_cross_year"] is True
+    assert_close(details[0]["premium_raw"], 119.23311,
+                 label="TC38 Vorjahrespraemie")
+    assert_close(audit.get("cross_year_premium_eur", 0), 119.23311,
+                 label="TC38 cross_year_premium")
+    assert_close(audit.get("put_nosell_premium_eur", 0), 119.23311,
+                 label="TC38 put_nosell")
+
+    print("  TC38 Split-Put-Andienung: Vorjahrespraemie korrekt auf 2 Kontrakte: OK")
+    print("    Voller Zufluss 119.23 EUR bleibt dem Verkaufsjahr 2024 zugeordnet")
+
+
 if __name__ == "__main__":
     test_cross_year_put_series()
     test_cross_year_call_series()
@@ -1965,4 +2073,6 @@ if __name__ == "__main__":
     test_occ_family_prefers_exact_series()
     test_fop_digit_suffix_not_grouped()
     test_option_split_matches_by_conid_and_cost_basis()
-    print("\nOK: alle 36 TCs gruen")
+    test_split_call_assignment_reclassifies_premium_and_stock_pnl()
+    test_cross_year_split_put_assignment_uses_new_contract_quantity()
+    print("\nOK: alle 38 TCs gruen")
