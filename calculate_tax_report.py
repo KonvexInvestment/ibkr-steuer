@@ -13,10 +13,15 @@ def load_csv(filepath):
         return list(csv.DictReader(f))
 
 def parse_date(date_str):
-    # Formats: 2025-01-01 or 2025-01-01 20:20:00
+    """Parst IBKR-Datumsfelder (2025-01-01 oder 2025-01-01 20:20:00).
+
+    Liefert None fuer leere/unparsbare Werte — Aufrufer behandeln None als
+    "kein Datum". Nur erwartbare Parse-Fehler werden gefangen; System-
+    Exceptions (KeyboardInterrupt etc.) laufen durch.
+    """
     try:
         return datetime.strptime(date_str[:10], '%Y-%m-%d').date()
-    except:
+    except (ValueError, TypeError):
         return None
 
 def safe_float(val, default=0.0):
@@ -695,6 +700,10 @@ def get_exchange_rates(trades, funds):
     RATE_MIN, RATE_MAX = 0.70, 1.30  # plausible USD-per-EUR bounds
 
     rates = {}
+    # Unparsbare EUR-Zeilen (kaputte fx-/Datumswerte) duerfen nicht still aus
+    # der Rate-Map fallen — get_rate_for_date wuerde sonst kommentarlos auf
+    # den Vortageskurs ausweichen. Zaehler geht als Wert an den Aufrufer.
+    parse_failures = {'funds': 0, 'trades': 0}
 
     # funds first (lower priority — may contain bogus fxRateToBase=1 entries)
     for r in funds:
@@ -708,10 +717,15 @@ def get_exchange_rates(trades, funds):
                 if abs(rate - 1.0) < 0.001:
                     continue  # Skip bogus EUR-native bookings (fxRateToBase=1.0)
                 eur_per_usd = 1.0 / rate
-                if RATE_MIN < eur_per_usd < RATE_MAX:
+                if d is None:
+                    # Kurs waere nutzbar, aber ohne Datum nicht zuordenbar —
+                    # niemals unter None ablegen (get_rate_for_date wuerde beim
+                    # naechsten Datums-Miss an sorted() mit None-Key crashen).
+                    parse_failures['funds'] += 1
+                elif RATE_MIN < eur_per_usd < RATE_MAX:
                     rates[d] = eur_per_usd
-            except:
-                pass
+            except (ValueError, TypeError, ZeroDivisionError):
+                parse_failures['funds'] += 1
 
     # trades second — overwrite any fund rate for the same date (trades are more reliable)
     for r in trades:
@@ -723,12 +737,14 @@ def get_exchange_rates(trades, funds):
             try:
                 rate = float(fx)
                 eur_per_usd = 1.0 / rate
-                if RATE_MIN < eur_per_usd < RATE_MAX:
+                if d is None:
+                    parse_failures['trades'] += 1
+                elif RATE_MIN < eur_per_usd < RATE_MAX:
                     rates[d] = eur_per_usd
-            except:
-                pass
+            except (ValueError, TypeError, ZeroDivisionError):
+                parse_failures['trades'] += 1
 
-    return rates
+    return rates, parse_failures
 
 def fetch_ecb_rates(tax_year):
     """Statische EZB-Referenzkurse USD→EUR für das Steuerjahr laden.
@@ -2023,6 +2039,615 @@ def _put_assignment_lot_cost_correction_per_share(closed_lots, det, underlying, 
     return default_per_share
 
 
+def _apply_stillhalter_row_correction(row, total_correction_raw, base_currency,
+                                      usd_to_eur_rates):
+    """Wendet eine Stillhalter-Prämien-Korrektur auf eine Stock-Trade-Row an.
+
+    Gemeinsamer Kern des Same-Year- und des Cross-Year-Apply-Loops: stellt die
+    von IBKR um die Prämie reduzierte Kostenbasis wieder her (beide Vorzeichen),
+    zieht die Prämie aus fifoPnlRealized, rechnet pnl_eur zum Row-FX neu
+    (EUR-Base direkt, USD-Base mit Tageskurs des Trade-Datums) und markiert die
+    Row als stillhalter_adjusted. Mutiert ausschließlich die übergebene Row.
+
+    Returns correction_eur = pnl_eur vor der Korrektur minus pnl_eur danach.
+    """
+    original_pnl_eur = row['pnl_eur']
+    # IBKR reduced absolute cost by premium → restore it
+    if row['cost'] >= 0:
+        row['cost'] += total_correction_raw
+    else:
+        row['cost'] -= total_correction_raw
+    row['fifoPnlRealized'] -= total_correction_raw
+    row['stillhalter_adjustment_raw'] = (
+        safe_float(row.get('stillhalter_adjustment_raw'), 0.0)
+        + total_correction_raw
+    )
+    fx = row.get('fxRateToBase', 1.0)
+    if base_currency == 'EUR':
+        row['pnl_eur'] = round(row['fifoPnlRealized'] * fx, 5)
+    else:
+        d = parse_date(row.get('dateTime', ''))
+        r_eur = get_rate_for_date(d, usd_to_eur_rates)
+        row['pnl_eur'] = round(row['fifoPnlRealized'] * fx * r_eur, 5)
+    row['stillhalter_adjusted'] = True
+    return original_pnl_eur - row['pnl_eur']
+
+
+def _split_stillhalter_correction(correction_eur, original_pnl_eur, row_cls,
+                                  is_etf_isin):
+    """Brutto-Split und Pool-Zuordnung einer Stillhalter-Korrektur.
+
+    Gemeinsame Klassifikations-Logik des Same-Year- und Cross-Year-Apply-Loops
+    (Issue #23-Pattern): der EUR-Korrekturbetrag wird zuerst gegen den
+    urspruenglichen Gewinn gebucht, der Rest gegen den Verlust-Bucket.
+
+    Returns (bucket, from_gain, from_loss) mit bucket in
+    ('anlage_so', 'etf', 'no_invstg', 'stk'). Der Aufrufer wendet die Betraege
+    auf seine jeweiligen Akkumulatoren an.
+    """
+    if original_pnl_eur > 0:
+        from_gain = min(correction_eur, original_pnl_eur)
+        from_loss = correction_eur - from_gain
+    else:
+        from_gain = 0.0
+        from_loss = correction_eur
+    if is_etf_isin and row_cls == 'anlage_so':
+        bucket = 'anlage_so'
+    elif is_etf_isin and row_cls not in ('no_invstg', 'anlage_so'):
+        bucket = 'etf'
+    elif row_cls == 'no_invstg':
+        bucket = 'no_invstg'
+    else:
+        bucket = 'stk'
+    return bucket, from_gain, from_loss
+
+
+def _option_key(t):
+    """Series-Key einer Options-Row: (assetCategory, underlying, strike, expiry, putCall)."""
+    return (t.get('assetCategory'), t.get('underlyingSymbol', ''),
+            t.get('strike'), t.get('expiry'), t.get('putCall'))
+
+
+def _occ_family_key(key):
+    """Familien-Key fuer OCC-adjusted Serien (MMM1-Fix, TC33-35).
+
+    OCC-adjusted Serien nach Kapitalmassnahmen (Spinoff/Merger) haengen eine
+    Ziffer an das Underlying an (MMM -> MMM1), strike/expiry/putCall bleiben
+    identisch. IBKRs eigenes FIFO verknuepft Close und Open ueber die
+    Umbenennung hinweg (fifoPnlRealized enthaelt die Praemie) — ohne
+    Familien-Matching gilt der Original-SELL faelschlich als offen und die
+    Praemie wird doppelt erfasst (Zufluss + Rueckkauf-PnL). Nur fuer OPT:
+    FOP-Underlyings (z.B. ESZ4) tragen legitime Ziffern-Suffixe.
+    """
+    if key[0] != 'OPT':
+        return key
+    und = key[1] or ''
+    root = und.rstrip('0123456789')
+    return (key[0], root or und, key[2], key[3], key[4])
+
+
+def _option_match_identity(t):
+    """Stabile Matching-Identitaet fuer Stillhalter-Events.
+
+    Bei Aktienoptionen ist IBKRs conid die belastbarste Serienidentitaet:
+    sie bleibt auch dann gleich, wenn ein Split Strike und Kontraktzahl
+    veraendert. Ohne conid bleibt das bisherige OCC-Familien-Matching aktiv.
+    accountId verhindert account-uebergreifende FIFO-Verknuepfungen.
+    """
+    category = t.get('assetCategory')
+    conid = str(t.get('conid') or '').strip()
+    if category == 'OPT' and conid:
+        return ('CONID', str(t.get('accountId') or '').strip(), category, conid)
+    return ('FAMILY',) + _occ_family_key(_option_key(t))
+
+
+def _option_split_terms_compatible(open_trade, close_trade):
+    """Konservative Plausibilitaet fuer conid-Matches mit geaenderten Terms."""
+    if _option_match_identity(open_trade) != _option_match_identity(close_trade):
+        return False
+    if _option_key(open_trade) == _option_key(close_trade):
+        return True
+    if not (open_trade.get('cost') and close_trade.get('cost')):
+        return False
+    return (
+        open_trade.get('assetCategory') == 'OPT'
+        and open_trade.get('expiry') == close_trade.get('expiry')
+        and open_trade.get('putCall') == close_trade.get('putCall')
+        and abs(safe_float(open_trade.get('cost'))) > 0.0000001
+        and abs(safe_float(close_trade.get('cost'))) > 0.0000001
+    )
+
+
+def _option_sort_key(t):
+    """Chronologischer Sortier-Key: dateTime > tradeDate > reportDate."""
+    return t.get('dateTime') or t.get('tradeDate') or t.get('reportDate') or ''
+
+
+def _collect_option_series_events(trades, tax_year):
+    """Sammelt die Zufluss-FIFO-relevanten Options-Events pro Series-Key.
+
+    Drei Event-Klassen bis einschliesslich Steuerjahresende: SELL-to-open
+    (ExchTrade SELL, PnL ≈ 0), ExchTrade-BUY-Close (PnL ≠ 0) und BookTrade-BUY
+    (Assignment ODER Verfall — die Unterscheidung trifft erst die FIFO-Loop
+    anhand des PnL). Reine Funktion: liefert
+    (series_events: dict key -> [rows in trades-Reihenfolge],
+     all_sell_open_keys: Set der Keys mit mindestens einem SELL-to-open).
+    """
+    series_events = defaultdict(list)
+    all_sell_open_keys = set()
+    for t in trades:
+        if t.get('assetCategory') not in ('OPT', 'FOP', 'FSFOP'):
+            continue
+        rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
+        if not rd or rd.year > tax_year:
+            continue
+        key = _option_key(t)
+        if (t.get('transactionType') == 'ExchTrade' and t.get('buySell') == 'SELL'
+                and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01):
+            series_events[key].append(t)
+            all_sell_open_keys.add(key)
+        elif ((t.get('transactionType') == 'ExchTrade' and t.get('buySell') == 'BUY'
+               and abs(safe_float(t.get('fifoPnlRealized'))) >= 0.01)
+              or (t.get('transactionType') == 'BookTrade' and t.get('buySell') == 'BUY')):
+            series_events[key].append(t)
+    return series_events, all_sell_open_keys
+
+
+def _detect_zufluss_unmatched(trades, tax_year, all_sell_open_keys):
+    """Erkennt Glattstellungen ohne Eroeffnungs-SELL (fehlendes Vorjahres-XML).
+
+    Close-Definition identisch zu is_buy_close im Zufluss-FIFO: jeder BUY mit
+    realisierter PnL (ExchTrade-Buyback ODER BookTrade-Verfall); Assignments
+    (PnL ≈ 0) fallen durch den PnL-Filter. Familien-Check analog zum FIFO:
+    ein Close unter einer OCC-umbenannten Serie (MMM1) gilt als gematcht, wenn
+    die Original-Serie (MMM) einen Eroeffnungs-SELL hat. Ohne Vorjahres-XML
+    bleibt die Praemie doppelt versteuert — deshalb die Warnung.
+
+    Reine Funktion: liefert die Liste der Warn-Eintraege (dedupliziert pro
+    Serie, Reihenfolge = trades-Reihenfolge).
+    """
+    zufluss_unmatched = []
+    all_sell_open_family_keys = {_occ_family_key(k) for k in all_sell_open_keys}
+    open_sells_by_identity = defaultdict(list)
+    for t in trades:
+        if t.get('assetCategory') not in ('OPT', 'FOP', 'FSFOP'):
+            continue
+        rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
+        if not rd or rd.year > tax_year:
+            continue
+        if (t.get('transactionType') == 'ExchTrade' and t.get('buySell') == 'SELL'
+                and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01):
+            open_sells_by_identity[_option_match_identity(t)].append(t)
+
+    for t in trades:
+        if t.get('assetCategory') not in ('OPT', 'FOP', 'FSFOP'):
+            continue
+        if t.get('buySell') != 'BUY':
+            continue
+        if abs(safe_float(t.get('fifoPnlRealized'))) < 0.01:
+            continue  # Opening BUY oder Assignment, not a taxable close
+        rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
+        if not rd or rd.year != tax_year:
+            continue
+        key = (t.get('assetCategory'), t.get('underlyingSymbol', ''),
+               t.get('strike'), t.get('expiry'), t.get('putCall'))
+        identity = _option_match_identity(t)
+        if identity[0] == 'CONID':
+            matched = any(
+                _option_split_terms_compatible(open_trade, t)
+                for open_trade in open_sells_by_identity.get(identity, [])
+            )
+        else:
+            matched = (
+                key in all_sell_open_keys
+                or _occ_family_key(key) in all_sell_open_family_keys
+            )
+        if not matched:
+            symbol = t.get('symbol') or t.get('description') or f"{key[1]} {key[2]} {key[3]} {key[4]}"
+            # Avoid duplicate warnings for same instrument
+            if not any(u.get('underlyingSymbol', '') == key[1]
+                       and u['strike'] == key[2]
+                       and u['expiry'] == key[3]
+                       and u['putCall'] == key[4]
+                       for u in zufluss_unmatched):
+                zufluss_unmatched.append({
+                    'symbol': symbol,
+                    'underlyingSymbol': key[1],
+                    'strike': key[2],
+                    'expiry': key[3],
+                    'putCall': key[4],
+                    'quantity': abs(int(safe_float(t.get('quantity')))),
+                })
+    return zufluss_unmatched
+
+
+def _build_tageskurs_put_adjustments(stillhalter_details, xy_tageskurs_lots):
+    """Baut die FIFO-Lots fuer den Put-Praemien-Restore der Aktien-Kostenbasis.
+
+    IBKR bettet bei Put-Andienungen die Stillhalterpraemie in die Aktien-
+    Kostenbasis ein (cost = (strike - praemie) * qty). Fuer die Tageskurs-
+    Formel muss die Praemie zurueckaddiert werden (cost_raw = strike * qty).
+    Quellen: Same-Year-Andienungen aus stillhalter_details (nur putCall='P')
+    und Cross-Year-Andienungen aus xy_tageskurs_lots (dort unter FIFO-Logik
+    gespeichert, Issue #54/#55). Pro Symbol nach Datum sortierte deque (FIFO).
+
+    Reine Funktion: liefert {underlying: deque of
+    {date, shares_remaining, premium_per_share_raw}}.
+    """
+    put_adj = {}
+    for det in stillhalter_details:
+        if det.get('putCall') != 'P':
+            continue  # Only put assignments embed premium in stock COST basis
+        underlying = det['symbol'].split()[0] if det['symbol'] else ''
+        if not underlying:
+            continue
+        mult = det.get('multiplier', 100)
+        shares = det['quantity'] * mult
+        if shares <= 0 or det['premium_raw'] <= 0:
+            continue
+        a_date = (det.get('assignment_date') or '')[:10]
+        put_adj.setdefault(underlying, deque()).append({
+            'date': a_date,
+            'shares_remaining': shares,
+            'premium_per_share_raw': det['premium_raw'] / shares,
+        })
+    for sym, snap_lots in xy_tageskurs_lots.items():
+        for snap in snap_lots:
+            if snap['shares'] <= 0:
+                continue
+            put_adj.setdefault(sym, deque()).append({
+                'date': snap['date_str'],
+                'shares_remaining': snap['shares'],
+                'premium_per_share_raw': snap['premium_per_share_raw'],
+            })
+    # Sort each symbol's lots by date (FIFO)
+    for sym in put_adj:
+        put_adj[sym] = deque(sorted(put_adj[sym], key=lambda x: x['date']))
+    return put_adj
+
+
+def _tageskurs_close_timestamp(row):
+    """Normalisierter Close-Timestamp (YYYY-MM-DD HH:MM:SS) einer Trade-/Lot-Row."""
+    value = (row.get('dateTime') or row.get('reportDate') or '').replace(';', ' ')
+    return value[:19]
+
+
+def _build_tageskurs_pnl_adjustment_maps(debug_rows):
+    """Baut die Per-Share-Korrektur-Maps fuer die Tageskurs-Bruttozuordnung.
+
+    Gross gain/loss buckets muessen die tatsaechlich auf die Trade-Row
+    angewandte Stillhalter-Korrektur nutzen (stillhalter_adjustment_raw) —
+    Cost-Basis-Restore ist verwandt, aber nicht identisch. Die Entries werden
+    unter zwei Keys abgelegt: exakter Timestamp (Symbol, Timestamp, Side) und
+    Same-Day (Symbol, Datum, Side) fuer konsolidierte CLOSED_LOTs. Beide Maps
+    teilen DIESELBEN Entry-Objekte — ein exakter Slice kann darum nicht
+    doppelt konsumiert werden.
+
+    Returns (adj_exact, adj_date).
+    """
+    adj_exact = {}
+    adj_date = {}
+    for row in debug_rows:
+        adjustment_raw = safe_float(row.get('stillhalter_adjustment_raw'), 0.0)
+        if row.get('source') != 'trades' or row.get('assetCategory') != 'STK' \
+                or adjustment_raw <= 0:
+            continue
+        quantity = abs(safe_float(row.get('quantity'), 0.0))
+        symbol = _symbol_root(row.get('underlyingSymbol') or row.get('symbol'))
+        close_timestamp = _tageskurs_close_timestamp(row)
+        side = (row.get('buySell') or '').upper()
+        if quantity <= 0 or not symbol or not close_timestamp:
+            continue
+        entry = {
+            'remaining_shares': quantity,
+            'adjustment_per_share_raw': adjustment_raw / quantity,
+        }
+        exact_key = (symbol, close_timestamp, side)
+        date_key = (symbol, close_timestamp[:10], side)
+        adj_exact.setdefault(exact_key, []).append(entry)
+        adj_date.setdefault(date_key, []).append(entry)
+    return adj_exact, adj_date
+
+
+def _consume_tageskurs_pnl_adjustment(lot, adj_exact, adj_date):
+    """Konsumiert die Stillhalter-Korrektur eines CLOSED_LOTs quantity-proportional.
+
+    Exakter Timestamp zuerst; Same-Day-Fallback nur fuer den Rest (IBKR
+    konsolidiert mehrere Executions in groessere Lots). Mutiert die
+    remaining_shares der geteilten Entry-Objekte in beiden Maps.
+    Returns den Roh-Korrekturbetrag fuer diesen Lot.
+    """
+    quantity_signed = safe_float(lot.get('quantity'), 0.0)
+    remaining = abs(quantity_signed)
+    if remaining <= 0:
+        return 0.0
+    symbol = _symbol_root(lot.get('underlyingSymbol') or lot.get('symbol'))
+    close_timestamp = _tageskurs_close_timestamp(lot)
+    side = (lot.get('buySell') or '').upper()
+    if not side:
+        side = 'SELL' if quantity_signed >= 0 else 'BUY'
+    exact_key = (symbol, close_timestamp, side)
+    date_key = (symbol, close_timestamp[:10], side)
+    adjustment = 0.0
+
+    def consume(entries):
+        nonlocal adjustment, remaining
+        for entry in entries:
+            if remaining <= 0:
+                break
+            available = entry['remaining_shares']
+            if available <= 0:
+                continue
+            consumed = min(remaining, available)
+            adjustment += consumed * entry['adjustment_per_share_raw']
+            entry['remaining_shares'] -= consumed
+            remaining -= consumed
+
+    consume(adj_exact.get(exact_key, []))
+    if remaining > 0:
+        consume(adj_date.get(date_key, []))
+    return adjustment
+
+
+def _run_zufluss_fifo(series_events, tax_year, on_prior_close, on_current_open):
+    """FIFO ueber die vollstaendige Series-Historie bis zum Steuerjahresende.
+
+    Aktuelle Rueckkaeufe verbrauchen zuerst noch offene Vorjahres-Sells; so
+    werden aktuelle Sells nicht faelschlich als geschlossen behandelt und
+    Vorjahrespraemien nur fuer tatsaechlich im Steuerjahr geschlossene Lots
+    korrigiert. OPT-Serien mit conid laufen ueber diese stabile IBKR-Identitaet.
+    Bei durch Splits geaenderten Terms wird nach FIFO-Kostenbasis statt nach
+    Kontraktzahl konsumiert (z.B. 1x P88 -> 2x P44). Ohne conid bleibt die
+    bisherige OCC-Familie mit Exact-Key-Prioritaet aktiv.
+
+    Event-Klassifikation innerhalb der Loop:
+      - ExchTrade SELL, PnL ≈ 0  → neuer offener Lot
+      - BUY mit |PnL| ≥ 0.01     → steuerwirksame Schliessung (Buyback ODER
+        BookTrade-Verfall); konsumiert Vorjahres-Lots im Steuerjahr via
+        on_prior_close(key, sell_trade, qty)
+      - BookTrade-BUY mit PnL ≈ 0 (Assignment) → konsumiert Lots OHNE
+        on_prior_close (Cross-Year-Praemie erfasst
+        _build_stillhalter_details_for_assignment separat, sonst
+        Doppelkorrektur)
+    Lots, die am Jahresende offen bleiben und im Steuerjahr verkauft wurden,
+    melden on_current_open(key, sell_trade, remaining_qty) (Zufluss, §11 EStG).
+
+    Effekte laufen ausschliesslich ueber die beiden Callbacks; Rueckgabewert
+    ist occ_rename_matches (Transparenz-Tracking fuer OCC-Umbenennungen und
+    conid-basierte Split-Zuordnungen in Konsole/GUI).
+    """
+    event_groups = defaultdict(list)
+    for key, events in series_events.items():
+        for event in events:
+            event_groups[_option_match_identity(event)].append((key, event))
+
+    occ_rename_matches = []
+    epsilon = 0.0000001
+
+    for identity, events in event_groups.items():
+        conid_group = identity[0] == 'CONID'
+        open_lots = []
+        for k, ev in sorted(events, key=lambda pair: _option_sort_key(pair[1])):
+            ev_date = parse_date(ev.get('reportDate') or ev.get('dateTime') or ev.get('tradeDate'))
+            if not ev_date:
+                continue
+            if (ev.get('transactionType') == 'ExchTrade' and ev.get('buySell') == 'SELL'
+                    and abs(safe_float(ev.get('fifoPnlRealized'))) < 0.01):
+                qty = abs(safe_float(ev.get('quantity')))
+                if qty > 0:
+                    basis = abs(safe_float(ev.get('cost')))
+                    open_lots.append({
+                        'trade': ev,
+                        'remaining': qty,
+                        'original_quantity': qty,
+                        'remaining_basis': basis,
+                        'original_basis': basis,
+                        'key': k,
+                    })
+                continue
+
+            close_qty = abs(safe_float(ev.get('quantity')))
+            if close_qty <= 0:
+                continue
+            is_buy_close = (ev.get('buySell') == 'BUY'
+                            and abs(safe_float(ev.get('fifoPnlRealized'))) >= 0.01)
+            remaining_close = close_qty
+            close_basis = abs(safe_float(ev.get('cost')))
+            remaining_close_basis = close_basis
+            passes = (None,) if conid_group else (True, False)
+
+            for exact_pass in passes:
+                for lot in open_lots:
+                    if remaining_close <= epsilon:
+                        break
+                    if lot['remaining'] <= epsilon:
+                        continue
+                    exact_match = lot['key'] == k
+                    if exact_pass is not None and exact_match != exact_pass:
+                        continue
+                    if conid_group and not exact_match \
+                            and not _option_split_terms_compatible(lot['trade'], ev):
+                        continue
+
+                    basis_match = conid_group and not exact_match
+                    if basis_match:
+                        if (lot['remaining_basis'] <= epsilon
+                                or remaining_close_basis <= epsilon):
+                            continue
+                        take_basis = min(lot['remaining_basis'], remaining_close_basis)
+                        take_fraction = (
+                            take_basis / lot['original_basis']
+                            if lot['original_basis'] > epsilon else 0.0
+                        )
+                        take = lot['original_quantity'] * take_fraction
+                        close_take = remaining_close * (
+                            take_basis / remaining_close_basis
+                        )
+                        lot['remaining_basis'] -= take_basis
+                        remaining_close_basis -= take_basis
+                    else:
+                        take = min(lot['remaining'], remaining_close)
+                        close_take = take
+                        if lot['original_quantity'] > epsilon:
+                            lot['remaining_basis'] = max(
+                                0.0,
+                                lot['remaining_basis']
+                                - lot['original_basis']
+                                * take / lot['original_quantity'],
+                            )
+                        if close_qty > epsilon:
+                            remaining_close_basis = max(
+                                0.0,
+                                remaining_close_basis
+                                - close_basis * close_take / close_qty,
+                            )
+
+                    sell_date = parse_date(lot['trade'].get('reportDate') or lot['trade'].get('dateTime') or lot['trade'].get('tradeDate'))
+                    if is_buy_close and ev_date.year == tax_year and sell_date and sell_date.year < tax_year:
+                        on_prior_close(lot['key'], lot['trade'], take)
+                    if not exact_match:
+                        ratio = close_take / take if take > epsilon else 0.0
+                        if conid_group:
+                            match_type = (
+                                'split'
+                                if abs(ratio - 1.0) > epsilon
+                                else 'contract_adjustment'
+                            )
+                        else:
+                            match_type = 'occ_rename'
+                        occ_rename_matches.append({
+                            'match_type': match_type,
+                            'conid': identity[3] if conid_group else '',
+                            'sell_symbol': lot['trade'].get('symbol', ''),
+                            'sell_underlying': lot['key'][1],
+                            'sell_date': str(sell_date) if sell_date else '',
+                            'sell_strike': lot['key'][2],
+                            'close_symbol': ev.get('symbol', ''),
+                            'close_underlying': k[1],
+                            'close_date': str(ev_date),
+                            'close_strike': k[2],
+                            'strike': k[2],
+                            'expiry': k[3],
+                            'putCall': k[4],
+                            'quantity': take,
+                            'close_quantity': close_take,
+                            'ratio': ratio,
+                        })
+                    lot['remaining'] -= take
+                    remaining_close -= close_take
+                if remaining_close <= epsilon:
+                    break
+
+        for lot in open_lots:
+            if lot['remaining'] <= epsilon:
+                continue
+            sell_date = parse_date(lot['trade'].get('reportDate') or lot['trade'].get('dateTime') or lot['trade'].get('tradeDate'))
+            if sell_date and sell_date.year == tax_year:
+                on_current_open(lot['key'], lot['trade'], lot['remaining'])
+
+    return occ_rename_matches
+
+
+def _collect_option_assignments(trades, tax_year):
+    """Detection der Options-Andienungen (BMF Rn. 26 Call / Rn. 33 Put).
+
+    Kriterien: OPT/FOP/FSFOP + BookTrade + BUY (Schliessen einer Short-
+    Position) + putCall gesetzt + fifoPnlRealized ≈ 0 (IBKR bucht die Praemie
+    beim Assignment in den Aktien-Trade, nicht in den Options-BookTrade) +
+    Report-/Trade-Datum im Steuerjahr. Long-Exercises haben denselben
+    BookTrade-BUY, aber die Praemie ist dort Anschaffungskosten — sie werden
+    ueber die fehlenden offenen SELLs im Matching neutral behandelt.
+
+    Reine Funktion: liefert die gefilterten Trade-Rows in Original-
+    Reihenfolge (Aufrufer sortiert fuer den FIFO-Konsum, Issue #53).
+    """
+    return [t for t in trades
+            if t.get('assetCategory') in ('OPT', 'FOP', 'FSFOP')
+            and t.get('transactionType') == 'BookTrade'
+            and t.get('buySell') == 'BUY'      # closing a short position
+            and t.get('putCall') in ('C', 'P')  # both call and put assignments
+            and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01
+            and (d := parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))) is not None
+            and d.year == tax_year]             # only assignments in tax year
+
+
+def _write_trades_debug_csv(debug_rows, ib_tax_dir):
+    """Schreibt trades_debug_eur.csv (Diagnose-Export) in den Daten-Ordner.
+
+    Einziger Datei-Write im Berechnungspfad — bewusst als benannte Schalen-
+    Funktion isoliert statt inline in calculate_tax. Achtung: wird VOR den
+    Stillhalter-Korrekturen aufgerufen; die Rows werden danach in place
+    weiter mutiert, die Datei zeigt den Stand vor der Korrektur.
+    Unterstrich-Felder (interne Marker wie _trade_oid) bleiben ausgeschlossen.
+    """
+    debug_path = os.path.join(ib_tax_dir, 'trades_debug_eur.csv')
+    with open(debug_path, 'w', newline='', encoding='utf-8') as f:
+        export_fields = [k for k in debug_rows[0].keys() if not k.startswith('_')]
+        w = csv.DictWriter(f, fieldnames=export_fields, extrasaction='ignore')
+        w.writeheader()
+        w.writerows(debug_rows)
+    return debug_path
+
+
+def _dedupe_trades(all_trades):
+    """Dedupliziert Trade-Rows.
+
+    Key ist primaer tradeID (extended Flex Query) — verhindert falsches
+    Deduplizieren von Partial-Fills mit identischen Attributen. Fallback ohne
+    tradeID: Composite-Key aus dateTime/isin/buySell/quantity/closePrice/
+    fifoPnlRealized. Reine Funktion: mutiert nichts, liefert
+    (trades, duplicates_count).
+    """
+    unique_trades_set = set()
+    trades = []
+    duplicates_count = 0
+    for t in all_trades:
+        trade_id = t.get('tradeID', '').strip()
+        if trade_id:
+            key = (trade_id,)
+        else:
+            key = (
+                t.get('dateTime'),
+                t.get('isin'),
+                t.get('buySell'),
+                t.get('quantity'),
+                t.get('closePrice'),
+                t.get('fifoPnlRealized')
+            )
+        if key in unique_trades_set:
+            duplicates_count += 1
+            continue
+        unique_trades_set.add(key)
+        trades.append(t)
+    return trades, duplicates_count
+
+
+def _dedupe_funds(all_funds):
+    """Dedupliziert StmtFunds-Rows.
+
+    Key ist (transactionID, activityDescription) — IBKR buendelt mehrere
+    Aktivitaeten (z.B. Borrow Fees + SYEP Interest) unter derselben
+    transactionID; nur transactionID wuerde legitime Eintraege verwerfen.
+    Ohne transactionID zaehlt die komplette Row als Key. Reine Funktion:
+    mutiert nichts, liefert (funds, duplicates_count).
+    """
+    unique_funds_set = set()
+    funds = []
+    funds_duplicates = 0
+    for f in all_funds:
+        tid = f.get('transactionID')
+        if tid:
+            key = (tid, f.get('activityDescription', ''))
+        else:
+            key = tuple(f.items())
+        if key in unique_funds_set:
+            funds_duplicates += 1
+            continue
+        unique_funds_set.add(key)
+        funds.append(f)
+    return funds, funds_duplicates
+
+
 def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrides=None,
                   fx_margin_correction_enabled=True,
                   dba_wht_beta_enabled=False):
@@ -2050,33 +2675,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         if not os.path.exists(os.path.join(ib_tax_dir, 'trades.csv')):
             print("Hinweis: Keine trades.csv gefunden — die Flex Query XML enthält keine Trades im gewählten Zeitraum. "
                   "Es werden nur Dividenden, Zinsen und Quellensteuern ausgewertet.")
-    
-    unique_trades_set = set()
-    trades = []
-    duplicates_count = 0
-    
-    for t in all_trades:
-        # Create a unique key based on relevant fields
-        # Include tradeID when available (extended Flex Query) to avoid
-        # falsely deduplicating partial fills with identical attributes
-        trade_id = t.get('tradeID', '').strip()
-        if trade_id:
-            key = (trade_id,)
-        else:
-            key = (
-                t.get('dateTime'),
-                t.get('isin'),
-                t.get('buySell'),
-                t.get('quantity'),
-                t.get('closePrice'),
-                t.get('fifoPnlRealized')
-            )
-        if key in unique_trades_set:
-            duplicates_count += 1
-            continue
-        unique_trades_set.add(key)
-        trades.append(t)
-        
+
+    trades, duplicates_count = _dedupe_trades(all_trades)
     print(f"Loaded {len(all_trades)} trade rows. Removed {duplicates_count} duplicates. Unique trades: {len(trades)}")
 
     # Detect extended Flex Query (has tradePrice for accurate Stillhalter premium calc)
@@ -2087,35 +2687,24 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         print("Basis-Flex-Query erkannt (kein tradePrice — Stillhalterprämien nutzen closePrice als Näherung).")
 
     all_funds = load_csv(os.path.join(ib_tax_dir, 'statement_of_funds.csv'))
-    unique_funds_set = set()
-    funds = []
-    funds_duplicates = 0
-    
-    for f in all_funds:
-        # Use (transactionID, activityDescription) — IBKR bundles multiple items
-        # (e.g. Borrow Fees + SYEP Interest) under the same transactionID.
-        # Using only transactionID would drop legitimate entries.
-        tid = f.get('transactionID')
-        if tid:
-            key = (tid, f.get('activityDescription', ''))
-        else:
-            key = tuple(f.items())
-            
-        if key in unique_funds_set:
-            funds_duplicates += 1
-            continue
-        unique_funds_set.add(key)
-        funds.append(f)
-        
+    funds, funds_duplicates = _dedupe_funds(all_funds)
     print(f"Loaded {len(all_funds)} fund rows. Removed {funds_duplicates} duplicates. Unique funds: {len(funds)}")
     
     # 2. Build Exchange Rates (USD -> EUR) — only needed for USD-based accounts
     usd_to_eur_rates = {}
     ecb_rates_used = False
+    fx_rate_parse_failures = {'funds': 0, 'trades': 0}
     if base_currency == 'USD':
-        usd_to_eur_rates = get_exchange_rates(trades, funds)
+        usd_to_eur_rates, fx_rate_parse_failures = get_exchange_rates(trades, funds)
         ibkr_rate_count = len(usd_to_eur_rates)
         print(f"IBKR-Wechselkurse: {ibkr_rate_count} Tageskurse aus Transaktionsdaten.")
+        failed_rows = fx_rate_parse_failures['funds'] + fx_rate_parse_failures['trades']
+        if failed_rows:
+            print(f"WARNUNG: {failed_rows} EUR-Zeilen mit unparsbarem Kurs/Datum "
+                  f"nicht in die Wechselkurs-Map uebernommen "
+                  f"(funds: {fx_rate_parse_failures['funds']}, "
+                  f"trades: {fx_rate_parse_failures['trades']}). "
+                  f"Betroffene Tage nutzen EZB-/Vortageskurse.")
 
         # EZB-Referenzkurse als Ergänzung/Fallback laden (statisch eingebettet, kein Internet nötig)
         ecb_rates = fetch_ecb_rates(tax_year)
@@ -2418,13 +3007,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
 
     # Write debug CSV
     if debug_rows:
-        import csv as csv_mod
-        debug_path = os.path.join(ib_tax_dir, 'trades_debug_eur.csv')
-        with open(debug_path, 'w', newline='', encoding='utf-8') as f:
-            export_fields = [k for k in debug_rows[0].keys() if not k.startswith('_')]
-            w = csv_mod.DictWriter(f, fieldnames=export_fields, extrasaction='ignore')
-            w.writeheader()
-            w.writerows(debug_rows)
+        debug_path = _write_trades_debug_csv(debug_rows, ib_tax_dir)
         print(f"Debug: {len(debug_rows)} Trades mit EUR-Umrechnung → {debug_path}")
 
     # --- Stillhalterprämien: separate assigned option premiums from stock PnL ---
@@ -2446,14 +3029,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     stillhalter_open_short = []
     stillhalter_details = []
 
-    opt_assignments = [t for t in trades
-                       if t.get('assetCategory') in ('OPT', 'FOP', 'FSFOP')
-                       and t.get('transactionType') == 'BookTrade'
-                       and t.get('buySell') == 'BUY'      # closing a short position
-                       and t.get('putCall') in ('C', 'P')  # both call and put assignments
-                       and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01
-                       and (d := parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))) is not None
-                       and d.year == tax_year]             # only assignments in tax year
+    opt_assignments = _collect_option_assignments(trades, tax_year)
 
     # Issue #53: Bei mehreren Andienungen derselben Series werden die Original-Sells
     # FIFO konsumiert (aelteste zuerst), nicht als Durchschnitt verteilt. State pro
@@ -2825,52 +3401,29 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 corr['remaining_shares'] -= shares
                 remaining_by_side[side] -= shares
             if total_correction_raw > 0:
-                # IBKR reduced absolute cost by premium → restore it
-                if row['cost'] >= 0:
-                    row['cost'] += total_correction_raw
-                else:
-                    row['cost'] -= total_correction_raw
-                row['fifoPnlRealized'] -= total_correction_raw
-                row['stillhalter_adjustment_raw'] = (
-                    safe_float(row.get('stillhalter_adjustment_raw'), 0.0)
-                    + total_correction_raw
-                )
-                fx = row.get('fxRateToBase', 1.0)
-                if base_currency == 'EUR':
-                    row['pnl_eur'] = round(row['fifoPnlRealized'] * fx, 5)
-                else:
-                    d = parse_date(row.get('dateTime', ''))
-                    r_eur = get_rate_for_date(d, usd_to_eur_rates)
-                    row['pnl_eur'] = round(row['fifoPnlRealized'] * fx * r_eur, 5)
-                row['stillhalter_adjusted'] = True
+                correction_eur = _apply_stillhalter_row_correction(
+                    row, total_correction_raw, base_currency, usd_to_eur_rates)
 
                 # Per-trade gain/loss split (Issue #23 pattern)
-                correction_eur = original_pnl_eur - row['pnl_eur']
                 row_isin = row.get('isin', '')
                 _row_cls = _effective_classification(row_isin) if row_isin else None
-                is_so = bool(row_isin and row_isin in etf_isins and _row_cls == 'anlage_so')
-                is_etf = bool(row_isin and row_isin in etf_isins
-                              and _row_cls not in ('no_invstg', 'anlage_so'))
-                if original_pnl_eur > 0:
-                    from_gain = min(correction_eur, original_pnl_eur)
-                    from_loss = correction_eur - from_gain
-                else:
-                    from_gain = 0.0
-                    from_loss = correction_eur
-                if is_so:
+                bucket, from_gain, from_loss = _split_stillhalter_correction(
+                    correction_eur, original_pnl_eur, _row_cls,
+                    bool(row_isin and row_isin in etf_isins))
+                if bucket == 'anlage_so':
                     # Anlage-SO-Override (Issue #51): Keine Aggregation auf
                     # stocks/ETF-Pools. Die debug_row ist bereits korrigiert
                     # (Zeilen oben); Anlage-SO-PnL-Korrektur läuft per Lot im
                     # Anlage-SO-Build via _so_premium_lookup.
                     pass
-                elif is_etf:
+                elif bucket == 'etf':
                     etf_gain_corr_cy += from_gain
                     etf_loss_corr_cy += from_loss
                     if row_isin not in _etf_by_isin_corr_cy:
                         _etf_by_isin_corr_cy[row_isin] = {'gain': 0.0, 'loss': 0.0}
                     _etf_by_isin_corr_cy[row_isin]['gain'] += from_gain
                     _etf_by_isin_corr_cy[row_isin]['loss'] += from_loss
-                elif _row_cls == 'no_invstg':
+                elif bucket == 'no_invstg':
                     # no_invstg-ETPs (GLD, IBIT, BSOL, …) wurden im Trade-Loop in
                     # options_gain/loss gebucht (Topf 2). Der Prämie-Zusatz oben
                     # addiert die Prämie erneut zu options_gain → hier raus-
@@ -2956,46 +3509,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     zufluss_details = []
     prior_zufluss_details = []
 
-    from collections import defaultdict
-
-    def _option_key(t):
-        return (t.get('assetCategory'), t.get('underlyingSymbol', ''),
-                t.get('strike'), t.get('expiry'), t.get('putCall'))
-
-    def _occ_family_key(key):
-        # OCC-adjusted Serien nach Kapitalmassnahmen (Spinoff/Merger) haengen eine
-        # Ziffer an das Underlying an (MMM -> MMM1), strike/expiry/putCall bleiben
-        # identisch. IBKRs eigenes FIFO verknuepft Close und Open ueber die
-        # Umbenennung hinweg (fifoPnlRealized enthaelt die Praemie) — ohne
-        # Familien-Matching gilt der Original-SELL faelschlich als offen und die
-        # Praemie wird doppelt erfasst (Zufluss + Rueckkauf-PnL). Nur fuer OPT:
-        # FOP-Underlyings (z.B. ESZ4) tragen legitime Ziffern-Suffixe.
-        if key[0] != 'OPT':
-            return key
-        und = key[1] or ''
-        root = und.rstrip('0123456789')
-        return (key[0], root or und, key[2], key[3], key[4])
-
-    def _option_sort_key(t):
-        return t.get('dateTime') or t.get('tradeDate') or t.get('reportDate') or ''
-
-    series_events = defaultdict(list)
-    all_sell_open_keys = set()
-    for t in trades:
-        if t.get('assetCategory') not in ('OPT', 'FOP', 'FSFOP'):
-            continue
-        rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
-        if not rd or rd.year > tax_year:
-            continue
-        key = _option_key(t)
-        if (t.get('transactionType') == 'ExchTrade' and t.get('buySell') == 'SELL'
-                and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01):
-            series_events[key].append(t)
-            all_sell_open_keys.add(key)
-        elif ((t.get('transactionType') == 'ExchTrade' and t.get('buySell') == 'BUY'
-               and abs(safe_float(t.get('fifoPnlRealized'))) >= 0.01)
-              or (t.get('transactionType') == 'BookTrade' and t.get('buySell') == 'BUY')):
-            series_events[key].append(t)
+    series_events, all_sell_open_keys = _collect_option_series_events(trades, tax_year)
 
     current_zufluss_by_key = {}
 
@@ -3052,89 +3566,30 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             'type': 'prior_year_correction',
         })
 
-    # FIFO über die vollständige Series-Historie bis zum Steuerjahresende:
-    # aktuelle Rückkäufe verbrauchen zuerst noch offene Vorjahres-Sells. Dadurch
-    # werden aktuelle Sells nicht fälschlich als geschlossen behandelt und
-    # Vorjahresprämien nur für tatsächlich im Steuerjahr geschlossene Lots korrigiert.
-    # Serien laufen pro OCC-Familie (siehe _occ_family_key): ein Close konsumiert
-    # zuerst Lots seiner exakten Serie, danach Lots umbenannter Schwester-Serien.
-    series_families = defaultdict(list)
-    for key in series_events:
-        series_families[_occ_family_key(key)].append(key)
-
-    # Transparenz: jede Familien-Fallback-Zuordnung (Close einer umbenannten
-    # Serie auf den Original-SELL) wird getrackt und in der GUI angezeigt.
-    occ_rename_matches = []
-
-    for fam_keys in series_families.values():
-        events = [(k, ev) for k in fam_keys for ev in series_events[k]]
-        open_lots = []
-        for k, ev in sorted(events, key=lambda pair: _option_sort_key(pair[1])):
-            ev_date = parse_date(ev.get('reportDate') or ev.get('dateTime') or ev.get('tradeDate'))
-            if not ev_date:
-                continue
-            if (ev.get('transactionType') == 'ExchTrade' and ev.get('buySell') == 'SELL'
-                    and abs(safe_float(ev.get('fifoPnlRealized'))) < 0.01):
-                qty = abs(int(safe_float(ev.get('quantity'))))
-                if qty > 0:
-                    open_lots.append({'trade': ev, 'remaining': qty, 'key': k})
-                continue
-
-            close_qty = abs(int(safe_float(ev.get('quantity'))))
-            if close_qty <= 0:
-                continue
-            # Steuerwirksame Schließung = jeder BUY mit realisierter PnL: ExchTrade-Buyback
-            # ODER BookTrade-Verfall (fifoPnlRealized = Prämie). BookTrade mit PnL≈0
-            # (Assignment) bleibt ausgenommen — dessen Cross-Year-Prämie erfasst
-            # _build_stillhalter_details_for_assignment separat (sonst Doppelkorrektur).
-            is_buy_close = (ev.get('buySell') == 'BUY'
-                            and abs(safe_float(ev.get('fifoPnlRealized'))) >= 0.01)
-            remaining_close = close_qty
-            # Exact-Key-Priorität: koexistieren Original- und adjusted Serie
-            # (verschiedene Deliverables!), bleibt die eigene Serie zuerst dran;
-            # der Familien-Fallback greift nur für sonst unmatchte Closes.
-            for exact_pass in (True, False):
-                for lot in open_lots:
-                    if remaining_close <= 0:
-                        break
-                    if lot['remaining'] <= 0:
-                        continue
-                    if (lot['key'] == k) != exact_pass:
-                        continue
-                    take = min(lot['remaining'], remaining_close)
-                    sell_date = parse_date(lot['trade'].get('reportDate') or lot['trade'].get('dateTime') or lot['trade'].get('tradeDate'))
-                    if is_buy_close and ev_date.year == tax_year and sell_date and sell_date.year < tax_year:
-                        _add_prior_zufluss_detail(lot['key'], lot['trade'], take)
-                    if not exact_pass:
-                        occ_rename_matches.append({
-                            'sell_symbol': lot['trade'].get('symbol', ''),
-                            'sell_underlying': lot['key'][1],
-                            'sell_date': str(sell_date) if sell_date else '',
-                            'close_symbol': ev.get('symbol', ''),
-                            'close_underlying': k[1],
-                            'close_date': str(ev_date),
-                            'strike': k[2],
-                            'expiry': k[3],
-                            'putCall': k[4],
-                            'quantity': take,
-                        })
-                    lot['remaining'] -= take
-                    remaining_close -= take
-                if remaining_close <= 0:
-                    break
-
-        for lot in open_lots:
-            if lot['remaining'] <= 0:
-                continue
-            sell_date = parse_date(lot['trade'].get('reportDate') or lot['trade'].get('dateTime') or lot['trade'].get('tradeDate'))
-            if sell_date and sell_date.year == tax_year:
-                _add_current_zufluss(lot['key'], lot['trade'], lot['remaining'])
+    # FIFO ueber die Series-Historie (Mechanik + Doku: _run_zufluss_fifo).
+    # Effekte laufen ueber die beiden Closures; occ_rename_matches trackt
+    # Familien-Fallback-Zuordnungen fuer Konsole/GUI.
+    occ_rename_matches = _run_zufluss_fifo(
+        series_events, tax_year,
+        on_prior_close=_add_prior_zufluss_detail,
+        on_current_open=_add_current_zufluss,
+    )
 
     if occ_rename_matches:
-        renames = ", ".join(sorted({f"{m['sell_underlying']} -> {m['close_underlying']}"
-                                    for m in occ_rename_matches}))
+        labels = []
+        for match in occ_rename_matches:
+            if match.get('match_type') == 'split':
+                labels.append(
+                    f"{match['sell_symbol']} -> {match['close_symbol']} "
+                    f"({match['quantity']:g} -> {match['close_quantity']:g})"
+                )
+            else:
+                labels.append(
+                    f"{match['sell_underlying']} -> {match['close_underlying']}"
+                )
+        matched_series = ", ".join(sorted(set(labels)))
         print(f"  (i) Kapitalmassnahme erkannt: {len(occ_rename_matches)} Glattstellung(en) "
-              f"umbenannter Optionsserien dem Original-SELL zugeordnet ({renames}). "
+              f"dem Original-SELL zugeordnet ({matched_series}). "
               f"Verhindert Doppelerfassung der Stillhalterpraemie.")
 
     for key, acc in current_zufluss_by_key.items():
@@ -3249,44 +3704,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     # BUY-close (Glattstellung/Verfall) ohne matching SELL-to-open = Vorjahr fehlt
     # all_sell_open_keys contains current-year and prior-year openings from history.
 
-    zufluss_unmatched = []
-    # Familien-Check analog zum Zufluss-FIFO: ein Close unter einer OCC-
-    # umbenannten Serie (MMM1) ist gematcht, wenn die Original-Serie (MMM)
-    # einen Eröffnungs-SELL hat — keine False-Positive-Warnung.
-    all_sell_open_family_keys = {_occ_family_key(k) for k in all_sell_open_keys}
-    for t in trades:
-        if t.get('assetCategory') not in ('OPT', 'FOP', 'FSFOP'):
-            continue
-        # Gleiche Close-Definition wie is_buy_close im Zufluss-FIFO: jeder BUY
-        # mit realisierter PnL — ExchTrade-Buyback ODER BookTrade-Verfall
-        # (fifoPnlRealized = Prämie). Assignments (PnL≈0) fallen durch den
-        # PnL-Filter. Vorher wurden BookTrade-Verfälle ohne Vorjahres-XML
-        # nicht gewarnt, obwohl die Prämie doppelt versteuert bleibt.
-        if t.get('buySell') != 'BUY':
-            continue
-        if abs(safe_float(t.get('fifoPnlRealized'))) < 0.01:
-            continue  # Opening BUY oder Assignment, not a taxable close
-        rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
-        if not rd or rd.year != tax_year:
-            continue
-        key = (t.get('assetCategory'), t.get('underlyingSymbol', ''),
-               t.get('strike'), t.get('expiry'), t.get('putCall'))
-        if key not in all_sell_open_keys and _occ_family_key(key) not in all_sell_open_family_keys:
-            symbol = t.get('symbol') or t.get('description') or f"{key[1]} {key[2]} {key[3]} {key[4]}"
-            # Avoid duplicate warnings for same instrument
-            if not any(u.get('underlyingSymbol', '') == key[1]
-                       and u['strike'] == key[2]
-                       and u['expiry'] == key[3]
-                       and u['putCall'] == key[4]
-                       for u in zufluss_unmatched):
-                zufluss_unmatched.append({
-                    'symbol': symbol,
-                    'underlyingSymbol': key[1],
-                    'strike': key[2],
-                    'expiry': key[3],
-                    'putCall': key[4],
-                    'quantity': abs(int(safe_float(t.get('quantity')))),
-                })
+    zufluss_unmatched = _detect_zufluss_unmatched(trades, tax_year, all_sell_open_keys)
 
     if zufluss_unmatched:
         print(f"  (!) WARNUNG: {len(zufluss_unmatched)} Glattstellung(en) ohne Eröffnungs-SELL. "
@@ -3553,27 +3971,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     if remaining <= 0:
                         break
                 if total_correction_raw > 0:
-                    if row['cost'] >= 0:
-                        row['cost'] += total_correction_raw
-                    else:
-                        row['cost'] -= total_correction_raw
-                    row['fifoPnlRealized'] -= total_correction_raw
-                    row['stillhalter_adjustment_raw'] = (
-                        safe_float(row.get('stillhalter_adjustment_raw'), 0.0)
-                        + total_correction_raw
-                    )
-                    fx = row.get('fxRateToBase', 1.0)
-                    if base_currency == 'EUR':
-                        row['pnl_eur'] = round(row['fifoPnlRealized'] * fx, 5)
-                    else:
-                        d = parse_date(row.get('dateTime', ''))
-                        r_eur = get_rate_for_date(d, usd_to_eur_rates)
-                        row['pnl_eur'] = round(row['fifoPnlRealized'] * fx * r_eur, 5)
-                    row['stillhalter_adjusted'] = True
-
                     # Pool-Anpassung aus dem tatsächlichen Row-Delta ableiten
                     # (gain/loss-Split-Logik identisch zum Same-Year-Block).
-                    correction_eur = original_pnl_eur - row['pnl_eur']
+                    correction_eur = _apply_stillhalter_row_correction(
+                        row, total_correction_raw, base_currency, usd_to_eur_rates)
                     # Tatsaechlichen EUR-Korrekturbetrag (stock_fx) anteilig auf die
                     # konsumierten cross_year_put_corrections-Eintraege verteilen, damit
                     # Box-Gesamt, Einzelzeilen, Pool-Reduktion und Plausibilitaetscheck-
@@ -3583,27 +3984,21 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                             _chunk_raw / total_correction_raw)
                     row_isin = row.get('isin', '')
                     _row_cls = _effective_classification(row_isin) if row_isin else None
-                    is_so = bool(row_isin and row_isin in etf_isins and _row_cls == 'anlage_so')
-                    is_etf = bool(row_isin and row_isin in etf_isins
-                                  and _row_cls not in ('no_invstg', 'anlage_so'))
-                    if original_pnl_eur > 0:
-                        from_gain = min(correction_eur, original_pnl_eur)
-                        from_loss = correction_eur - from_gain
-                    else:
-                        from_gain = 0.0
-                        from_loss = correction_eur
-                    if is_so:
+                    bucket, from_gain, from_loss = _split_stillhalter_correction(
+                        correction_eur, original_pnl_eur, _row_cls,
+                        bool(row_isin and row_isin in etf_isins))
+                    if bucket == 'anlage_so':
                         # Anlage-SO-Override (Issue #51): Keine Aggregation auf
                         # stocks/ETF-Pools. Korrektur läuft per Lot im Anlage-SO-Build.
                         pass
-                    elif is_etf:
+                    elif bucket == 'etf':
                         etf_gain_corr += from_gain
                         etf_loss_corr += from_loss
                         if row_isin not in _etf_by_isin_corr_xy:
                             _etf_by_isin_corr_xy[row_isin] = {'gain': 0.0, 'loss': 0.0}
                         _etf_by_isin_corr_xy[row_isin]['gain'] += from_gain
                         _etf_by_isin_corr_xy[row_isin]['loss'] += from_loss
-                    elif _row_cls == 'no_invstg':
+                    elif bucket == 'no_invstg':
                         nv_gain_corr += from_gain
                         nv_loss_corr += from_loss
                     else:
@@ -4501,108 +4896,15 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     # IBKR embeds the premium in the stock's cost basis (cost = strike - premium).
     # The Tageskurs formula needs the corrected cost (= strike), so we add the
     # premium back per share for stock CLOSED_LOTs acquired through put assignments.
-    _tageskurs_put_adj = {}  # {underlying_symbol: deque of {date, shares_remaining, premium_per_share_raw}}
-    for det in stillhalter_details:
-        if det.get('putCall') != 'P':
-            continue  # Only put assignments embed premium in stock COST basis
-        underlying = det['symbol'].split()[0] if det['symbol'] else ''
-        if not underlying:
-            continue
-        mult = det.get('multiplier', 100)
-        shares = det['quantity'] * mult
-        if shares <= 0 or det['premium_raw'] <= 0:
-            continue
-        a_date = (det.get('assignment_date') or '')[:10]
-        _tageskurs_put_adj.setdefault(underlying, deque()).append({
-            'date': a_date,
-            'shares_remaining': shares,
-            'premium_per_share_raw': det['premium_raw'] / shares,
-        })
-    # Include cross-year put assignments (assigned in prior years).
-    # Issue #55: Premium-Werte werden aus _xy_tageskurs_lots gelesen (dort waehrend
-    # der prior_put_assignments-Schleife unter FIFO-Logik gespeichert, siehe Issue
-    # #54 Fix). Das eliminiert die fruehere parallele Berechnung mit dem identischen
-    # Durchschnitts-Bug.
-    for sym, snap_lots in _xy_tageskurs_lots.items():
-        for snap in snap_lots:
-            if snap['shares'] <= 0:
-                continue
-            _tageskurs_put_adj.setdefault(sym, deque()).append({
-                'date': snap['date_str'],
-                'shares_remaining': snap['shares'],
-                'premium_per_share_raw': snap['premium_per_share_raw'],
-            })
-    # Sort each symbol's lots by date (FIFO)
-    for sym in _tageskurs_put_adj:
-        _tageskurs_put_adj[sym] = deque(sorted(_tageskurs_put_adj[sym], key=lambda x: x['date']))
+    # Same-Year- + Cross-Year-Put-Praemien als FIFO-Lots (Issue #54/#55; Doku:
+    # _build_tageskurs_put_adjustments).
+    _tageskurs_put_adj = _build_tageskurs_put_adjustments(
+        stillhalter_details, _xy_tageskurs_lots)
 
-    # Gross gain/loss buckets must use the premium correction that was actually
-    # applied to the tax trade row. Cost-basis restoration above is related but
-    # not identical: IBKR may already report strike basis, or a call adjustment
-    # may affect proceeds instead of cost. Map final corrected trade rows to
-    # CLOSED_LOTs and consume their corrections quantity-proportionally.
-    _tageskurs_pnl_adj_exact = {}
-    _tageskurs_pnl_adj_date = {}
-
-    def _tageskurs_close_timestamp(row):
-        value = (row.get('dateTime') or row.get('reportDate') or '').replace(';', ' ')
-        return value[:19]
-
-    for row in debug_rows:
-        adjustment_raw = safe_float(row.get('stillhalter_adjustment_raw'), 0.0)
-        if row.get('source') != 'trades' or row.get('assetCategory') != 'STK' \
-                or adjustment_raw <= 0:
-            continue
-        quantity = abs(safe_float(row.get('quantity'), 0.0))
-        symbol = _symbol_root(row.get('underlyingSymbol') or row.get('symbol'))
-        close_timestamp = _tageskurs_close_timestamp(row)
-        side = (row.get('buySell') or '').upper()
-        if quantity <= 0 or not symbol or not close_timestamp:
-            continue
-        entry = {
-            'remaining_shares': quantity,
-            'adjustment_per_share_raw': adjustment_raw / quantity,
-        }
-        exact_key = (symbol, close_timestamp, side)
-        date_key = (symbol, close_timestamp[:10], side)
-        _tageskurs_pnl_adj_exact.setdefault(exact_key, []).append(entry)
-        _tageskurs_pnl_adj_date.setdefault(date_key, []).append(entry)
-
-    def _consume_tageskurs_pnl_adjustment(lot):
-        quantity_signed = safe_float(lot.get('quantity'), 0.0)
-        remaining = abs(quantity_signed)
-        if remaining <= 0:
-            return 0.0
-        symbol = _symbol_root(lot.get('underlyingSymbol') or lot.get('symbol'))
-        close_timestamp = _tageskurs_close_timestamp(lot)
-        side = (lot.get('buySell') or '').upper()
-        if not side:
-            side = 'SELL' if quantity_signed >= 0 else 'BUY'
-        exact_key = (symbol, close_timestamp, side)
-        date_key = (symbol, close_timestamp[:10], side)
-        adjustment = 0.0
-
-        def consume(entries):
-            nonlocal adjustment, remaining
-            for entry in entries:
-                if remaining <= 0:
-                    break
-                available = entry['remaining_shares']
-                if available <= 0:
-                    continue
-                consumed = min(remaining, available)
-                adjustment += consumed * entry['adjustment_per_share_raw']
-                entry['remaining_shares'] -= consumed
-                remaining -= consumed
-
-        # Prefer the exact execution timestamp. If IBKR consolidates several
-        # executions into a larger CLOSED_LOT, consume the still-open same-day
-        # correction rows as a fallback. Both maps hold the same entry objects,
-        # so an exact slice cannot be consumed twice.
-        consume(_tageskurs_pnl_adj_exact.get(exact_key, []))
-        if remaining > 0:
-            consume(_tageskurs_pnl_adj_date.get(date_key, []))
-        return adjustment
+    # Per-Share-Korrektur-Maps fuer die Bruttozuordnung (Mechanik + Doku:
+    # _build_tageskurs_pnl_adjustment_maps / _consume_tageskurs_pnl_adjustment).
+    _tageskurs_pnl_adj_exact, _tageskurs_pnl_adj_date = \
+        _build_tageskurs_pnl_adjustment_maps(debug_rows)
 
     fx_correction_total = 0.0
     fx_correction_details = []
@@ -4817,7 +5119,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             # Track gain/loss shift per lot for consistent Zeilen 20/22/23
             pnl_raw = safe_float(lot.get('fifoPnlRealized'), 0)
             pnl_stillhalter_adjustment_raw = (
-                _consume_tageskurs_pnl_adjustment(lot)
+                _consume_tageskurs_pnl_adjustment(
+                    lot, _tageskurs_pnl_adj_exact, _tageskurs_pnl_adj_date)
                 if category == 'STK' else 0.0
             )
             detail['stillhalter_adjustment_raw'] = round(
@@ -5224,6 +5527,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             "added_from_summary": added_from_summary,
             "usd_to_eur_rates_count": len(usd_to_eur_rates),
             "ecb_rates_used": ecb_rates_used,
+            "fx_rate_parse_failures": fx_rate_parse_failures,
             "stillhalter_count": stillhalter_count,
             "stillhalter_premium_eur": stillhalter_premium_eur,
             "put_nosell_premium_eur": put_nosell_premium_eur,

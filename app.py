@@ -1029,15 +1029,39 @@ if unmatched:
 
 occ_rename_matches = d.get('audit', {}).get('occ_rename_matches', [])
 if occ_rename_matches:
-    occ_lines = "<br>".join(
-        f"<strong>{m['sell_symbol']}</strong> (verkauft {m['sell_date']}) &rarr; "
-        f"<strong>{m['close_symbol']}</strong> (geschlossen {m['close_date']}, {m['quantity']} Kontrakt(e))"
+    split_count = sum(m.get('match_type') == 'split' for m in occ_rename_matches)
+    adjustment_count = sum(
+        m.get('match_type') == 'contract_adjustment'
         for m in occ_rename_matches
     )
+    rename_count = len(occ_rename_matches) - split_count - adjustment_count
+    occ_rows = []
+    for m in occ_rename_matches:
+        if m.get('match_type') == 'split':
+            qty_text = (
+                f"{m.get('quantity', 0):g} alter &rarr; "
+                f"{m.get('close_quantity', 0):g} neue Kontrakte"
+            )
+        else:
+            qty_text = f"{m.get('quantity', 0):g} Kontrakt(e)"
+        occ_rows.append(
+            f"<strong>{m['sell_symbol']}</strong> (verkauft {m['sell_date']}) &rarr; "
+            f"<strong>{m['close_symbol']}</strong> "
+            f"(geschlossen {m['close_date']}, {qty_text})"
+        )
+    occ_lines = "<br>".join(occ_rows)
+    action_parts = []
+    if split_count:
+        action_parts.append(f"{split_count} Split-Zuordnung(en)")
+    if adjustment_count:
+        action_parts.append(f"{adjustment_count} Kontraktanpassung(en)")
+    if rename_count:
+        action_parts.append(f"{rename_count} Serien-Umbenennung(en)")
+    action_summary = " und ".join(action_parts)
     st.markdown(f"""
 <div style="background: rgba(56,189,248,0.08); border: 1px solid rgba(56,189,248,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
-    <strong style="color: #38bdf8;">Kapitalmaßnahme erkannt (Umbenennung der Optionsserie):</strong>
-    Bei {len(occ_rename_matches)} Position(en) wurde die Optionsserie nach einer Kapitalmaßnahme (z.B. Spinoff oder Merger) von der Optionsbörse umbenannt; Strike, Verfall und Optionstyp sind identisch.
+    <strong style="color: #38bdf8;">Kapitalmaßnahme erkannt:</strong>
+    {action_summary}. Die veränderte Optionsserie wurde anhand der stabilen IBKR-Kontraktidentität und ihrer FIFO-Kostenbasis zugeordnet.
     Die Schließung wurde automatisch dem ursprünglichen Verkauf zugeordnet, damit die Stillhalterprämie nur einmal versteuert wird:<br>{occ_lines}<br>
     <span style="color: #64748b; font-size: 0.75rem;">Bitte prüfen: Falls es sich wider Erwarten um zwei verschiedene Kontrakte handelt, die Positionen in den Trade-Details kontrollieren.</span>
 </div>

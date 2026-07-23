@@ -1877,6 +1877,57 @@ def test_fop_digit_suffix_not_grouped():
     print("    ESZ4-Zufluss 100.00 EUR bleibt, ESZ5-Close warnt unmatched")
 
 
+def test_option_split_matches_by_conid_and_cost_basis():
+    """TC36: Ein Optionssplit wird trotz geaenderter Stückzahl und Strike korrekt geschlossen."""
+    sell = make_sell(
+        "2025-12-04", 1, 1.20, strike="88", expiry="2026-01-16",
+        underlying="XLE", commission=-0.76689,
+    )
+    sell.update({
+        "accountId": "TEST",
+        "conid": "653278898",
+        "symbol": "XLE   260116P00088000",
+        "cost": "-119.23311",
+        "fxRateToBase": "0.85878",
+    })
+    close = make_buy_close(
+        "2025-12-30", 2, 0.33, 51.90491, strike="44",
+        expiry="2026-01-16", underlying="XLE",
+    )
+    close.update({
+        "accountId": "TEST",
+        "conid": "653278898",
+        "symbol": "XLE   260116P00044000",
+        "cost": "119.23311",
+        "ibCommission": "-1.3282",
+        "fxRateToBase": "0.85122",
+    })
+
+    rd = calculate_for_trades([sell, close], tax_year=2025)
+    audit = rd.get("audit", {})
+
+    assert_close(audit.get("zufluss_premium_eur", 0), 0.0,
+                 label="TC36 zufluss_premium_eur")
+    assert audit.get("zufluss_unmatched", []) == [], \
+        f"TC36: unerwartete unmatched-Warnung: {audit.get('zufluss_unmatched')}"
+    assert_close(rd.get("options_gain_eur", 0), 44.182497,
+                 label="TC36 options_gain (nur realisiertes IBKR-Ergebnis)")
+
+    matches = audit.get("occ_rename_matches", [])
+    assert len(matches) == 1, \
+        f"TC36: erwartet einen Split-Match, aktuell {matches}"
+    match = matches[0]
+    assert match.get("match_type") == "split"
+    assert match.get("conid") == "653278898"
+    assert_close(match.get("quantity"), 1.0, label="TC36 alte Kontraktzahl")
+    assert_close(match.get("close_quantity"), 2.0,
+                 label="TC36 neue Kontraktzahl")
+    assert_close(match.get("ratio"), 2.0, label="TC36 Split-Verhaeltnis")
+
+    print("  TC36 Optionssplit: XLE P88 1x matcht XLE P44 2x per conid/cost: OK")
+    print("    Kein falscher Zufluss und keine unmatched-Warnung")
+
+
 if __name__ == "__main__":
     test_cross_year_put_series()
     test_cross_year_call_series()
@@ -1913,4 +1964,5 @@ if __name__ == "__main__":
     test_occ_renamed_series_close_matches_original_sell()
     test_occ_family_prefers_exact_series()
     test_fop_digit_suffix_not_grouped()
-    print("\nOK: alle 35 TCs gruen")
+    test_option_split_matches_by_conid_and_cost_basis()
+    print("\nOK: alle 36 TCs gruen")

@@ -46,6 +46,11 @@ SYNTHETIC_TESTS = [
     ("QYLD-und-Sonderprodukte", "tests/test_qyld_and_special_products.py"),
     ("German-Dividend-Tax", "-m unittest tests/test_german_dividend_tax.py"),
     ("FX-Margin-Negative-Balance", "tests/test_fx_negative_balance.py"),
+    ("Stillhalter-Row-Korrektur", "tests/test_stillhalter_row_correction.py"),
+    ("Trade-Funds-Dedupe", "tests/test_dedupe.py"),
+    ("FX-Rate-Parse-Ausfaelle", "tests/test_fx_rate_parse_failures.py"),
+    ("Options-Event-Sammlung", "tests/test_option_event_collection.py"),
+    ("Tageskurs-Korrektur-Maps", "tests/test_tageskurs_adjustment_maps.py"),
 ]
 
 
