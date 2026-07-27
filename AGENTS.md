@@ -6,6 +6,7 @@ This repository is a Python/Streamlit tool for calculating German Anlage KAP/KAP
 
 - `app.py` is the Streamlit UI and user-facing orchestration layer.
 - `calculate_tax_report.py` contains the main tax calculation logic. Option-to-stock assignment matching resolves IBKR symbol variants (exchange-suffix symbols, ticker renames) via conid/ISIN-based symbol equivalence classes (Issue #83); regression coverage lives in `tests/test_underlying_symbol_matching.py`.
+  - Instrument categories and StmtFunds activity codes are routed via module-level tables, not inline literals: `TOPF2_ASSET_CATEGORIES` / `KNOWN_UNROUTED_ASSET_CATEGORIES` for `assetCategory`, and `INCOME_ACTIVITY_CODES` / `KNOWN_IGNORED_ACTIVITY_CODES` / `FEE_ACTIVITY_CODES` / `MANUAL_REVIEW_ACTIVITY_CODES` for `activityCode`. Anything not covered is collected by `register_unrouted_category` / `register_unhandled_activity_code` and surfaced as a review item (`audit['unrouted_asset_categories']`, `audit['unhandled_activity_codes']`) instead of being dropped silently. When adding support for a new category or code, extend the table rather than the branch, and add a case to `tests/test_asset_category_routing.py`.
 - `extract_ibkr_data.py` converts IBKR XML exports into CSV inputs.
 - `etf_classification.py` maintains the InvStG fund classification table (Teilfreistellung rates) and documented treaty withholding-tax rates; `ecb_rates.py` and helper scripts provide FX, audit, and comparison utilities.
 - `tests/` contains focused regression tests; `test_data/` is local and gitignored because it may contain real IBKR data.
@@ -40,6 +41,7 @@ Run individual synthetic tests while iterating (`run_tests.py` runs all files in
 ```bash
 python tests/test_cross_year_series.py
 python tests/test_kap_inv_wht.py
+python tests/test_asset_category_routing.py
 python -m unittest tests/test_german_dividend_tax.py
 ```
 
@@ -55,7 +57,9 @@ Use Python 3 with 4-space indentation and standard library modules where practic
 
 ## Testing Guidelines
 
-Add regression coverage for tax logic changes, especially around realized gains, withholding tax crediting, FX conversion, ETF classification (KAP-INV form mapping), and cross-year Stillhalter handling. Prefer small synthetic fixtures in `tests/` for reproducible bugs; new synthetic test files must be registered in `SYNTHETIC_TESTS` in `run_tests.py` so the full run picks them up. `run_tests.py` also uses local `test_data/audit_expectations.json`; if unavailable, some audit scenarios cannot run and may be skipped or fail early.
+Add regression coverage for tax logic changes, especially around realized gains, withholding tax crediting, FX conversion, ETF classification (KAP-INV form mapping), and cross-year Stillhalter handling. Prefer small synthetic fixtures in `tests/` for reproducible bugs; new synthetic test files must be registered in `SYNTHETIC_TESTS` in `run_tests.py` so the full run picks them up.
+
+When a change adds or reroutes an instrument category or booking code, a green suite is not enough on its own: synthetic fixtures only prove that the new branch works, not that it matches what IBKR actually exports. Verify the assumption against a real Flex Query export, and state plainly in the PR which parts remain synthetic-only. `run_tests.py` also uses local `test_data/audit_expectations.json`; if unavailable, some audit scenarios cannot run and may be skipped or fail early.
 
 ## Commit & Pull Request Guidelines
 
@@ -64,3 +68,5 @@ Recent commits use concise imperative messages, sometimes with issue references,
 ## Security & Configuration Tips
 
 Do not commit real IBKR XML, extracted CSVs, personal TXT reports, virtualenvs, or `test_data/`; these are covered by `.gitignore`. Treat financial exports as sensitive and keep processing local unless the user explicitly requests otherwise.
+
+`app.py` renders several blocks with `unsafe_allow_html=True`. Any value taken from the IBKR export (symbols, descriptions, activity codes, ISINs) must pass through `html.escape` before it is interpolated into such a block.

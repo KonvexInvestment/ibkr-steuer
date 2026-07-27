@@ -31,6 +31,111 @@ def safe_float(val, default=0.0):
     return float(val)
 
 
+# --- Instrumentenkategorien: Single Source fuer alle Routing-Stellen -------
+#
+# Topf 2 (§20 Abs. 6 EStG, BMF Rn. 118): Termingeschaefte und sonstige
+# Kapitalforderungen. Aktien (STK) laufen ueber einen eigenen Zweig, weil dort
+# die ETF-/InvStG-Erkennung greift.
+#   WAR = Optionsscheine (verbriefte Kapitalforderungen, §20 Abs. 1 Nr. 7
+#         und Abs. 2 S. 1 Nr. 7 EStG; kein Termingeschaeft, BMF Rn. 8 f.)
+#   CFD = Contracts for Difference (Termingeschaeft, §20 Abs. 2 S. 1 Nr. 3 EStG)
+TOPF2_ASSET_CATEGORIES = frozenset({
+    'OPT', 'FUT', 'FOP', 'FSFOP', 'BILL', 'BOND', 'WAR', 'CFD',
+})
+
+TOPF2_CAT_LABELS = {
+    'OPT': 'Optionen', 'FOP': 'Optionen', 'FSFOP': 'Optionen',
+    'FUT': 'Futures', 'BILL': 'T-Bills', 'BOND': 'Anleihen',
+    'WAR': 'Optionsscheine', 'CFD': 'CFDs',
+}
+
+# Kategorien, die hier bewusst NICHT geroutet werden und deshalb keine
+# Warnung ausloesen: CASH sind Devisenumsaetze, deren Ergebnis die FX-Engine
+# separat als Fremdwaehrungsgewinn erfasst (§20 Abs. 2 S. 1 Nr. 7 EStG).
+# Eine Zuordnung hier waere Doppelzaehlung.
+KNOWN_UNROUTED_ASSET_CATEGORIES = frozenset({'CASH'})
+
+
+# --- StmtFunds-activityCodes: Single Source fuer den Ertrags-Filter --------
+#
+# Codes mit Ertragswirkung. Reihenfolge der Behandlung siehe Funds-Loop.
+INCOME_ACTIVITY_CODES = frozenset({
+    'DIV', 'PIL', 'INTR', 'CINT', 'INTP', 'DINT', 'CFD', 'FRTAX', 'WHT',
+})
+
+# Bewusst uebersprungen, weil das steuerliche Ergebnis an anderer Stelle
+# entsteht: Trade-Settlements (BUY/SELL/ADJ/ASSIGN/EXE) laufen ueber
+# trades.csv, Devisenumsaetze (FOREX) ueber die FX-Engine, Ein- und
+# Auszahlungen (DEP/WITH) sind keine Ertraege.
+#   CORP = Nominalrueckzahlungen aus Kapitalmassnahmen, in echten Daten
+#   T-Bill-Maturities; der Ertrag daraus kommt aus dem BILL-Pfad. Achtung:
+#   Return of Capital laeuft ebenfalls hier durch und ist noch offen (#58).
+KNOWN_IGNORED_ACTIVITY_CODES = frozenset({
+    '', 'BUY', 'SELL', 'ADJ', 'DEP', 'WITH', 'FOREX', 'ASSIGN', 'EXE', 'CORP',
+})
+
+# Laufende Gebuehren und darauf erhobene Umsatzsteuer. Fliessen nicht in die
+# Ertragsrechnung, werden aber nachrichtlich summiert.
+FEE_ACTIVITY_CODES = frozenset({'OFEE', 'STAX'})
+
+# IBKR meldet TTAX als separat von Trades gebuchte Transaktionssteuer. Solche
+# unmittelbaren Transaktionskosten sind grundsaetzlich nach §20 Abs. 4 EStG
+# ergebniswirksam; ohne belastbare Zuordnung zu Trade und Steuertopf darf der
+# Betrag aber weder pauschal Topf 1 noch Topf 2 zugeschlagen werden. Deshalb
+# sichtbarer manueller Prueffall statt falscher Automatik.
+MANUAL_REVIEW_ACTIVITY_CODES = frozenset({'TTAX'})
+
+
+def register_unrouted_category(registry, category, pnl_eur, symbol='', source='trades'):
+    """Sammelt realisierte PnL, die in keinen Topf geroutet wurde.
+
+    Ohne diesen Guard verschwinden unbekannte IBKR-assetCategories (WAR und
+    CFD waren solche Faelle) still aus der Berechnung: kein Topf, keine Zeile,
+    keine Warnung. `registry` wird in-place ergaenzt und landet als
+    `audit['unrouted_asset_categories']` im Report.
+    """
+    label = (category or '').strip() or '(leer)'
+    if label in KNOWN_UNROUTED_ASSET_CATEGORIES:
+        return registry
+    entry = registry.setdefault(label, {
+        'category': label,
+        'count': 0,
+        'pnl_eur': 0.0,
+        'symbols': [],
+        'sources': [],
+    })
+    entry['count'] += 1
+    entry['pnl_eur'] += pnl_eur
+    sym = (symbol or '').strip()
+    if sym and sym not in entry['symbols']:
+        entry['symbols'].append(sym)
+    if source and source not in entry['sources']:
+        entry['sources'].append(source)
+    return registry
+
+
+def register_unhandled_activity_code(registry, code, amount_eur, description=''):
+    """Sammelt StmtFunds-Codes ohne sichere automatische Behandlung.
+
+    Gegenstueck zu `register_unrouted_category` auf der Cash-Seite: der
+    Ertrags-Filter uebersprang unbekannte Codes bisher wortlos. Auch bekannte
+    Prueffaelle wie TTAX landen hier, wenn eine belastbare Topf-Zuordnung fehlt.
+    """
+    label = (code or '').strip() or '(leer)'
+    entry = registry.setdefault(label, {
+        'code': label,
+        'count': 0,
+        'amount_eur': 0.0,
+        'descriptions': [],
+    })
+    entry['count'] += 1
+    entry['amount_eur'] += amount_eur
+    desc = (description or '').strip()
+    if desc and len(entry['descriptions']) < 3 and desc not in entry['descriptions']:
+        entry['descriptions'].append(desc)
+    return registry
+
+
 def calculate_tageskurs_gross_adjustment(pnl_before_tageskurs, fx_delta):
     """Split one lot's FX delta after all prior lot corrections.
 
@@ -3221,11 +3326,11 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     options_loss = 0.0
 
     # Topf 2 breakdown by instrument category (for detailed reporting)
-    TOPF2_CAT_LABELS = {
-        'OPT': 'Optionen', 'FOP': 'Optionen', 'FSFOP': 'Optionen',
-        'FUT': 'Futures', 'BILL': 'T-Bills', 'BOND': 'Anleihen',
-    }
+    # Labels/Kategorien: Modul-Level (TOPF2_CAT_LABELS, TOPF2_ASSET_CATEGORIES)
     topf2_by_category = {}  # {label: {'gain': float, 'loss': float}}
+
+    # Realisierte PnL, die in keinen Topf faellt (unbekannte assetCategory)
+    unrouted_asset_categories = {}
 
     def add_topf2_detail(cat_label, amount):
         if cat_label not in topf2_by_category:
@@ -3389,13 +3494,22 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     stocks_gain += pnl_eur
                 else:
                     stocks_loss += pnl_eur
-        elif category in ['OPT', 'FUT', 'FOP', 'FSFOP', 'BILL', 'BOND']:
-            # FSFOP = Flex Single-Stock Futures Options, BILL = Treasury Bills, BOND = Bonds
+        elif category in TOPF2_ASSET_CATEGORIES:
+            # FSFOP = Flex Single-Stock Futures Options, BILL = Treasury Bills,
+            # BOND = Bonds, WAR = Optionsscheine, CFD = Contracts for Difference
             if pnl_eur > 0:
                 options_gain += pnl_eur
             else:
                 options_loss += pnl_eur
             add_topf2_detail(TOPF2_CAT_LABELS.get(category, category), pnl_eur)
+        else:
+            # Weder STK noch eine bekannte Topf-2-Kategorie: nicht still
+            # verschlucken, sondern als Prueffall melden (CASH ausgenommen,
+            # siehe KNOWN_UNROUTED_ASSET_CATEGORIES).
+            register_unrouted_category(
+                unrouted_asset_categories, category, pnl_eur,
+                symbol=t.get('symbol', ''), source='trades',
+            )
 
         # Collect debug row
         sub = t.get('subCategory', '')
@@ -3410,8 +3524,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 topf = 'KAP-INV'
         elif category == 'STK':
             topf = 'Topf1'
-        else:
+        elif (category in TOPF2_ASSET_CATEGORIES
+              or category in KNOWN_UNROUTED_ASSET_CATEGORIES):
+            # CASH bleibt Topf2: das Ergebnis wird von der FX-Engine erfasst.
             topf = 'Topf2'
+        else:
+            # Muss zur Hauptrechnung passen: was dort nicht geroutet wurde,
+            # darf im Export nicht als Topf 2 erscheinen.
+            topf = 'Nicht zugeordnet'
         debug_rows.append({
             'dateTime': t.get('dateTime', ''),
             'reportDate': t.get('reportDate', ''),
@@ -4631,7 +4751,12 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     dividends_eur = 0.0
     domestic_taxed_dividends_eur = 0.0
     interest_eur = 0.0  # Bond coupons, credit interest, Stückzinsen (abzugsfähig)
-    debit_interest_eur = 0.0  # Margin-Sollzinsen, Leihgebühren (NICHT abzugsfähig, §20 Abs. 9 EStG)
+    debit_interest_eur = 0.0  # Margin-Sollzinsen, Leihgebühren, CFD-Finanzierung (NICHT abzugsfähig, §20 Abs. 9 EStG)
+    cfd_interest_income_eur = 0.0   # nachrichtlich: CFD-Habenzinsen (in interest_eur enthalten)
+    cfd_financing_cost_eur = 0.0    # nachrichtlich: CFD-Kosten (in debit_interest_eur enthalten)
+    other_fees_eur = 0.0            # nachrichtlich: laufende Gebuehren/Umsatzsteuer (OFEE/STAX)
+    fee_by_activity_code = {}       # {code: Summe EUR}
+    unhandled_activity_codes = {}   # Cash-Buchungen ohne sichere automatische Behandlung
     withholding_tax_eur = 0.0
     domestic_withholding_tax_eur = 0.0
 
@@ -4662,8 +4787,12 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # INTR = Bond Coupon/Interest, CINT = Credit Interest
         # INTP = Accrued Interest Paid (Stückzinsen)
         # DINT = Debit Interest (Margin-Sollzinsen, Leihgebühren, SYEP)
+        # CFD = CFD-Zinsen und -Finanzierungskosten (vorzeichenabhaengig, s.u.)
         # FRTAX/WHT = Withholding Tax
-        if code not in ['DIV', 'PIL', 'INTR', 'CINT', 'INTP', 'DINT', 'FRTAX', 'WHT']:
+        # Alles Weitere: siehe KNOWN_IGNORED_ACTIVITY_CODES (still uebersprungen)
+        # bzw. FEE_ACTIVITY_CODES, MANUAL_REVIEW_ACTIVITY_CODES und der
+        # Unbekannt-Guard nach der Umrechnung.
+        if code in KNOWN_IGNORED_ACTIVITY_CODES:
             continue
 
         # Use reportDate (booking/settlement date) for tax year assignment
@@ -4674,9 +4803,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         if not report_date or report_date.year != tax_year:
             funds_skipped_year += 1
             continue
-            
-        funds_processed += 1
-            
+
         amount_raw = safe_float(f.get('amount'))
         curr = f.get('currency')
 
@@ -4695,7 +4822,33 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 fx = safe_float(f.get('fxRateToBase'), 1.0)
                 amount_usd = amount_raw * fx
                 amount_eur = amount_usd * rate_eur
-        
+
+        if code in FEE_ACTIVITY_CODES:
+            # Laufende Gebuehren/Umsatzsteuer: nur nachrichtlich, nicht in der
+            # Ertragsrechnung (§20 Abs. 9 EStG).
+            other_fees_eur += amount_eur
+            fee_by_activity_code[code] = fee_by_activity_code.get(code, 0.0) + amount_eur
+            continue
+
+        if code in MANUAL_REVIEW_ACTIVITY_CODES:
+            # TTAX kann steuerlich ergebniswirksam sein, ist in StmtFunds aber
+            # nicht sicher einem konkreten Trade/Steuertopf zuzuordnen.
+            register_unhandled_activity_code(
+                unhandled_activity_codes, code, amount_eur,
+                description=f.get('activityDescription', ''),
+            )
+            continue
+
+        if code not in INCOME_ACTIVITY_CODES:
+            # Unbekannter Buchungscode: nicht wortlos fallen lassen.
+            register_unhandled_activity_code(
+                unhandled_activity_codes, code, amount_eur,
+                description=f.get('activityDescription', ''),
+            )
+            continue
+
+        funds_processed += 1
+
         # Check if this is an InvStG ETF dividend/WHT
         # Anlage-SO-ETFs (auch via Override, Issue #51) landen hier NICHT, denn
         # Ausschüttungen auf physische Edelmetall-ETCs sind nicht als InvStG-
@@ -4749,6 +4902,19 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             # Margin-Sollzinsen, Leihgebühren, SYEP — NICHT abzugsfähig (§20 Abs. 9 EStG)
             # Werbungskosten bei Kapitalerträgen → nur Sparer-Pauschbetrag erlaubt
             debit_interest_eur += amount_eur
+        elif code == 'CFD':
+            # IBKR bucht unter diesem Code die Finanzierungsseite von CFDs, nicht
+            # das Kursergebnis (das laeuft ueber die Trades mit assetCategory=CFD).
+            # Habenzinsen (z.B. auf Short-CFDs) sind Kapitalertrag nach
+            # §20 Abs. 1 Nr. 7 EStG → Topf 2. Finanzierungs- und Leihgebuehren
+            # sind Werbungskosten und damit nach §20 Abs. 9 EStG nicht abziehbar
+            # → gleicher nachrichtlicher Ausweis wie DINT.
+            if amount_eur >= 0:
+                interest_eur += amount_eur
+                cfd_interest_income_eur += amount_eur
+            else:
+                debit_interest_eur += amount_eur
+                cfd_financing_cost_eur += amount_eur
         elif code in ['INTR', 'CINT', 'INTP']:
             # INTR = Bond Coupon/Interest, CINT = Credit Interest
             # INTP = Accrued interest paid (Stückzinsen — negative Einnahme, abzugsfähig)
@@ -4961,11 +5127,17 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                         summary_topf = 'Topf1'
                         stocks_gain += gain_eur
                         stocks_loss += loss_eur
-                elif asset in ['OPT', 'FUT', 'FOP', 'FSFOP']:
+                elif asset in TOPF2_ASSET_CATEGORIES:
                     options_gain += gain_eur
                     options_loss += loss_eur
                     add_topf2_detail(TOPF2_CAT_LABELS.get(asset, asset), gain_eur)
                     add_topf2_detail(TOPF2_CAT_LABELS.get(asset, asset), loss_eur)
+                else:
+                    summary_topf = 'Nicht zugeordnet'
+                    register_unrouted_category(
+                        unrouted_asset_categories, asset, gain_eur + loss_eur,
+                        symbol=s_row.get('symbol', ''), source='pnl_summary',
+                    )
                 added_from_summary += 1
                 net_eur = gain_eur + loss_eur
                 debug_rows.append({
@@ -6045,6 +6217,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         "domestic_taxed_dividends_eur": domestic_taxed_dividends_eur,
         "interest_eur": interest_eur,
         "debit_interest_eur": debit_interest_eur,
+        # Laufende Gebuehren/Umsatzsteuer (OFEE/STAX) — nachrichtlich,
+        # nicht Teil der Ertragsrechnung. TTAX ist ein manueller Prueffall.
+        "other_fees_eur": other_fees_eur,
         "stocks_gain_eur": stocks_gain,
         "stocks_loss_eur": stocks_loss,
         "stocks_net_eur": stocks_gain + stocks_loss,
@@ -6117,6 +6292,21 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             "usd_to_eur_rates_count": len(usd_to_eur_rates),
             "ecb_rates_used": ecb_rates_used,
             "fx_rate_parse_failures": fx_rate_parse_failures,
+            # Realisierte PnL ohne Topf-Zuordnung (unbekannte assetCategory).
+            # Leer = alles zugeordnet; Eintraege sind ein Prueffall, kein Fehler.
+            "unrouted_asset_categories": sorted(
+                unrouted_asset_categories.values(), key=lambda e: e['category']
+            ),
+            # Nachrichtlich: CFD-Finanzierungsseite (Issue #85). Die Ertraege
+            # stecken in interest_eur, die Kosten in debit_interest_eur.
+            "cfd_interest_income_eur": cfd_interest_income_eur,
+            "cfd_financing_cost_eur": cfd_financing_cost_eur,
+            # Laufende Gebuehren/Umsatzsteuer je Code (nur nachrichtlich) und
+            # Cash-Buchungen ohne sichere automatische Zuordnung (Prueffall).
+            "fee_by_activity_code": dict(sorted(fee_by_activity_code.items())),
+            "unhandled_activity_codes": sorted(
+                unhandled_activity_codes.values(), key=lambda e: e['code']
+            ),
             # Issue #83: erkannte Symbol-Aliasse (kanonisch → abweichende
             # Schreibweisen), z.B. {'CONd': ['CON']} oder Ticker-Renames.
             "underlying_symbol_aliases": underlying_symbol_aliases,
@@ -6145,6 +6335,29 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         }
     }
 
+    if unrouted_asset_categories:
+        total_unrouted = sum(e['pnl_eur'] for e in unrouted_asset_categories.values())
+        print(f"  (!) WARNUNG: {len(unrouted_asset_categories)} Instrumentenkategorie(n) ohne "
+              f"Topf-Zuordnung, Saldo {total_unrouted:,.2f} EUR. Diese Ergebnisse fehlen in "
+              f"Anlage KAP und muessen manuell geprueft werden.")
+        for entry in sorted(unrouted_asset_categories.values(), key=lambda e: e['category']):
+            syms = ', '.join(entry['symbols'][:5])
+            if len(entry['symbols']) > 5:
+                syms += f" (+{len(entry['symbols']) - 5} weitere)"
+            print(f"      {entry['category']}: {entry['count']} Position(en), "
+                  f"{entry['pnl_eur']:,.2f} EUR{' — ' + syms if syms else ''}")
+
+    if unhandled_activity_codes:
+        total_unhandled = sum(e['amount_eur'] for e in unhandled_activity_codes.values())
+        print(f"  (!) WARNUNG: {len(unhandled_activity_codes)} nicht automatisch "
+              f"zugeordnete(r) Cash-Buchungscode(s), "
+              f"Saldo {total_unhandled:,.2f} EUR. Diese Betraege sind in keiner Zeile enthalten "
+              f"und muessen manuell geprueft werden.")
+        for entry in sorted(unhandled_activity_codes.values(), key=lambda e: e['code']):
+            desc = '; '.join(entry['descriptions'])
+            print(f"      {entry['code']}: {entry['count']} Buchung(en), "
+                  f"{entry['amount_eur']:,.2f} EUR{' — ' + desc[:90] if desc else ''}")
+
     print("\n" + "="*60)
     print(f"GERMAN TAX REPORT - ANLAGE KAP {tax_year}")
     print("="*60)
@@ -6165,6 +6378,13 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     print(f"    Zinsen:                {interest_eur:>12,.2f} EUR")
     if abs(debit_interest_eur) > 0.01:
         print(f"    Sollzinsen (n. abzf.): {debit_interest_eur:>12,.2f} EUR  (§20 Abs. 9 EStG, nicht in Berechnung)")
+    if abs(cfd_interest_income_eur) > 0.01 or abs(cfd_financing_cost_eur) > 0.01:
+        print(f"      davon CFD:           Zinsen {cfd_interest_income_eur:>9,.2f} / "
+              f"Kosten {cfd_financing_cost_eur:>9,.2f} EUR")
+    if abs(other_fees_eur) > 0.01:
+        codes = ', '.join(f"{c} {v:,.2f}" for c, v in sorted(fee_by_activity_code.items()))
+        print(f"    Sonstige Gebühren:     {other_fees_eur:>12,.2f} EUR  "
+              f"(nachrichtlich, nicht in Berechnung: {codes})")
     if stillhalter_premium_eur > 0:
         print(f"    Stillhalterprämien:    {stillhalter_premium_eur:>12,.2f} EUR  ({stillhalter_count} Assignments)")
     print(f"    Sonstige Gewinne:      {options_gain:>12,.2f} EUR")

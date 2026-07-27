@@ -1,8 +1,10 @@
 import copy
-import streamlit as st
+import html
 import os
 import tempfile
 from datetime import datetime as _dt
+
+import streamlit as st
 
 import extract_ibkr_data
 import calculate_tax_report
@@ -365,7 +367,7 @@ def merge_report_data(reports):
     # Simple sum fields
     for field in ['stocks_gain_eur', 'stocks_loss_eur', 'dividends_eur', 'interest_eur',
                   'domestic_taxed_dividends_eur', 'domestic_withholding_tax_eur',
-                  'debit_interest_eur', 'options_gain_eur', 'options_loss_eur',
+                  'debit_interest_eur', 'other_fees_eur', 'options_gain_eur', 'options_loss_eur',
                   'withholding_tax_eur', 'fx_total_gain', 'fx_total_loss', 'fx_translation',
                   'fx_correction_total', 'fx_correction_kap_inv_taxable']:
         merged[field] = sum(r.get(field, 0) for r in reports)
@@ -642,7 +644,49 @@ def merge_report_data(reports):
         'etf_correction_cy': sum(r.get('audit', {}).get('etf_correction_cy', 0) for r in reports),
         'put_nosell_premium_eur': sum(r.get('audit', {}).get('put_nosell_premium_eur', 0) for r in reports),
         'underlying_symbol_aliases': {},
+        'unrouted_asset_categories': [],
+        'cfd_interest_income_eur': sum(r.get('audit', {}).get('cfd_interest_income_eur', 0) for r in reports),
+        'cfd_financing_cost_eur': sum(r.get('audit', {}).get('cfd_financing_cost_eur', 0) for r in reports),
+        'fee_by_activity_code': {},
+        'unhandled_activity_codes': [],
     }
+    _fees_by_code = {}
+    _unhandled_by_code = {}
+    for r in reports:
+        for _c, _v in (r.get('audit', {}).get('fee_by_activity_code') or {}).items():
+            _fees_by_code[_c] = _fees_by_code.get(_c, 0.0) + _v
+        for _e in r.get('audit', {}).get('unhandled_activity_codes', []):
+            _code = _e.get('code', '(leer)')
+            _agg = _unhandled_by_code.setdefault(
+                _code, {'code': _code, 'count': 0, 'amount_eur': 0.0, 'descriptions': []}
+            )
+            _agg['count'] += _e.get('count', 0)
+            _agg['amount_eur'] += _e.get('amount_eur', 0.0)
+            for _d in _e.get('descriptions', []):
+                if _d not in _agg['descriptions'] and len(_agg['descriptions']) < 3:
+                    _agg['descriptions'].append(_d)
+    merged_audit['fee_by_activity_code'] = dict(sorted(_fees_by_code.items()))
+    merged_audit['unhandled_activity_codes'] = sorted(
+        _unhandled_by_code.values(), key=lambda e: e['code']
+    )
+    _unrouted_by_cat = {}
+    for r in reports:
+        for _e in r.get('audit', {}).get('unrouted_asset_categories', []):
+            _cat = _e.get('category', '(leer)')
+            _agg = _unrouted_by_cat.setdefault(
+                _cat, {'category': _cat, 'count': 0, 'pnl_eur': 0.0, 'symbols': [], 'sources': []}
+            )
+            _agg['count'] += _e.get('count', 0)
+            _agg['pnl_eur'] += _e.get('pnl_eur', 0.0)
+            for _s in _e.get('symbols', []):
+                if _s not in _agg['symbols']:
+                    _agg['symbols'].append(_s)
+            for _src in _e.get('sources', []):
+                if _src not in _agg['sources']:
+                    _agg['sources'].append(_src)
+    merged_audit['unrouted_asset_categories'] = sorted(
+        _unrouted_by_cat.values(), key=lambda e: e['category']
+    )
     for r in reports:
         a = r.get('audit', {})
         for _canon, _members in a.get('underlying_symbol_aliases', {}).items():
@@ -1098,6 +1142,54 @@ if zufluss_unmatched:
 </div>
 """, unsafe_allow_html=True)
 
+unrouted_categories = d.get('audit', {}).get('unrouted_asset_categories', [])
+if unrouted_categories:
+    unrouted_total = sum(e.get('pnl_eur', 0) for e in unrouted_categories)
+    unrouted_rows = []
+    for e in unrouted_categories:
+        category = html.escape(str(e.get('category', '?')))
+        syms = ', '.join(
+            html.escape(str(symbol)) for symbol in e.get('symbols', [])[:6]
+        )
+        if len(e.get('symbols', [])) > 6:
+            syms += f" und {len(e['symbols']) - 6} weitere"
+        unrouted_rows.append(
+            f"<strong>{category}</strong>: {e.get('count', 0)} Position(en), "
+            f"{e.get('pnl_eur', 0):,.2f} EUR{' (' + syms + ')' if syms else ''}"
+        )
+    unrouted_lines = "<br>".join(unrouted_rows)
+    st.markdown(f"""
+<div style="background: rgba(251,146,60,0.08); border: 1px solid rgba(251,146,60,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
+    <strong style="color: #fb923c;">Nicht zugeordnete Instrumente:</strong>
+    Für {len(unrouted_categories)} Instrumentenkategorie(n) mit einem Saldo von {unrouted_total:,.2f} EUR kennt das Tool keine Steuertopf-Zuordnung:<br>{unrouted_lines}<br>
+    Diese Ergebnisse sind in den Zeilen der Anlage KAP <strong>nicht enthalten</strong> und müssen manuell nachgetragen werden.
+    <br><span style="color: #64748b; font-size: 0.75rem;">Die betroffenen Trades stehen im Excel-Export im Block "Nicht zugeordnet". Bitte melde die Kategorie als Issue, damit sie fest eingebaut werden kann.</span>
+</div>
+""", unsafe_allow_html=True)
+
+unhandled_codes = d.get('audit', {}).get('unhandled_activity_codes', [])
+if unhandled_codes:
+    unhandled_total = sum(e.get('amount_eur', 0) for e in unhandled_codes)
+    code_rows = []
+    for e in unhandled_codes:
+        code = html.escape(str(e.get('code', '?')))
+        desc = html.escape('; '.join(
+            str(description) for description in e.get('descriptions', [])
+        )[:120])
+        code_rows.append(
+            f"<strong>{code}</strong>: {e.get('count', 0)} Buchung(en), "
+            f"{e.get('amount_eur', 0):,.2f} EUR{' (' + desc + ')' if desc else ''}"
+        )
+    code_lines = "<br>".join(code_rows)
+    st.markdown(f"""
+<div style="background: rgba(251,146,60,0.08); border: 1px solid rgba(251,146,60,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
+    <strong style="color: #fb923c;">Nicht automatisch zugeordnete Cash-Buchungen:</strong>
+    IBKR hat Buchungsarten geliefert, für die das Tool keine sichere automatische Behandlung kennt, Saldo {unhandled_total:,.2f} EUR:<br>{code_lines}<br>
+    Diese Beträge sind in <strong>keiner</strong> Zeile der Anlage KAP enthalten.
+    <br><span style="color: #64748b; font-size: 0.75rem;">TTAX und andere Prüffälle bitte anhand der IBKR-Abrechnung manuell zuordnen; neue Buchungscodes bitte als Issue melden.</span>
+</div>
+""", unsafe_allow_html=True)
+
 # ── Zuflussprinzip Toggle ────────────────────────────────────────────────────
 
 zuflussprinzip_aktiv = False
@@ -1441,6 +1533,7 @@ st.markdown(
     + metric_card("Dividenden", final['dividends'])
     + metric_card("Zinsen (netto)", final['interest'])
     + (metric_card("Sollzinsen (n. abzf.)", d.get('debit_interest_eur', 0), "info") if abs(d.get('debit_interest_eur', 0)) > 0.01 else '')
+    + (metric_card("Gebühren (nachrichtl.)", d.get('other_fees_eur', 0), "info") if abs(d.get('other_fees_eur', 0)) > 0.01 else '')
     + metric_card("Sonstige Gewinne", final['options_gain'], "gain")
     + metric_card("Sonstige Verluste", final['options_loss'], "loss")
     + metric_card("Saldo Sonstiges", final['topf_2'], "saldo")
@@ -2235,11 +2328,13 @@ if d:
         'Topf2': 'Topf 2 - Sonstiges (Termingeschäfte, Stillhalter, FX)',
         'KAP-INV': 'Anlage KAP-INV (InvStG)',
         'Anlage SO': 'Anlage SO (§23 EStG)',
+        'Nicht zugeordnet': 'Nicht zugeordnet (bitte manuell prüfen)',
     }
     cat_labels = {
         'STK': 'Aktie', 'OPT': 'Option', 'FUT': 'Future',
         'FOP': 'Futures-Option', 'FSFOP': 'Flex-Option',
         'BILL': 'T-Bill', 'BOND': 'Anleihe',
+        'WAR': 'Optionsschein', 'CFD': 'CFD',
     }
     trades_by_topf = defaultdict(list)
     for row in trade_details:
@@ -2261,7 +2356,7 @@ if d:
     else:
         header = "**Keine Trade-Details - Zusammenfassung verfügbar**"
     summary_lines = [header]
-    for topf_key in ['Topf1', 'Topf2', 'KAP-INV', 'Anlage SO']:
+    for topf_key in ['Topf1', 'Topf2', 'KAP-INV', 'Anlage SO', 'Nicht zugeordnet']:
         rows = trades_by_topf.get(topf_key, [])
         if rows:
             s = sum(r.get('pnl_eur', 0) for r in rows)
@@ -2514,7 +2609,7 @@ if d:
         notice.font = Font(italic=True, size=9, color="7f6000")
         notice.fill = korr_fill
         row_num = 3
-        for topf_key in ['Topf1', 'Topf2', 'KAP-INV', 'Anlage SO']:
+        for topf_key in ['Topf1', 'Topf2', 'KAP-INV', 'Anlage SO', 'Nicht zugeordnet']:
             topf_rows = trades_by_topf.get(topf_key, [])
             if not topf_rows: continue
             ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=len(cols))

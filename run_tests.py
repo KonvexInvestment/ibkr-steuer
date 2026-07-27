@@ -52,6 +52,7 @@ SYNTHETIC_TESTS = [
     ("Options-Event-Sammlung", "tests/test_option_event_collection.py"),
     ("Tageskurs-Korrektur-Maps", "tests/test_tageskurs_adjustment_maps.py"),
     ("Underlying-Symbol-Aliasse", "tests/test_underlying_symbol_matching.py"),
+    ("Instrumentenkategorie-Routing", "tests/test_asset_category_routing.py"),
 ]
 
 
