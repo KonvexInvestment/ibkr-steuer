@@ -6209,7 +6209,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     if anlage_so_result['details'] or anlage_so_result['total_gain'] != 0 or anlage_so_result['total_loss'] != 0:
         print("-" * 60)
         print("ANLAGE SO (§23 EStG — Private Veräußerungsgeschäfte)")
-        print("    Physische Gold-ETCs mit Lieferanspruch (BFH VIII R 4/15)")
+        print("    Physische Gold-ETCs mit Lieferanspruch (BFH VIII R 35/14, VIII R 4/15)")
         for isin, data in sorted(anlage_so_result['by_isin'].items(), key=lambda x: abs(x[1]['total']), reverse=True):
             print(f"    {data['ticker']:6s}  Gesamt: {data['total']:>10,.2f}  Stpfl.: {data['taxable']:>10,.2f}  Frei: {data['tax_free']:>10,.2f}")
         so_taxable = anlage_so_result['taxable_gain'] + anlage_so_result['taxable_loss']

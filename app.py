@@ -788,7 +788,7 @@ st.markdown("""
     Diese werden automatisch mit unserer Einzelberechnung aus der Flex Query XML verglichen. Cent-genaue Übereinstimmung ist das Ziel.<br><br>
     <strong style="color: #6ee7b7;">FX-Fallback:</strong>
     Bei EUR-Basiskonten liefert der CSV-Bericht IBKRs aggregierte FIFO-Rohwerte als
-    Ersatz, falls Ihre Flex Query keine <code>FxTransactions</code>-Sektion enthält.
+    Ersatz, falls die Flex Query keine <code>FxTransactions</code>-Sektion enthält.
     Einzelne Schuldtilgungen sind darin nicht erkennbar; bei negativem Währungssaldo
     und aktiver Saldo-Korrektur verwendet das Tool deshalb stattdessen die
     FIFO-Näherung aus den Kontobewegungen.<br><br>
@@ -1066,7 +1066,7 @@ has_cross_year = len(cross_year_details) > 0 or len(zufluss_details) > 0 or len(
 if not d.get('has_trade_price', False):
     st.markdown("""
 <div style="background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #fbbf24;">Hinweis:</strong> Ihre Flex Query enthält kein <code>tradePrice</code>-Feld. Stillhalterprämien werden mit dem Tagesschlusskurs (<code>closePrice</code>) statt dem tatsächlichen Ausführungspreis berechnet.
+    <strong style="color: #fbbf24;">Hinweis:</strong> Die Flex Query enthält kein <code>tradePrice</code>-Feld. Stillhalterprämien werden mit dem Tagesschlusskurs (<code>closePrice</code>) statt dem tatsächlichen Ausführungspreis berechnet.
     Für genauere Ergebnisse: In IBKR unter <em>Reports → Flex Queries</em> eine erweiterte Query erstellen und bei <em>Trade Confirmation</em> alle Felder aktivieren (insbesondere <em>Execution</em>-Details).
 </div>
 """, unsafe_allow_html=True)
@@ -1170,7 +1170,7 @@ if unrouted_categories:
     <strong style="color: #fb923c;">Nicht zugeordnete Instrumente:</strong>
     Für {len(unrouted_categories)} Instrumentenkategorie(n) mit einem Saldo von {unrouted_total:,.2f} EUR kennt das Tool keine Steuertopf-Zuordnung:<br>{unrouted_lines}<br>
     Diese Ergebnisse sind in den Zeilen der Anlage KAP <strong>nicht enthalten</strong> und müssen manuell nachgetragen werden.
-    <br><span style="color: #64748b; font-size: 0.75rem;">Die betroffenen Trades stehen im Excel-Export im Block "Nicht zugeordnet". Bitte melde die Kategorie als Issue, damit sie fest eingebaut werden kann.</span>
+    <br><span style="color: #64748b; font-size: 0.75rem;">Die betroffenen Trades stehen im Excel-Export im Block "Nicht zugeordnet". Die Kategorie kann als Issue gemeldet werden, damit sie fest eingebaut wird.</span>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1251,7 +1251,7 @@ if has_etf_data:
 
     st.markdown(f"""
 <div style="background: rgba(74,222,128,0.08); border: 1px solid rgba(74,222,128,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #4ade80;">InvStG-Klassifizierung (§2 InvStG):</strong> {len(etf_by_isin)} ETFs in Ihrer XML erkannt, die nach dem Investmentsteuergesetz als Investmentfonds gelten und auf <strong>Anlage KAP-INV</strong> gemeldet werden (nicht auf Anlage KAP).
+    <strong style="color: #4ade80;">InvStG-Klassifizierung (§2 InvStG):</strong> {len(etf_by_isin)} ETFs in der XML erkannt, die nach dem Investmentsteuergesetz als Investmentfonds gelten und auf <strong>Anlage KAP-INV</strong> gemeldet werden (nicht auf Anlage KAP).
     Davon {cls_summary}.<br>
     <span style="color: #64748b; font-size: 0.75rem;">Betroffene ETFs: {etf_tickers}</span>
 </div>
@@ -1356,7 +1356,7 @@ if abs(zeile_7) > 0.01:
     de_kest_variante_b = st.checkbox(
         "Variante B: DE-KESt nach Zeile 19/41 verschieben",
         value=False,
-        help="Aktivieren, falls dein Steuerprogramm Zeile 7/37/38 mangels "
+        help="Aktivieren, falls das Steuerprogramm Zeile 7/37/38 mangels "
              "Steuerbescheinigung nicht freischaltet. Die Bruttodividende wird dann zu "
              "Zeile 19, DE-KESt+Soli zu Zeile 41 addiert. Das ist eine technische "
              "Ersatzdarstellung, kein amtlich belegter Ersatz für die Bescheinigung; "
@@ -1473,10 +1473,10 @@ if not xml_has_fx and fx_source != 'csv':
     st.markdown("""
 <div style="background: rgba(251,146,60,0.1); border: 1px solid rgba(251,146,60,0.35); border-radius: 10px; padding: 0.85rem 1rem; margin-bottom: 1rem; font-size: 0.82rem; color: #cbd5e1; line-height: 1.6;">
     <strong style="color: #fb923c; font-size: 0.9rem;">Flex Query unvollständig: Keine FX-Transaktionsdaten</strong><br>
-    Ihre Flex Query XML enthält keine <code>FxTransactions</code>-Sektion. Ohne diese Daten können Fremdwährungs-Gewinne/-Verluste
+    Die Flex Query XML enthält keine <code>FxTransactions</code>-Sektion. Ohne diese Daten können Fremdwährungs-Gewinne/-Verluste
     nur approximiert werden (FIFO-Schätzung mit eingeschränkter Genauigkeit).<br><br>
-    <strong style="color: #fdba74;">Lösung bei EUR-Basiskonten:</strong> Laden Sie den
-    <strong>IBKR Standard-Bericht (CSV)</strong> oben hoch: Er enthält IBKRs aggregierte
+    <strong style="color: #fdba74;">Lösung bei EUR-Basiskonten:</strong> Oben zusätzlich den
+    <strong>IBKR Standard-Bericht (CSV)</strong> hochladen: Er enthält IBKRs aggregierte
     FIFO-Rohwerte. Einzelne Schuldtilgungen lassen sich daraus nicht erkennen; bei negativem
     Währungssaldo und aktiver Saldo-Korrektur bleibt daher die FIFO-Näherung maßgeblich.
     Bei USD-Basiskonten ist dieser CSV-Fallback nicht verfügbar.<br>
@@ -2279,7 +2279,7 @@ if selectable_etfs:
     st.markdown("""
 <div style="background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
     <strong style="color: #fbbf24;">Nur für physische Edelmetall-ETCs mit Lieferanspruch</strong>
-    (BFH VIII R 4/15, analog zu Xetra-Gold / EUWAX Gold II). Die Zuordnung gilt nur für diese Session -
+    (BFH VIII R 35/14 und VIII R 4/15, analog zu Xetra-Gold / EUWAX Gold II). Die Zuordnung gilt nur für diese Session:
     ausgewählte ETFs werden aus Anlage KAP-INV entfernt und auf Anlage SO (§23 EStG) berechnet,
     inkl. 1-Jahres-Spekulationsfrist.
 </div>
@@ -2315,14 +2315,15 @@ if has_so_data:
             '<br><br><strong style="color: #f87171;">Haltedauer nicht ermittelbar:</strong> '
             'Ohne Vorjahres-XMLs oder CLOSED_LOT-Daten kann die Haltedauer nicht bestimmt werden. '
             f'Betroffene Positionen ({fmt(so_unknown)}) werden konservativ als <strong>steuerpflichtig</strong> behandelt. '
-            'Laden Sie die XML des Kaufjahres als History-Datei hoch, um die Spekulationsfrist korrekt zu berechnen.'
+            'Die XML-Datei des Kaufjahres als History-Datei hochladen, damit die Spekulationsfrist korrekt berechnet werden kann.'
         )
 
     st.markdown(f"""
 <div style="background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
     <strong style="color: #fbbf24;">Physische Edelmetall-ETCs mit Lieferanspruch</strong> werden nach
     <strong>§23 Abs. 1 S. 1 Nr. 2 EStG</strong> als private Veräußerungsgeschäfte behandelt
-    (bestätigt durch <strong>BFH VIII R 4/15</strong> für Xetra-Gold; analog für Silber/Platin/Palladium).
+    (bestätigt durch <strong>BFH VIII R 35/14</strong> für die Veräußerung und <strong>VIII R 4/15</strong> für die
+    physische Auslieferung von Xetra-Gold; analog für Silber/Platin/Palladium).
     Die Spekulationsfrist beträgt <strong>1 Jahr</strong> (§23 Abs. 1 S. 1 Nr. 2 S. 1 EStG) -
     Veräußerungsgewinne nach Ablauf dieser Frist sind <strong style="color: #4ade80;">steuerfrei</strong>.
     Innerhalb der Frist sind sie auf <strong>Anlage SO</strong> zu erklären (nicht auf Anlage KAP).{history_hint}
@@ -3150,14 +3151,14 @@ Beim Halten von Fremdwährungsguthaben (z.B. USD) auf einem verzinslichen Konto 
 
 ### Stillhalterprämien bei Assignments (BMF Rn. 25–35)
 
-Wenn Sie eine Option verkaufen (Stillhalter) und diese ausgeübt wird (Assignment), muss die Prämie steuerlich korrekt zugeordnet werden:
+Wird eine verkaufte Option (Stillhalterposition) ausgeübt (Assignment), muss die Prämie steuerlich korrekt zugeordnet werden:
 
 - **Prämie** = laufende Einnahmen nach §20 Abs. 1 Nr. 11 → gehört in **Topf 2**
 - **Aktientransaktion** = Veräußerung (Call, Rn. 26) bzw. Anschaffung (Put, Rn. 33) nach §20 Abs. 2 → gehört in **Topf 1**
 
 Bei **beiden** Assignment-Typen gilt laut BMF: „Die vereinnahmte Optionsprämie wird bei der Ermittlung des Veräußerungsgewinns **nicht berücksichtigt**." IBKR bündelt die Prämie jedoch im Aktien-Trade (Call: im Verkaufserlös, Put: in den reduzierten Anschaffungskosten). Dieses Tool erkennt Assignments automatisch und trennt die Prämie heraus.
 
-{"**In Ihrem Report:** " + str(sh_count) + " Assignments erkannt (Call + Put), " + fmt_de(sh_eur) + " EUR Stillhalterprämien von Topf 1 nach Topf 2 verschoben." if sh_count > 0 else "**In Ihrem Report:** Keine Assignments erkannt."}
+{"**In diesem Report:** " + str(sh_count) + " Assignments erkannt (Call + Put), " + fmt_de(sh_eur) + " EUR Stillhalterprämien von Topf 1 nach Topf 2 verschoben." if sh_count > 0 else "**In diesem Report:** Keine Assignments erkannt."}
 
 ---
 
@@ -3181,7 +3182,7 @@ Bei **beiden** Assignment-Typen gilt laut BMF: „Die vereinnahmte Optionsprämi
 
 Ausländische Quellensteuern auf Dividenden und Zinsen (z.B. 15% US-Quellensteuer) werden in Zeile 41 als **anrechenbare ausländische Steuern** gemeldet. Zeile 41 setzt sich aus zwei Teilen zusammen: der Quellensteuer außerhalb der Fonds und der anrechenbaren Fonds-Quellensteuer aus KAP-INV. Damit steht die Fonds-Quellensteuer genau einmal im Formular; KAP-INV hat keine eigene Quellensteuer-Zeile.
 
-Deutsche Dividendensteuer aus Buchungen mit `- DE Steuer` wird dagegen in Kapitalertragsteuer (Zeile 37) und Solidaritätszuschlag (Zeile 38) aufgeteilt. Wenn Ihr Steuerprogramm diese Zeilen ohne Steuerbescheinigung nach §45a EStG sperrt, bietet "Variante B" eine technische Ersatzdarstellung über Zeile 19 bzw. 41. Sie ist kein amtlich belegter Ersatz für die Steuerbescheinigung und sollte vor der Abgabe mit Finanzamt oder Steuerberatung abgestimmt werden.
+Deutsche Dividendensteuer aus Buchungen mit `- DE Steuer` wird dagegen in Kapitalertragsteuer (Zeile 37) und Solidaritätszuschlag (Zeile 38) aufgeteilt. Wenn das Steuerprogramm diese Zeilen ohne Steuerbescheinigung nach §45a EStG sperrt, bietet "Variante B" eine technische Ersatzdarstellung über Zeile 19 bzw. 41. Sie ist kein amtlich belegter Ersatz für die Steuerbescheinigung und sollte vor der Abgabe mit Finanzamt oder Steuerberatung abgestimmt werden.
 
 ---
 
@@ -3203,7 +3204,7 @@ Da Interactive Brokers ein **ausländischer Broker ohne inländischen Steuerabzu
 
 ### Währungsumrechnung
 
-{"**Ihr Konto hat EUR als Basiswährung.** Alle Beträge in der IBKR-Abrechnung sind bereits in EUR umgerechnet. Bei USD-Trades nutzt IBKR den Tageskurs (`fxRateToBase`), der direkt in EUR umrechnet, kein zusätzlicher FX-Lookup erforderlich." if base_curr == "EUR" else "**Ihr Konto hat USD als Basiswährung.** Beträge werden in zwei Schritten umgerechnet: (1) Trade-Währung → USD über `fxRateToBase`, (2) USD → EUR über den Tageskurs des vorherigen Geschäftstags. Die täglichen USD/EUR-Kurse werden aus den IBKR-Daten extrahiert."}
+{"**Das Konto hat EUR als Basiswährung.** Alle Beträge in der IBKR-Abrechnung sind bereits in EUR umgerechnet. Bei USD-Trades nutzt IBKR den Tageskurs (`fxRateToBase`), der direkt in EUR umrechnet, kein zusätzlicher FX-Lookup erforderlich." if base_curr == "EUR" else "**Das Konto hat USD als Basiswährung.** Beträge werden in zwei Schritten umgerechnet: (1) Trade-Währung → USD über `fxRateToBase`, (2) USD → EUR über den Tageskurs des vorherigen Geschäftstags. Die täglichen USD/EUR-Kurse werden aus den IBKR-Daten extrahiert."}
 
 ---
 
@@ -3354,7 +3355,7 @@ Buchungscodes außerhalb dieser Tabelle werden nicht stillschweigend übergangen
 
 ### Schritt 6: Währungsumrechnung
 
-{"**Ihr Konto: EUR-Basis.** Alle Beträge in `statement_of_funds` und `fifoPnlRealized × fxRateToBase` sind direkt in EUR. Es wird kein separater Tageskurs-Lookup benötigt." if base_curr == "EUR" else "**Ihr Konto: USD-Basis.** Zweistufige Umrechnung: (1) `fifoPnlRealized × fxRateToBase` → USD, (2) USD → EUR über täglichen Wechselkurs. Kurse werden primär aus EUR-Einträgen in Trades/Funds extrahiert; Lücken werden automatisch mit **EZB-Referenzkursen** gefüllt."}
+{"**Konto: EUR-Basis.** Alle Beträge in `statement_of_funds` und `fifoPnlRealized × fxRateToBase` sind direkt in EUR. Es wird kein separater Tageskurs-Lookup benötigt." if base_curr == "EUR" else "**Konto: USD-Basis.** Zweistufige Umrechnung: (1) `fifoPnlRealized × fxRateToBase` → USD, (2) USD → EUR über täglichen Wechselkurs. Kurse werden primär aus EUR-Einträgen in Trades/Funds extrahiert; Lücken werden automatisch mit **EZB-Referenzkursen** gefüllt."}
 
 | Szenario | Formel |
 |---|---|
@@ -3601,7 +3602,7 @@ if abs(zeile_7) > 0.01:
     else:
         de_kest_export = (
             "\nHINWEIS DEUTSCHE DIVIDENDEN (Variante A aktiv)\n"
-            "  Falls dein Steuerprogramm Z. 7/37/38 nicht freischaltet, alternativ:\n"
+            "  Falls das Steuerprogramm Z. 7/37/38 nicht freischaltet, alternativ:\n"
             f"    Zeile 19: +{fmt_de(zeile_7)} EUR  (Bruttodividende)\n"
             f"    Zeile 41: +{fmt_de(z_kest_total)} EUR  (DE-KESt+Soli als anrechenbare Steuer)\n"
             "  Variante B ist eine technische Ersatzdarstellung und kein amtlich belegter\n"
@@ -3653,7 +3654,7 @@ ANLAGE KAP EINTRAGUNGEN
   Zeile 22 (Verluste o. Aktien): {fmt_de(final['zeile_22']):>8} EUR
   Zeile 23 (Aktienverluste): {fmt_de(final['zeile_23']):>11} EUR
   Zeile 41 (ausl. Quellensteuer): {fmt_de(final['quellensteuer']):>8} EUR
-{de_kest_export}{kap_inv_entries_export}{"" if not has_so_data else chr(10) + "ANLAGE SO (§23 EStG): PRIVATE VERÄUSSERUNGSGESCHÄFTE" + chr(10) + f"  Physische Gold-ETCs (BFH VIII R 4/15)" + chr(10) + f"  Steuerpflichtig (≤ 1J): {fmt_de(so_taxable_for_row):>12} EUR  → Anlage SO" + chr(10) + f"  Steuerfrei (> 1J):      {fmt_de(so_free_for_row):>12} EUR" + chr(10)}═══════════════════════════════════════════════════
+{de_kest_export}{kap_inv_entries_export}{"" if not has_so_data else chr(10) + "ANLAGE SO (§23 EStG): PRIVATE VERÄUSSERUNGSGESCHÄFTE" + chr(10) + f"  Physische Gold-ETCs (BFH VIII R 35/14, VIII R 4/15)" + chr(10) + f"  Steuerpflichtig (≤ 1J): {fmt_de(so_taxable_for_row):>12} EUR  → Anlage SO" + chr(10) + f"  Steuerfrei (> 1J):      {fmt_de(so_free_for_row):>12} EUR" + chr(10)}═══════════════════════════════════════════════════
 """
 
 st.download_button(
@@ -3679,7 +3680,7 @@ Dieses Tool dient ausschließlich zur Unterstützung bei der Erstellung der Eink
 
 <br><br>
 <strong style="color: #94a3b8;">Keine Steuerberatung</strong><br>
-Dieses Tool stellt keine Steuerberatung im Sinne des Steuerberatungsgesetzes (StBerG) dar und ersetzt nicht die Beratung durch einen Steuerberater, Wirtschaftsprüfer oder eine andere zur Steuerberatung befugte Person. Bei Unsicherheiten oder komplexen Sachverhalten konsultieren Sie bitte einen steuerlichen Berater.
+Dieses Tool stellt keine Steuerberatung im Sinne des Steuerberatungsgesetzes (StBerG) dar und ersetzt nicht die Beratung durch einen Steuerberater, Wirtschaftsprüfer oder eine andere zur Steuerberatung befugte Person. Bei Unsicherheiten oder komplexen Sachverhalten ist eine steuerliche Beratung hinzuzuziehen.
 
 <br><br>
 <strong style="color: #94a3b8;">Keine Haftung</strong><br>

@@ -8,7 +8,8 @@ fuer die Berechnung der Teilfreistellung:
   - sonstiger_fonds:   0% Teilfreistellung (Anleihen-ETFs, Derivate-Fonds)
   - no_invstg:        Kein Investmentfonds i.S.d. InvStG (physische Rohstoffe, Krypto-ETPs)
   - anlage_so:        Privates Veraeusserungsgeschaeft (ss 23 Abs. 1 Nr. 2 EStG)
-                      Physische Gold-ETCs mit Lieferanspruch (BFH VIII R 4/15).
+                      Physische Gold-ETCs mit Lieferanspruch (BFH VIII R 35/14
+                      zur Veraeusserung, VIII R 4/15 zur physischen Auslieferung).
                       Nach 1 Jahr Haltedauer steuerfrei (Spekulationsfrist).
 
 Rechtsgrundlage: ss 20 InvStG (Teilfreistellung), ss 2 InvStG (Investmentfonds-Definition)
@@ -22,7 +23,7 @@ werden nicht automatisch klassifiziert, sondern in den Pruefstatus verschoben.
 # ── Teilfreistellungssaetze ──────────────────────────────────────────────────
 TEILFREISTELLUNG = {
     'aktienfonds':     0.30,   # 30 % — ss 20 Abs. 1 S. 1 InvStG
-    'mischfonds':      0.15,   # 15 % — ss 20 Abs. 1 S. 2 InvStG
+    'mischfonds':      0.15,   # 15 % — ss 20 Abs. 2 InvStG (halber Aktienfonds-Satz)
     'immobilienfonds': 0.60,   # 60 % — ss 20 Abs. 3 S. 1 InvStG
     'auslands_immobilienfonds': 0.80,  # 80 % — ss 20 Abs. 3 S. 2 InvStG
     'sonstiger_fonds': 0.00,   # 0 %  — keine Teilfreistellung
@@ -372,7 +373,8 @@ ETF_CLASSIFICATION = {
     'US06742W5R66': ('DLBR', 'Barclays ETN+ FI Enhanced Global High Yield ETN',  'no_invstg'),  # ETN
 
     # --- Deutsche Gold-ETCs (physisch besichert, Lieferanspruch → Anlage SO) ---
-    # BFH VIII R 4/15: Xetra-Gold = privates Veräußerungsgeschäft (§23 EStG)
+    # BFH VIII R 35/14 (Veräußerung) und VIII R 4/15 (physische Auslieferung):
+    # Xetra-Gold = privates Veräußerungsgeschäft (§23 EStG)
     # Nach 1 Jahr Haltedauer steuerfrei (Spekulationsfrist)
     'DE000EWG2LD7': ('EWG2',  'EUWAX Gold II',                                   'anlage_so'),  # physisches Gold-ETC, Lieferanspruch
     'DE000EWG0LD1': ('GOLD1', 'EUWAX Gold I',                                    'anlage_so'),  # physisches Gold-ETC, Lieferanspruch
