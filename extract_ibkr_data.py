@@ -187,20 +187,41 @@ def extract_fx_multi_xml(xml_files, output_dir):
         except Exception as e:
             print(f"  FEHLER bei {xml_path}: {e}")
 
-    # Sort chronologically and deduplicate by transactionID
+    # Sort chronologically and deduplicate.
+    #
+    # WICHTIG: NICHT ueber transactionID allein deduplizieren. IBKR vergibt dieselbe
+    # transactionID fuer jede Folgebuchung derselben Position — alle taeglichen
+    # MTM-Abrechnungen eines Futures teilen sich eine ID (Beleg: audit1_2024.xml,
+    # tid 654722380 traegt 40+ Zeilen "M6E 18MAR24 Position MTM" an verschiedenen
+    # Tagen mit verschiedenen Betraegen). Auch am selben Tag kollidieren fachlich
+    # verschiedene Buchungen (tid 2389736669: "USD Borrow Fees" -19,63 und
+    # "SYEP Interest" +1,82). Ein ID-Key loeschte diese Zeilen als vermeintliche
+    # Duplikate: audit1 verlor netto -2.004,15 USD, audit2 -39.693,75 USD, wodurch
+    # der kumulierte Saldo und damit die FIFO-Naeherung (Option C) verfaelscht wurde.
+    #
+    # Beim Merge mehrerer XMLs sind Wiederholungen aus ueberlappenden
+    # Exportzeiträumen nur dann Duplikate, wenn alle sechs fachlichen
+    # Schluesselfelder uebereinstimmen: Waehrung, Datum, transactionID,
+    # Buchungstext, Betrag und Saldo.
     all_fx.sort(key=lambda x: x.get('date', ''))
     seen_ids = set()
     deduped = []
     for row in all_fx:
-        tid = row.get('transactionID', '')
         desc = row.get('activityDescription', '')
         if desc == 'Starting Balance':
             # Only keep the earliest Starting Balance per currency
             key = ('SB', row.get('currency', ''), row.get('date', ''))
-        elif tid:
-            key = tid
         else:
-            key = (row.get('date'), row.get('currency'), row.get('amount'))
+            # accountId steht nicht in FX_FIELDS und waere hier redundant: Die
+            # Extraktion laeuft je Konto (classify_xmls gruppiert vorher per accountId).
+            key = (
+                row.get('currency', ''),
+                row.get('date', ''),
+                row.get('transactionID', ''),
+                desc,
+                row.get('amount', ''),
+                row.get('balance', ''),
+            )
         if key in seen_ids:
             continue
         seen_ids.add(key)

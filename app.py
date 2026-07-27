@@ -438,8 +438,8 @@ def merge_report_data(reports):
             merged_fx[curr]['starting_balance'] += data.get('starting_balance', 0)
     merged['fx_results'] = merged_fx
 
-    # Issue #59 metadata for multi-account UI.
-    meta_sum_keys = ('approx_matches', 'skipped_full', 'partial_count')
+    # Issue #59/#84 metadata for multi-account UI.
+    meta_sum_keys = ('debt_repayments', 'debt_repayment_pnl')
     merged_meta = {k: 0 for k in meta_sum_keys}
     merged_meta.update({
         'has_negative_balance': merged['fx_has_negative_balance'],
@@ -447,11 +447,13 @@ def merge_report_data(reports):
         'corrected_total': 0.0,
         'raw_total': 0.0,
         'csv_raw_only': False,
+        'open_rows_with_pnl': [],
     })
     for r in reports:
         meta = r.get('fx_option_a_meta', {}) or {}
         for k in meta_sum_keys:
             merged_meta[k] += meta.get(k, 0)
+        merged_meta['open_rows_with_pnl'].extend(meta.get('open_rows_with_pnl', []) or [])
         merged_meta['corrected_total'] += meta.get(
             'corrected_total',
             sum(d.get('corrected_net', d.get('net', 0.0)) for d in r.get('fx_results', {}).values())
@@ -768,7 +770,8 @@ st.markdown("""
     <span style="color: #94a3b8; font-size: 0.78rem;">
     <strong>Mehrere Konten:</strong> Jedes Konto wird separat berechnet (eigene Trades, FX, Stillhalter). Die Ergebnisse werden addiert.
     Alle Konten müssen dieselbe Basiswährung (EUR oder USD) haben.<br>
-    <strong>Vorjahres-XMLs:</strong> Nur nötig bei Optionen über den Jahreswechsel (Stillhalter-Matching) oder für exakte FX-FIFO-Lots.
+    <strong>Vorjahres-XMLs:</strong> Nur nötig bei Optionen über den Jahreswechsel
+    (Stillhalter-Matching) oder für eine vollständigere Lot-Historie der FX-FIFO-Näherung.
     </span><br>
     <span style="color: #64748b;">IBKR &rarr; Performance &amp; Berichte &rarr; Flex-Abfragen &rarr; XML exportieren (gewünschter Zeitraum)</span>
 </div>
@@ -784,7 +787,11 @@ st.markdown("""
     Der IBKR-Bericht enthält aggregierte Summen pro Kategorie (Aktien, Optionen, Futures, Anleihen, Devisen, Dividenden, Zinsen, Quellensteuer).
     Diese werden automatisch mit unserer Einzelberechnung aus der Flex Query XML verglichen. Cent-genaue Übereinstimmung ist das Ziel.<br><br>
     <strong style="color: #6ee7b7;">FX-Fallback:</strong>
-    Falls Ihre Flex Query keine <code>FxTransactions</code>-Sektion enthält, liefert der CSV-Bericht die exakten Devisengewinne/-verluste als Ersatz.<br><br>
+    Bei EUR-Basiskonten liefert der CSV-Bericht IBKRs aggregierte FIFO-Rohwerte als
+    Ersatz, falls Ihre Flex Query keine <code>FxTransactions</code>-Sektion enthält.
+    Einzelne Schuldtilgungen sind darin nicht erkennbar; bei negativem Währungssaldo
+    und aktiver Saldo-Korrektur verwendet das Tool deshalb stattdessen die
+    FIFO-Näherung aus den Kontobewegungen.<br><br>
     <span style="background: rgba(16,185,129,0.12); border-radius: 6px; padding: 0.4rem 0.6rem; display: inline-block; margin-top: 0.2rem; color: #94a3b8;">
     <strong style="color: #a7f3d0;">So erstellen:</strong>
     IBKR &rarr; Performance &amp; Berichte &rarr; Kontoauszüge &rarr;
@@ -1329,7 +1336,8 @@ if abs(fx_corr_total) > 0.01:
 # Manche Steuerprogramme (WISO, Buhl, taxfix) schalten Z7/Z37/Z38 nur frei,
 # wenn eine deutsche Steuerbescheinigung nach §45a EStG vorliegt. IBKR liefert
 # diese nicht, obwohl die deutsche Verwahrstelle KESt+Soli auf DE-ISINs einbehält.
-# Variante B verschiebt die Werte nach Z19/Z41 — FA-seitig akzeptierter Workaround.
+# Variante B verschiebt die Werte technisch nach Z19/Z41. Sie ist kein amtlich
+# belegter Ersatz fuer die Steuerbescheinigung und muss fachlich abgestimmt werden.
 de_kest_variante_b = False
 if abs(zeile_7) > 0.01:
     st.markdown(f"""
@@ -1338,16 +1346,21 @@ if abs(zeile_7) > 0.01:
     {fmt_de(zeile_7)} EUR Bruttodividende + {fmt_de(zeile_37 + zeile_38)} EUR DE-KESt/Soli auf DE-ISINs (z.B. SAP, Allianz, Rheinmetall).
     Die deutsche Verwahrstelle (Clearstream) hat 26,375&nbsp;% an der Quelle einbehalten; das ist <em>inländischer Steuerabzug</em> nach §43 EStG, auch wenn IBKR keine Steuerbescheinigung ausstellt.<br><br>
     <strong style="color: #38bdf8;">Variante A (Default, tax-legally präzise):</strong> Eintragung in Z. 7 (brutto) + Z. 37 (KESt) + Z. 38 (Soli).<br>
-    <strong style="color: #38bdf8;">Variante B (Workaround):</strong> Manche Steuerprogramme schalten Z. 7/37/38 nur frei, wenn eine Steuerbescheinigung nach §45a EStG vorliegt. Für diesen Fall: Bruttodividende nach Z. 19, DE-KESt+Soli nach Z. 41 (FA-seitig akzeptiert).
+    <strong style="color: #38bdf8;">Variante B (technische Ersatzdarstellung):</strong>
+    Manche Steuerprogramme schalten Z. 7/37/38 nur frei, wenn eine Steuerbescheinigung
+    nach §45a EStG vorliegt. Die Variante verschiebt dann die Bruttodividende nach Z. 19
+    und DE-KESt+Soli nach Z. 41. Diese Darstellung ist kein amtlich belegter Ersatz für
+    die Steuerbescheinigung; bitte vor der Abgabe mit Finanzamt oder Steuerberatung abstimmen.
 </div>
 """, unsafe_allow_html=True)
     de_kest_variante_b = st.checkbox(
         "Variante B: DE-KESt nach Zeile 19/41 verschieben",
         value=False,
-        help="Aktivieren, falls dein Steuerprogramm Zeile 7/37/38 nicht freischaltet "
-             "(mangels Steuerbescheinigung). Die Bruttodividende wird dann zu Zeile 19 "
-             "addiert, die DE-KESt+Soli zu Zeile 41. Endergebnis identisch, beide Varianten "
-             "werden vom Finanzamt akzeptiert.")
+        help="Aktivieren, falls dein Steuerprogramm Zeile 7/37/38 mangels "
+             "Steuerbescheinigung nicht freischaltet. Die Bruttodividende wird dann zu "
+             "Zeile 19, DE-KESt+Soli zu Zeile 41 addiert. Das ist eine technische "
+             "Ersatzdarstellung, kein amtlich belegter Ersatz für die Bescheinigung; "
+             "bitte vor der Abgabe fachlich abstimmen.")
 
 # ── Konsolidierte Toggle-bereinigte Werte (Single Source of Truth) ──────────
 # Wird von GUI-Metrics, KAP-INV-Hero und Text-Report gemeinsam genutzt.
@@ -1462,8 +1475,11 @@ if not xml_has_fx and fx_source != 'csv':
     <strong style="color: #fb923c; font-size: 0.9rem;">Flex Query unvollständig: Keine FX-Transaktionsdaten</strong><br>
     Ihre Flex Query XML enthält keine <code>FxTransactions</code>-Sektion. Ohne diese Daten können Fremdwährungs-Gewinne/-Verluste
     nur approximiert werden (FIFO-Schätzung mit eingeschränkter Genauigkeit).<br><br>
-    <strong style="color: #fdba74;">Lösung:</strong> Laden Sie den <strong>IBKR Standard-Bericht (CSV)</strong> oben hoch:
-    dieser enthält die exakten Devisengewinne/-verluste, die IBKR intern per FIFO berechnet.<br>
+    <strong style="color: #fdba74;">Lösung bei EUR-Basiskonten:</strong> Laden Sie den
+    <strong>IBKR Standard-Bericht (CSV)</strong> oben hoch: Er enthält IBKRs aggregierte
+    FIFO-Rohwerte. Einzelne Schuldtilgungen lassen sich daraus nicht erkennen; bei negativem
+    Währungssaldo und aktiver Saldo-Korrektur bleibt daher die FIFO-Näherung maßgeblich.
+    Bei USD-Basiskonten ist dieser CSV-Fallback nicht verfügbar.<br>
     <span style="color: #94a3b8; font-size: 0.78rem;">
     Alternativ: In IBKR unter <em>Reports → Flex Queries → Configure</em> die Sektion
     <em>FX Transactions</em> aktivieren und die XML neu exportieren.
@@ -1474,7 +1490,9 @@ elif not xml_has_fx and fx_source == 'csv':
     st.markdown("""
 <div style="background: rgba(16,185,129,0.08); border: 1px solid rgba(16,185,129,0.25); border-radius: 10px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
     <strong style="color: #34d399;">FX-Daten aus CSV übernommen.</strong>
-    Die Flex Query enthält keine FxTransactions, aber der IBKR Standard-Bericht liefert exakte Devisenwerte.
+    Die Flex Query enthält keine FxTransactions; der IBKR Standard-Bericht liefert
+    IBKRs aggregierte FIFO-Rohwerte. Eine buchungsweise Schuldtilgungsprüfung ist damit
+    nicht möglich.
 </div>
 """, unsafe_allow_html=True)
 
@@ -1596,15 +1614,19 @@ if fx_results:
         key="fx_margin_correction_enabled",
         help=(
             "Empfohlen, aber konservativ. Behandelt negative Fremdwährungssalden als "
-            "Margin-Schuld: Abflüsse aus negativem Saldo erzeugen keinen steuerbaren "
-            "FX-Vorgang, weil BMF Rn. 131 nur das verzinsliche Fremdwährungs**guthaben** "
-            "erwähnt; eine Verbindlichkeit ist kein Guthaben.\n\n"
-            "Wirkt typischerweise zugunsten der Steuerschuld (filtert FX-Verluste stärker "
-            "raus als FX-Gewinne). Teile der Literatur (z.B. Krumm in K/S/M zu §20 EStG) "
-            "vertreten eine symmetrische Sicht; der BFH hat das nicht final entschieden.\n\n"
-            "Deaktivieren = IBKR-/Rohwerte übernehmen (möglicherweise höhere FX-Verluste, "
-            "aber auch höheres Diskussionsrisiko mit dem Finanzamt). Negative Salden "
-            "werden auch bei deaktivierter Korrektur weiterhin angezeigt."
+            "Margin-Schuld: Wer eine Fremdwährungs-Schuld tilgt oder aus ihr heraus zahlt, "
+            "veräußert kein Guthaben. BMF Rn. 131 erwähnt nur das verzinsliche "
+            "Fremdwährungs**guthaben** bzw. die Kapital**forderung**; eine Verbindlichkeit "
+            "ist beides nicht.\n\n"
+            "Erkannt wird das am Vorzeichen der IBKR-Buchung: Ein Zufluss mit realisiertem "
+            "Ergebnis schließt eine Short-Position, tilgt also Schuld. Ein Abfluss schließt "
+            "Guthaben und bleibt steuerbar.\n\n"
+            "Die Richtung der Wirkung hängt vom Konto ab; es fallen sowohl Verluste als auch "
+            "Gewinne aus solchen Buchungen weg. Teile der Literatur (z.B. Krumm in K/S/M zu "
+            "§20 EStG) vertreten eine symmetrische Sicht; der BFH hat das nicht final "
+            "entschieden.\n\n"
+            "Deaktivieren = IBKR-/Rohwerte übernehmen (höheres Diskussionsrisiko mit dem "
+            "Finanzamt). Negative Salden werden auch bei deaktivierter Korrektur angezeigt."
         ),
     )
 
@@ -1637,16 +1659,28 @@ if fx_results:
     )
     diff_corr_raw = corrected_total - raw_total
     total_neg_days = max((data.get('days_negative', 0) for data in fx_results.values()), default=0)
+    debt_repayments = fx_opt_a_meta.get('debt_repayments', 0)
+    debt_repayment_pnl = fx_opt_a_meta.get('debt_repayment_pnl', 0.0)
+    # Brutto-Wirkung getrennt: Heben sich herausgerechnete Gewinne und Verluste auf,
+    # ist die Nettodifferenz null, Zeile 22 ändert sich aber trotzdem.
+    corrected_gain_total = sum(data.get('corrected_gain', data.get('gain', 0.0))
+                               for data in fx_results.values())
+    raw_gain_total = sum(data.get('raw_gain', data.get('gain', 0.0))
+                         for data in fx_results.values())
+    corrected_loss_total = sum(data.get('corrected_loss', data.get('loss', 0.0))
+                               for data in fx_results.values())
+    raw_loss_total = sum(data.get('raw_loss', data.get('loss', 0.0))
+                         for data in fx_results.values())
+    diff_gain = corrected_gain_total - raw_gain_total
+    diff_loss = corrected_loss_total - raw_loss_total
 
-    if (has_raw_data or has_corrected_data) and (fx_has_neg or abs(diff_corr_raw) > 0.01):
-        skipped = fx_opt_a_meta.get('skipped_full', 0)
-        partial = fx_opt_a_meta.get('partial_count', 0)
-        approx = fx_opt_a_meta.get('approx_matches', 0)
+    if (has_raw_data or has_corrected_data) and (
+            fx_has_neg or debt_repayments or abs(diff_corr_raw) > 0.01
+            or abs(diff_gain) > 0.01 or abs(diff_loss) > 0.01):
 
         accent = "#fb923c" if (abs(diff_corr_raw) > 50.0 or total_neg_days > 30) else "#6ee7b7"
         raw_label = "IBKR-Rohwert vor Saldo-Prüfung" if fx_source == 'xml' else "Rohwert vor Saldo-Prüfung"
         comparison_label = "gegenüber IBKR" if fx_source == 'xml' else "gegenüber dem Rohwert"
-        approx_label = "IBKR-FX-Zeilen" if fx_source == 'xml' else "FX-Zeilen"
         unchanged_label = "IBKR-Wert" if fx_source == 'xml' else "Rohwert"
 
         # Welche Währungen waren im Minus?
@@ -1671,43 +1705,36 @@ if fx_results:
                     f'<strong>{fmt_de(abs(diff_corr_raw))} EUR</strong> '
                     f'{"höher" if diff_corr_raw > 0 else "niedriger"}.'
                 )
+        elif abs(diff_gain) > 0.005 or abs(diff_loss) > 0.005:
+            # Gewinne und Verluste heben sich im Saldo auf, die Brutto-Zeilen ändern
+            # sich aber: Zeile 19 bleibt gleich, Zeile 22 nicht.
+            correction_html = (
+                f'Der Netto-FX-Wert bleibt gleich, die Bruttowerte nicht: '
+                f'<strong>{fmt_de(abs(diff_gain))} EUR</strong> Gewinne und '
+                f'<strong>{fmt_de(abs(diff_loss))} EUR</strong> Verluste fallen weg. '
+                f'Das wirkt auf Zeile 22, nicht auf Zeile 19.'
+            )
         else:
             correction_html = f'Die Saldo-Prüfung ändert den {unchanged_label} rechnerisch nicht.'
 
         details_parts = []
-        if skipped:
+        if debt_repayments:
             if correction_enabled:
                 details_parts.append(
-                    f"<strong>{skipped}</strong> Abflüsse waren vollständig aus Margin-Schuld bezahlt "
-                    f"und wurden nicht als steuerbarer FX-Vorgang gezählt"
+                    f"<strong>{debt_repayments}</strong> Buchungen haben eine Fremdwährungs-Schuld getilgt "
+                    f"statt Guthaben zu veräußern; ihr IBKR-Ergebnis von "
+                    f"<strong>{fmt_de(debt_repayment_pnl)} EUR</strong> bleibt außen vor"
                 )
             else:
                 details_parts.append(
-                    f"<strong>{skipped}</strong> Abflüsse wären bei aktivierter Korrektur vollständig "
-                    f"als Margin-Schuld behandelt und nicht als steuerbarer FX-Vorgang gezählt"
+                    f"<strong>{debt_repayments}</strong> Buchungen haben eine Fremdwährungs-Schuld getilgt; "
+                    f"bei aktivierter Korrektur bliebe ihr IBKR-Ergebnis von "
+                    f"<strong>{fmt_de(debt_repayment_pnl)} EUR</strong> außen vor"
                 )
-        if partial:
-            if correction_enabled:
-                details_parts.append(
-                    f"<strong>{partial}</strong> Abflüsse waren nur teilweise durch Guthaben gedeckt "
-                    f"und wurden anteilig berücksichtigt"
-                )
-            else:
-                details_parts.append(
-                    f"<strong>{partial}</strong> Abflüsse wären bei aktivierter Korrektur nur anteilig "
-                    f"berücksichtigt, weil sie teilweise aus Margin-Schuld bezahlt wurden"
-                )
-        if approx:
-            if correction_enabled:
-                details_parts.append(
-                    f"<strong>{approx}</strong> {approx_label} ließen sich nicht eindeutig einem Cash-Event zuordnen; "
-                    f"diese Zeilen blieben mit dem {unchanged_label} unverändert"
-                )
-            else:
-                details_parts.append(
-                    f"<strong>{approx}</strong> {approx_label} wären auch bei aktivierter Korrektur nicht eindeutig "
-                    f"einem Cash-Event zuordenbar; dort bliebe der {unchanged_label} unverändert"
-                )
+            details_parts.append(
+                "Abflüsse werden dagegen ungekürzt übernommen: IBKR weist bei nur teilweise "
+                "gedeckten Buchungen bereits allein das Ergebnis des gedeckten Teils aus"
+            )
 
         details_html = ''
         if details_parts:
@@ -1722,10 +1749,18 @@ if fx_results:
             f'padding: 0.95rem 1.15rem; margin: 0.6rem 0; border-radius: 0 8px 8px 0;">'
             f'<div style="color: {accent}; font-weight: 600; margin-bottom: 0.45rem; font-size: 0.98rem;">'
             f'{"FX-Saldo-Korrektur" if correction_enabled else "FX-Saldo-Korrektur deaktiviert"}: '
-            f'{curr_label} war zeitweise im Minus</div>'
+            + (f'{curr_label} war zeitweise im Minus' if total_neg_days
+               else 'Fremdwährungs-Schuld im Steuerjahr getilgt')
+            + f'</div>'
             f'<div style="font-size: 0.92rem; color: #cbd5e1; line-height: 1.6;">'
-            f'An <strong>{total_neg_days} Tagen</strong> im Steuerjahr war der Fremdwährungssaldo negativ. '
-            f'Das ist steuerlich Margin-Schuld, nicht Fremdwährungsguthaben. '
+            + (
+                f'An <strong>{total_neg_days} Tagen</strong> im Steuerjahr war der '
+                f'Fremdwährungssaldo negativ. '
+                if total_neg_days else
+                f'IBKR weist <strong>{debt_repayments}</strong> Buchungen aus, die eine '
+                f'Fremdwährungs-Schuld geschlossen haben. '
+            )
+            + f'Das ist steuerlich Margin-Schuld, nicht Fremdwährungsguthaben. '
             f'Steuerbar sind Währungsgewinne/-verluste aus verzinslichem Fremdwährungsguthaben '
             f'(§20 Abs. 2 S. 1 Nr. 7 i.V.m. Abs. 4 S. 1 EStG, BMF 14.05.2025 Rn. 131). '
             + (
@@ -1752,6 +1787,29 @@ if fx_results:
             f'</div>',
             unsafe_allow_html=True
         )
+
+    # Prüffall: IBKR weist die Zeile als Eröffnung aus, bucht aber ein Ergebnis.
+    _fx_open_anomalies = fx_opt_a_meta.get('open_rows_with_pnl', []) or []
+    if _fx_open_anomalies:
+        st.warning(
+            f"{len(_fx_open_anomalies)} Devisen-Buchungen tragen ein realisiertes Ergebnis, "
+            f"obwohl IBKR sie als Eröffnung ausweist. Das widerspricht der üblichen "
+            f"IBKR-Konvention (Ergebnis nur auf Schließungen). Sie wurden als steuerbar "
+            f"behandelt; bitte prüfen."
+        )
+        with st.expander(f"Betroffene Buchungen ({len(_fx_open_anomalies)})"):
+            _anom_table = ("| Datum | Währung | Code | Menge | Ergebnis EUR | Beschreibung |\n"
+                           "|-------|---------|------|------:|-------------:|--------------|\n")
+            for _a in _fx_open_anomalies[:50]:
+                _anom_table += (
+                    f"| {html.escape(str(_a.get('date', '')))} "
+                    f"| {html.escape(str(_a.get('currency', '')))} "
+                    f"| {html.escape(str(_a.get('code', '')))} "
+                    f"| {fmt_de(_a.get('quantity', 0))} "
+                    f"| {fmt_de(_a.get('realized_pnl', 0))} "
+                    f"| {html.escape(str(_a.get('description', ''))[:60])} |\n"
+                )
+            st.markdown(_anom_table)
 
     with st.expander("Details pro Währung"):
         has_raw_col = any('raw_net' in data for data in fx_results.values())
@@ -1781,23 +1839,45 @@ if fx_results:
             st.markdown(f"**IBKR Referenz (fxTranslationGainLoss):** {fmt_de(fx_tgl)} EUR")
 
         if fx_source in ('csv', 'xml'):
-            st.success("Exakte FX-Werte aus " + ("IBKR Standard-Bericht" if fx_source == 'csv' else "XML FxTransactions") +
-                       " (per-Settlement FIFO, alle Währungen).")
+            _src_name = "IBKR Standard-Bericht" if fx_source == 'csv' else "XML FxTransactions"
+            _filtered = (fx_source == 'xml'
+                         and correction_enabled
+                         and fx_opt_a_meta.get('debt_repayments', 0))
+            _value_kind = (
+                "Buchungsgenaue IBKR-FIFO-Werte"
+                if fx_source == 'xml'
+                else "Aggregierte IBKR-FIFO-Rohwerte"
+            )
+            st.success(
+                f"{_value_kind} aus {_src_name} (alle Währungen)."
+                + (" Buchungen, die eine Fremdwährungs-Schuld tilgen, sind herausgerechnet "
+                   "(siehe Hinweis oben)." if _filtered else "")
+                + (" Einzelne Schuldtilgungen sind im CSV nicht erkennbar."
+                   if fx_source == 'csv' else "")
+            )
         else:
             no_xml_fx = not d.get('xml_has_fx_data', True)
             fx_prior = d.get('fx_has_prior_data', False)
             extra = (" Die Flex Query enthält keine FxTransactions. "
                      "Kursgenauigkeit der Approximation ist eingeschränkt.") if no_xml_fx else ""
             if fx_prior:
-                st.warning(f"FIFO-Approximation aus Flex Query (Tagesraten-Substitution).{extra} "
-                           "Für exakte Werte: IBKR Standard-Bericht (CSV) oben hochladen.")
+                st.warning(
+                    f"FIFO-Approximation aus Flex Query (Tagesraten-Substitution).{extra} "
+                    "Der IBKR Standard-Bericht (CSV) kann als aggregierter Rohwert "
+                    "hochgeladen werden; eine buchungsweise Schuldtilgungsprüfung ist "
+                    "damit nicht möglich."
+                )
             else:
-                st.warning(f"**Nur Steuerjahr geladen.** FIFO-Approximation.{extra} "
-                           "Für exakte Werte: IBKR Standard-Bericht (CSV) oben hochladen.")
+                st.warning(
+                    f"**Nur Steuerjahr geladen.** FIFO-Approximation.{extra} "
+                    "Der IBKR Standard-Bericht (CSV) kann als aggregierter Rohwert "
+                    "hochgeladen werden; eine buchungsweise Schuldtilgungsprüfung ist "
+                    "damit nicht möglich."
+                )
         st.info("**Rechtsgrundlage:** BMF-Schreiben Rn. 131 - verzinsliches Fremdwährungsguthaben, "
                 "§20 Abs. 2 S. 1 Nr. 7 i.V.m. Abs. 4 S. 1 EStG (Anlage KAP, Topf 2). "
-                "FIFO-Methode (§20 Abs. 4 S. 7). "
-                "In Topf 2 enthalten.")
+                "FIFO-Methode (§20 Abs. 4 S. 7). Erfasst wird die Veräußerung von Guthaben; "
+                "die Tilgung einer Fremdwährungs-Schuld zählt nicht. In Topf 2 enthalten.")
 
 # ── Anlage KAP-INV · Investmentfonds (Detail-Anzeige) ─────────────────────────
 
@@ -3041,11 +3121,16 @@ Das Finanzamt wendet die Verlustverrechnungsbeschränkung anhand der Zeilen 20 u
 | **OPT** (Optionen) | Termingeschäft (§20 Abs. 2 Nr. 3) | Topf 2 |
 | **FUT** (Futures) | Termingeschäft/Festgeschäft (§20 Abs. 2 Nr. 3) | Topf 2 |
 | **FOP** (Futures-Optionen) | Termingeschäft (§20 Abs. 2 Nr. 3) | Topf 2 |
+| **FSFOP** (Future-Style-Optionen) | Termingeschäft (§20 Abs. 2 Nr. 3) | Topf 2 |
 | **BILL** (T-Bills) | Kapitalforderung (§20 Abs. 2 Nr. 7) | Topf 2 |
 | **BOND** (Anleihen) | Kapitalforderung (§20 Abs. 2 Nr. 7) | Topf 2 |
+| **WAR** (Optionsscheine) | Verbriefte Kapitalforderung (§20 Abs. 2 Nr. 7, BMF Rn. 8 f.), **kein** Termingeschäft | Topf 2 |
+| **CFD** | Termingeschäft (§20 Abs. 2 Nr. 3) | Topf 2 |
 | **DIV/PIL** (Dividenden) | Laufende Erträge (§20 Abs. 1 Nr. 1) | Topf 2 |
 | **INTR/CINT** (Zinsen) | Zinserträge (§20 Abs. 1 Nr. 7) | Topf 2 |
-| **CASH/FOREX** (Fremdwährung) | Verzinsl. Fremdwährungsguthaben (§20 Abs. 2 Nr. 7, BMF Rn. 131) | Topf 2 |
+| **CASH/FOREX** (Fremdwährung) | Verzinsl. Fremdwährungs**guthaben** (§20 Abs. 2 Nr. 7, BMF Rn. 131). Tilgung einer Fremdwährungs-Schuld zählt nicht. | Topf 2 |
+| **DINT** (Sollzinsen) | Werbungskosten, durch den Sparer-Pauschbetrag abgegolten (§20 Abs. 9) | nachrichtlich, keine Zeile |
+| **OFEE/STAX** (Gebühren, Umsatzsteuer) | Nicht abziehbar (§20 Abs. 9) | nachrichtlich, keine Zeile |
 
 ---
 
@@ -3054,11 +3139,12 @@ Das Finanzamt wendet die Verlustverrechnungsbeschränkung anhand der Zeilen 20 u
 Beim Halten von Fremdwährungsguthaben (z.B. USD) auf einem verzinslichen Konto (IBKR zahlt Zinsen) entstehen bei Kursänderungen steuerlich relevante Gewinne oder Verluste:
 
 - **Anschaffung** = jeder Zufluss von Fremdwährung (Kauf, Dividende, Verkaufserlös)
-- **Veräußerung** = jeder Abfluss (Rücktausch, Aktienkauf, Gebühren)
+- **Veräußerung** = jeder Abfluss, der ein Guthaben auflöst (Rücktausch, Aktienkauf, Gebühren)
+- **Auslegung des Tools für Margin-Schulden:** Ein Abfluss bei bereits negativem Saldo vertieft die Schuld; ein Zufluss kann sie tilgen. Beides löst kein Guthaben auf. BMF Rn. 131 knüpft an ein Fremdwährungs**guthaben** bzw. eine Kapital**forderung** an und regelt die Verbindlichkeit nicht ausdrücklich. Diese konservative Auslegung ist über die Checkbox "FX-Saldo-Korrektur anwenden" abschaltbar.
 - **FIFO-Methode**: die zuerst erworbenen Beträge werden zuerst veräußert
 - **Rechtsgrundlage**: §20 Abs. 2 S. 1 Nr. 7 EStG, Anlage KAP, Topf 2
 
-**Hinweis:** Ohne Vorjahres-XMLs wird der Jahresanfangsbestand zum 01.01.-Kurs als Anschaffung angesetzt (Vereinfachung). Für exakte Berechnung können Vorjahres-XMLs hochgeladen werden. IBKR liefert keine FIFO-Daten für Währungsgewinne, diese werden hier eigenständig berechnet.
+**Datenquellen:** Enthält die Flex Query `<FxTransactions>`, verwendet das Tool IBKRs FIFO-Ergebnis pro Buchung und kann Schuldtilgungen einzeln prüfen. Bei EUR-Basiskonten dient andernfalls ein hochgeladener IBKR-Standardbericht als aggregierter FIFO-Rohwert; einzelne Schuldtilgungen sind darin nicht erkennbar. Fehlen beide Quellen, rechnet das Tool bei EUR-Basiskonten selbst eine FIFO-Näherung aus den Kontobewegungen. Vorjahres-XMLs vervollständigen dabei die Lot-Historie, beseitigen aber nicht die Kursnäherung. Ohne Vorjahres-XMLs wird zusätzlich der Jahresanfangsbestand vereinfachend zum 01.01.-Kurs angesetzt. Für USD-Basiskonten ist ohne `<FxTransactions>` weder der CSV- noch der FIFO-Fallback verfügbar.
 
 ---
 
@@ -3087,12 +3173,15 @@ Bei **beiden** Assignment-Typen gilt laut BMF: „Die vereinnahmte Optionsprämi
 
 - **INTR/CINT**: Zins- und Couponerträge aus Anleihen → Topf 2
 - **INTP** (Stückzinsen): Beim Kauf einer Anleihe gezahlte aufgelaufene Zinsen sind **negative Einnahmen** (BMF Rn. 51). Sie reduzieren den Zinsertrag und können diesen insgesamt negativ werden lassen.
+- **DINT** (Sollzinsen, Leihgebühren, CFD-Finanzierung): werden **nicht** von den Zinserträgen abgezogen. Es sind Werbungskosten, und die sind nach §20 Abs. 9 EStG durch den Sparer-Pauschbetrag abgegolten. Der Betrag wird nur nachrichtlich ausgewiesen.
 
 ---
 
 ### Quellensteuer (Zeile 41)
 
-Ausländische Quellensteuern auf Dividenden und Zinsen (z.B. 15% US-Quellensteuer) werden in Zeile 41 als **anrechenbare ausländische Steuern** gemeldet. Deutsche Dividendensteuer aus Buchungen mit `- DE Steuer` wird dagegen in Kapitalertragsteuer (Zeile 37) und Solidaritätszuschlag (Zeile 38) aufgeteilt.
+Ausländische Quellensteuern auf Dividenden und Zinsen (z.B. 15% US-Quellensteuer) werden in Zeile 41 als **anrechenbare ausländische Steuern** gemeldet. Zeile 41 setzt sich aus zwei Teilen zusammen: der Quellensteuer außerhalb der Fonds und der anrechenbaren Fonds-Quellensteuer aus KAP-INV. Damit steht die Fonds-Quellensteuer genau einmal im Formular; KAP-INV hat keine eigene Quellensteuer-Zeile.
+
+Deutsche Dividendensteuer aus Buchungen mit `- DE Steuer` wird dagegen in Kapitalertragsteuer (Zeile 37) und Solidaritätszuschlag (Zeile 38) aufgeteilt. Wenn Ihr Steuerprogramm diese Zeilen ohne Steuerbescheinigung nach §45a EStG sperrt, bietet "Variante B" eine technische Ersatzdarstellung über Zeile 19 bzw. 41. Sie ist kein amtlich belegter Ersatz für die Steuerbescheinigung und sollte vor der Abgabe mit Finanzamt oder Steuerberatung abgestimmt werden.
 
 ---
 
@@ -3108,7 +3197,7 @@ Da Interactive Brokers ein **ausländischer Broker ohne inländischen Steuerabzu
 | **22** | Verluste ohne Aktien | Verluste aus Optionen, Futures, Anleihen etc. (positiver Betrag) |
 | **23** | Aktienverluste | Verluste aus Aktienveräußerungen (positiver Betrag) |
 | **37/38** | Kapitalertragsteuer / Soli | Aufteilung deutscher Dividendensteuer (25% + 5,5% Soli) |
-| **41** | Anrechenbare Quellensteuer | Summe aller ausländischen Quellensteuern |
+| **41** | Anrechenbare Quellensteuer | Quellensteuer außerhalb der Fonds + anrechenbare Fonds-Quellensteuer aus KAP-INV |
 
 ---
 
@@ -3135,13 +3224,13 @@ Die IBKR Flex Query XML wird in einzelne CSV-Dateien zerlegt. Jede XML-Sektion e
 | XML-Sektion | Inhalt | Filter |
 |---|---|---|
 | `<Trades>` | Alle Trades. Felder: `assetCategory`, `fifoPnlRealized`, `fxRateToBase`, `reportDate`, `buySell`, `transactionType` | `EXECUTION` → trades.csv, `CLOSED_LOT` → closed_lots.csv (für Tageskurs-Korrektur) |
-| `<StmtFunds>` | Dividenden, Zinsen, Steuern, Gebühren. Felder: `activityCode`, `amount`, `fxRateToBase`, `reportDate`, `transactionID` | Duplikate per `transactionID` entfernt |
+| `<StmtFunds>` | Dividenden, Zinsen, Steuern, Gebühren. Felder: `activityCode`, `amount`, `fxRateToBase`, `reportDate`, `transactionID` | Bei einer einzelnen XML-Datei vollständig übernommen; Split-/Quartals-XMLs werden bereits beim Merge dedupliziert. Die Berechnung dedupliziert anschließend nochmals defensiv (Schritt 2) |
 | `<FIFOPerformanceSummaryInBase>` | Aggregierter PnL pro Instrument. Felder: `assetCategory`, `isin`, `totalRealizedPnl` | Fallback für fehlende Trades (z.B. T-Bill Maturity) |
 | `<FxTransactions>` | FX-Gewinne/-Verluste. Felder: `fxCurrency`, `realizedPL`, `reportDate` | Nur `levelOfDetail=TRANSACTION` |
 | `<AccountInformation>` | Basiswährung (`currency`), Kontotyp | Einzelner Eintrag |
 | `<FlexStatement>` | Berichtszeitraum → Steuerjahr aus `toDate` | Automatisch erkannt |
 
-**Multi-XML (Vorjahre):** Trades aus allen XMLs werden in eine gemeinsame `trades.csv` zusammengeführt (für Stillhalter-Matching über Jahresgrenzen). FX-Transaktionen werden chronologisch gemergt mit Deduplizierung per `transactionID`.
+**Multi-XML (Vorjahre):** Trades aus allen XMLs werden in eine gemeinsame `trades.csv` zusammengeführt (für Stillhalter-Matching über Jahresgrenzen). FX-Kontobewegungen werden chronologisch gemergt; als Duplikat gilt dabei eine Zeile, bei der alle sechs Schlüsselfelder übereinstimmen: Währung, Datum, `transactionID`, Buchungstext, Betrag und Saldo. Ein Schlüssel allein aus `transactionID` wäre falsch: IBKR vergibt dieselbe ID für jede Folgebuchung derselben Position, etwa für alle täglichen Abrechnungen eines Futures.
 
 ---
 
@@ -3152,7 +3241,7 @@ IBKR liefert in einigen Sektionen Duplikate:
 | Quelle | Duplikat-Ursache | Deduplizierungs-Schlüssel |
 |---|---|---|
 | **Trades** | Erweiterte Flex Queries enthalten ORDER + EXECUTION für denselben Trade | `tradeID` (wenn vorhanden) oder `(dateTime, isin, buySell, quantity, closePrice, fifoPnlRealized)` |
-| **StmtFunds** | IBKR bucht EUR-Transaktionen doppelt (Original-Währung + BaseCurrency-Ansicht) | `transactionID`. Erster Eintrag hat korrekten `fxRateToBase`, Duplikat hat `fxRateToBase=1` |
+| **StmtFunds** | Mehrfachansichten und überlappende Exporte können dieselbe Buchung wiederholen | `(transactionID, activityDescription)`. Der Buchungstext gehört zum Schlüssel, weil IBKR unter einer `transactionID` mehrere verschiedene Vorgänge bündeln kann. Ohne `transactionID` wird die vollständige CSV-Zeile verglichen |
 
 ---
 
@@ -3174,7 +3263,7 @@ Tageskurs-Methode: PnL (EUR) = Erlös × FX_Verkaufstag − AK × FX_Kauftag
 | `fifoPnlRealized` | IBKR's FIFO-basierter realisierter Gewinn/Verlust in **Trade-Währung** |
 | `fxRateToBase` | Umrechnungskurs Trade-Währung → Basiswährung (EUR) am **Schlusstag** |
 | `reportDate` | Buchungsdatum (bestimmt das Steuerjahr, Zuflussprinzip) |
-| `assetCategory` | Topf-Zuordnung: `STK` → Topf 1 oder KAP-INV, alles andere → Topf 2 |
+| `assetCategory` | Ausgangspunkt der Routingtabelle unten: `STK` wird weiter nach Produktart unterschieden; bekannte Derivate und Kapitalforderungen gehen in Topf 2, `CASH` in die separate FX-Rechnung. Unbekannte Kategorien werden als Prüffall gemeldet |
 | `subCategory` | ETF-Erkennung: `ETF` → InvStG-Prüfung, `COMMON` → Einzelaktie |
 
 **Topf-Zuordnung:**
@@ -3189,8 +3278,13 @@ Tageskurs-Methode: PnL (EUR) = Erlös × FX_Verkaufstag − AK × FX_Kauftag
 | `FOP` / `FSFOP` | | Termingeschäft, Future-Option (§20 Abs. 2 Nr. 3) | Topf 2 |
 | `BILL` | | Kapitalforderung, T-Bill (§20 Abs. 2 Nr. 7) | Topf 2 |
 | `BOND` | | Kapitalforderung, Anleihe (§20 Abs. 2 Nr. 7) | Topf 2 |
+| `WAR` | | Optionsschein, verbriefte Kapitalforderung (§20 Abs. 2 Nr. 7) | Topf 2 |
+| `CFD` | | Termingeschäft (§20 Abs. 2 Nr. 3) | Topf 2 |
+| `CASH` | | Devisenumsatz; wird von der FX-Rechnung erfasst, hier keine zweite Zuordnung | keine |
 
-**InvStG-Klassifizierung (optional):** ETFs mit `subCategory="ETF"` werden gegen eine Lookup-Tabelle (139 US-ETFs) geprüft. Aktienfonds (≥51% Aktienquote) erhalten 30% Teilfreistellung, sonstige Fonds 0%. Crypto/Commodity-ETPs (IBIT, GLD etc.) sind keine Investmentfonds i.S.d. InvStG (keine Risikomischung, einzelner Basiswert) und landen in Topf 2 (§20 Abs. 1 Nr. 7 EStG). Optionen auf ETFs bleiben in Topf 2.
+Kategorien außerhalb dieser Tabelle werden nicht stillschweigend verworfen: Taucht eine unbekannte `assetCategory` mit einem Ergebnis auf, meldet das Tool sie als Prüffall.
+
+**InvStG-Klassifizierung (optional):** ETFs mit `subCategory="ETF"` werden gegen eine Lookup-Tabelle geprüft. Produkte, deren Einordnung fachlich offen ist (etwa Single-Asset-Trusts oder Closed-End-Funds), stehen in einer Prüf-Liste: Sie behalten ihren bisherigen Rechenweg, werden aber als offener Punkt ausgewiesen statt geraten. Aktienfonds (≥51% Aktienquote) erhalten 30% Teilfreistellung, sonstige Fonds 0%. Crypto/Commodity-ETPs (IBIT, GLD etc.) sind keine Investmentfonds i.S.d. InvStG (keine Risikomischung, einzelner Basiswert) und landen in Topf 2 (§20 Abs. 1 Nr. 7 EStG). Optionen auf ETFs bleiben in Topf 2.
 
 **Jahresfilter:** Es wird `reportDate` verwendet, nicht `dateTime`. Grund: Trades am Jahresende (z.B. `dateTime=2024-12-29`, Settlement `reportDate=2025-01-02`) gehören steuerlich zum Settlement-Jahr (Zuflussprinzip §11 EStG).
 
@@ -3208,14 +3302,16 @@ Bei Optionsassignments bündelt IBKR die Prämie in den Aktien-PnL. Das BMF verl
 - `fifoPnlRealized` ≈ 0 (IBKR zeigt keinen PnL auf der Option)
 
 **Original-Verkauf finden:**
-- Alle `ExchTrade SELL` mit identischem `strike`, `expiry`, `putCall`
-- Können mehrere Teilfüllungen sein → gewichteter Durchschnitt
+- Vorrangig über IBKRs Kontraktnummer (`conid`), die auch eine Umbenennung oder einen Split der Optionsserie übersteht. Ohne `conid` über `strike`, `expiry`, `putCall`.
+- Es können mehrere Teilfüllungen sein; verbraucht wird nach FIFO, älteste zuerst.
 
 **Prämien-Berechnung:**
 ```
 Prämie (Trade-Währung) = tradePrice × multiplier × quantity
-Prämie (EUR) = Prämie × fxRateToBase (gewichtet über Teilfüllungen)
+Prämie (EUR)           = Σ über die verbrauchten Teilfüllungen:
+                         Betrag je Füllung × Kurs am Verkaufstag dieser Füllung
 ```
+Jede Teilfüllung wird einzeln umgerechnet. Ein gewichteter Durchschnittskurs wäre falsch, sobald sich Preise und Wechselkurse der Füllungen unterscheiden.
 
 **Topf-Umbuchung:**
 - `stocks_gain -= Prämie` (aus Topf 1 entfernen)
@@ -3223,7 +3319,7 @@ Prämie (EUR) = Prämie × fxRateToBase (gewichtet über Teilfüllungen)
 
 **Cross-Year:** Wenn die Option in einem Vorjahr verkauft wurde und im Steuerjahr assigned wird, gehört die Prämie ins Vorjahr (Zuflussprinzip). Vorjahres-XMLs müssen hochgeladen werden, damit der Original-SELL gefunden wird.
 
-**Cross-Year Put-Korrektur:** Wenn Aktien aus Put-Assignments früherer Jahre im Steuerjahr verkauft werden, wird IBKR's PnL korrigiert. Die Prämie war bereits im Assignment-Jahr versteuert und darf die Anschaffungskosten nicht mindern. FIFO-Lot-Matching per Symbol.
+**Cross-Year Put-Korrektur:** Wenn Aktien aus Put-Assignments früherer Jahre im Steuerjahr verkauft werden, wird IBKR's PnL korrigiert. Die Prämie war bereits im Assignment-Jahr versteuert und darf die Anschaffungskosten nicht mindern. Das Matching läuft über FIFO-Lots; Schreibweisen desselben Basiswerts (Handelsplatz-Suffix, Ticker-Wechsel im Jahresverlauf) werden dabei über die Kontraktnummer oder ISIN zusammengeführt.
 
 ---
 
@@ -3238,8 +3334,17 @@ Aus `statement_of_funds.csv` werden Cash-Positionen nach `activityCode` zugeordn
 | `INTR` | Anleihekupon / Zinserträge | Topf 2 (§20 Abs. 1 Nr. 7) |
 | `CINT` | Credit Interest (Guthabenzinsen) | Topf 2 |
 | `INTP` | Stückzinsen (beim Kauf gezahlt) | Negative Einnahmen, Topf 2 (BMF Rn. 51) |
-| `DINT` | Debit Interest (Sollzinsen, Leihgebühren, SYEP) | Negativ, Topf 2 |
-| `FRTAX` / `WHT` | Quellensteuer (Withholding Tax) | Zeile 41 (anrechenbar) |
+| `DINT` | Debit Interest (Sollzinsen, Leihgebühren, CFD-Finanzierung) | **Nicht** in Topf 2. Werbungskosten, nach §20 Abs. 9 EStG durch den Sparer-Pauschbetrag abgegolten; nur nachrichtlich |
+| `CFD` | CFD-Zinsen und -Gebühren | Habenzinsen in Topf 2, Finanzierungskosten wie `DINT` nur nachrichtlich |
+| `FRTAX` / `WHT` | Quellensteuer (Withholding Tax) | Zeile 41 (anrechenbar). Ausnahme: deutsche Kapitalertragsteuer auf DE-Wertpapieren geht nach Zeile 37/38 |
+| `OFEE` / `STAX` | Gebühren, Umsatzsteuer | Nicht abziehbar (§20 Abs. 9), nur nachrichtlich |
+| `TTAX` | Transaktionssteuer | Nach §20 Abs. 4 EStG ergebniswirksam, aber ohne belastbare Zuordnung zum Trade. Wird als Prüffall ausgewiesen statt automatisch verbucht |
+| `BUY` / `SELL` / `ADJ` / `ASSIGN` / `EXE` | Trade- und Settlement-Buchungen | Übersprungen; das realisierte Ergebnis kommt aus den Trade-Daten |
+| `DEP` / `WITH` | Ein- und Auszahlungen | Übersprungen; kein eigener Kapitalertrag |
+| `FOREX` | Devisenumsatz | Übersprungen; das Ergebnis kommt aus der separaten FX-Rechnung |
+| `CORP` | Kapitalmaßnahme | Wird derzeit übersprungen. Bei T-Bill-Maturities kommt das Ergebnis aus dem BILL-Fallback; Return-of-Capital-Buchungen sind noch nicht automatisch verarbeitet und müssen geprüft werden |
+
+Buchungscodes außerhalb dieser Tabelle werden nicht stillschweigend übergangen, sondern als Prüffall gemeldet.
 
 **Währungsumrechnung (EUR-Basis):** `amount` ist bereits in EUR (BaseCurrency-Ansicht). Keine weitere Umrechnung nötig.
 
@@ -3258,7 +3363,7 @@ Aus `statement_of_funds.csv` werden Cash-Positionen nach `activityCode` zugeordn
 | **USD-Base, USD-Trade** | `PnL_EUR = fifoPnlRealized × fxRateToBase × daily_usd_eur_rate` |
 | **USD-Base, EUR-Trade** | `PnL_EUR = amount_eur` (direkt, da Trade in EUR) |
 
-**Plausibilitätsprüfung:** USD→EUR-Kurse außerhalb [0.70, 1.30] werden verworfen. `fxRateToBase=1.0` auf EUR-Währungseinträgen wird als Duplikat übersprungen.
+**Plausibilitätsprüfung:** USD→EUR-Kurse außerhalb [0.70, 1.30] werden verworfen. `fxRateToBase=1.0` auf EUR-Währungseinträgen wird nicht als USD/EUR-Kursquelle verwendet; die zugrunde liegende Buchung bleibt in der Verarbeitung erhalten.
 
 ---
 
@@ -3271,8 +3376,10 @@ Fremdwährungsgewinne/-verluste entstehen durch Kursänderungen auf verzinsliche
 | Priorität | Quelle | Genauigkeit | Wann verfügbar |
 |---|---|---|---|
 | 1. | **XML `<FxTransactions>`** | Exakt (IBKR-internes FIFO, `realizedPL` pro Transaktion) | Wenn in Flex Query aktiviert |
-| 2. | **IBKR Standard-Bericht (CSV)** | Exakt (gleiche Daten wie #1, aggregiert) | Manuell erstellt |
-| 3. | **FIFO-Approximation** | Ungenau (~84% der Tageskurse unbrauchbar) | Immer (aus StmtFunds) |
+| 2. | **IBKR Standard-Bericht (CSV)** | Aggregierter IBKR-FIFO-Rohwert; keine Prüfung einzelner Schuldtilgungen möglich | Manuell erstellt, nur für EUR-Basiskonten als FX-Quelle |
+| 3. | **FIFO-Approximation** | Näherung aus den Kontobewegungen | Bei EUR-Basiskonten, wenn keine vorrangige Quelle greift |
+
+Nur Quelle 1 enthält einzelne Buchungen: Dort filtert das Tool bei aktiver Saldo-Korrektur Schuldtilgungen heraus; Abflüsse bleiben ungekürzt, weil IBKR bei nur teilweise gedeckten Buchungen bereits allein das Ergebnis des gedeckten Teils ausweist. Quelle 2 ist aggregiert und kann diese Prüfung nicht leisten. Bei negativem Währungssaldo und aktiver Korrektur wird der CSV-Wert deshalb nicht verwendet, sondern auf Quelle 3 zurückgefallen. Ist die Korrektur deaktiviert, wird der CSV-Rohwert bewusst unverändert übernommen.
 
 FX-Gewinne/-Verluste fließen in **Topf 2**.
 
@@ -3290,7 +3397,8 @@ Zeile 19 = Topf 1 + Topf 2 (Nettobetrag)
 Zeile 20 = Aktiengewinne (brutto, ohne Verluste)
 Zeile 22 = |Verluste ohne Aktien| (positiver Betrag)
 Zeile 23 = |Aktienverluste| (positiver Betrag)
-Zeile 41 = anrechenbare ausländische Quellensteuer
+Zeile 41 = Quellensteuer außerhalb der Fonds
+           + anrechenbare Fonds-Quellensteuer aus KAP-INV
            (Erstattungsüberschüsse bleiben als negative Korrektur erhalten)
 ```
 
@@ -3343,21 +3451,30 @@ if fx_results:
     _fx_corr_active = d.get('fx_margin_correction_enabled', True)
     _fx_neg = d.get('fx_has_negative_balance', False)
     _fx_meta = d.get('fx_option_a_meta', {}) or {}
+    _fx_debt_n = _fx_meta.get('debt_repayments', 0)
+    _fx_debt_pnl = _fx_meta.get('debt_repayment_pnl', 0.0)
     if _fx_corr_active:
         fx_export += "  Saldo-Korrektur (§20 Abs. 2 S. 1 Nr. 7 EStG): AKTIV (konservativ)\n"
-        _skipped = _fx_meta.get('skipped_full', 0)
-        _partial = _fx_meta.get('partial_count', 0)
-        _approx = _fx_meta.get('approx_matches', 0)
-        if _skipped or _partial or _approx:
+        if _fx_debt_n:
             fx_export += (
-                f"    → {_skipped} Abflüsse komplett aus Margin-Schuld (kein PnL), "
-                f"{_partial} proportional gekürzt, {_approx} approximative Matches "
-                f"(IBKR-Rohwert belassen).\n"
+                f"    → {_fx_debt_n} Buchungen tilgen eine Fremdwährungs-Schuld "
+                f"({fmt_de(_fx_debt_pnl)} EUR) und bleiben unberücksichtigt.\n"
             )
     else:
         fx_export += "  Saldo-Korrektur (§20 Abs. 2 S. 1 Nr. 7 EStG): DEAKTIVIERT (Opt-out)\n"
-        if _fx_neg:
+        if _fx_debt_n:
+            fx_export += (
+                f"    → {_fx_debt_n} Buchungen aus Schuldtilgung ({fmt_de(_fx_debt_pnl)} EUR) "
+                f"sind mit IBKR-Rohwert enthalten.\n"
+            )
+        elif _fx_neg:
             fx_export += "    → IBKR-/Rohwerte übernommen trotz negativem Fremdwährungssaldo.\n"
+    _fx_open_anom = _fx_meta.get('open_rows_with_pnl', []) or []
+    if _fx_open_anom:
+        fx_export += (
+            f"  PRUEFFALL: {len(_fx_open_anom)} Buchungen tragen ein Ergebnis, obwohl IBKR\n"
+            f"    sie als Eroeffnung ausweist (code != 'C'). Als steuerbar behandelt.\n"
+        )
 
 sh_export = ""
 if sh_count > 0:
@@ -3487,7 +3604,8 @@ if abs(zeile_7) > 0.01:
             "  Falls dein Steuerprogramm Z. 7/37/38 nicht freischaltet, alternativ:\n"
             f"    Zeile 19: +{fmt_de(zeile_7)} EUR  (Bruttodividende)\n"
             f"    Zeile 41: +{fmt_de(z_kest_total)} EUR  (DE-KESt+Soli als anrechenbare Steuer)\n"
-            "  Beide Varianten sind FA-akzeptiert (Endergebnis identisch).\n"
+            "  Variante B ist eine technische Ersatzdarstellung und kein amtlich belegter\n"
+            "  Ersatz fuer die Steuerbescheinigung; vor Abgabe fachlich abstimmen.\n"
         )
 
 multi_acct_export = ""

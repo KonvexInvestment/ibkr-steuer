@@ -997,6 +997,13 @@ def parse_ibkr_csv_report(csv_path):
 # Abflüsse aus negativem Saldo erzeugen keinen steuerbaren Vorgang, Zuflüsse auf
 # negatives Konto tilgen Schuld (keine Lot-Erzeugung bis Saldo positiv).
 #
+# Diese Engine trägt nur noch Option C (FIFO-Näherung, wenn IBKR keine
+# FxTransactions liefert). Option A entscheidet seit Issue #84 über
+# `is_fx_debt_repayment` je Buchung statt über einen selbst nachgebauten Saldo;
+# siehe dortige Begründung. Option B (aggregierter CSV-Bericht) kann einzelne
+# Schuldtilgungen gar nicht erkennen und nimmt weiterhin entweder den Rohwert
+# oder faellt bei negativem Saldo auf Option C zurueck.
+#
 # Die Engine läuft zwei FIFO-Inventare parallel pro Währung:
 #   - `lots_corrected`: alle Cash-Events (inkl. BUY/SELL/ADJ) sichtbar, Saldo-Gate
 #     filtert PnL auf positiv-gedeckte Anteile. Gewählte Form für Topf 2.
@@ -1007,193 +1014,50 @@ _FX_PNL_OFF_CODES = frozenset({'BUY', 'SELL', 'ADJ', 'DINT', ''})
 _FX_LEGACY_SKIP_CODES = frozenset({'BUY', 'SELL', 'ADJ', ''})
 
 
-def _parse_fx_opt_desc(desc):
-    """Parse 'OPT: -1 TLT 240126P00095000' aus fx_realized_pnl.activityDescription.
+def is_fx_closing_row(code):
+    """Schliesst diese FxTransaction-Zeile eine Position?
 
-    Liefert dict mit symbol/expiry/putCall/strike oder None, falls Format nicht passt.
+    IBKRs `code` auf FxTransaction: 'O' = Opening Trade, 'C' = Closing Trade,
+    'C;O' = Close des Bestands plus Gegen-Open des Ueberhangs. Nur Closings tragen
+    ein realisiertes Ergebnis.
+
+    Leerer Code (aeltere Extraktionen ohne die Spalte) gilt als Closing, damit der
+    Aufrufer auf das Vorzeichen zurueckfaellt statt Zeilen stillschweigend zu
+    verwerfen.
     """
-    import re
-    m = re.match(r'^OPT:\s+(-?\d+)\s+(\S+)\s+(\d{6})([CP])(\d{8})$', desc or '')
-    if not m:
-        return None
-    return {
-        'symbol': m.group(2),
-        'expiry': m.group(3),         # YYMMDD aus OPT-String
-        'putCall': m.group(4),
-        'strike': int(m.group(5)) / 1000.0,
-    }
+    parts = {p.strip().upper() for p in (code or '').split(';') if p.strip()}
+    return 'C' in parts or not parts
 
 
-def _parse_fx_inst_symbol(desc):
-    """Parse erstes Symbol nach Asset-Type-Präfix aus fx_realized_pnl.activityDescription.
+def is_fx_debt_repayment(quantity, realized_pnl, code=''):
+    """Ist diese FxTransaction-Zeile die Tilgung einer Fremdwährungsschuld?
 
-    'STK: 100 TLT' → 'TLT'
-    'OPT: -1 TLT 240126P00095000' → 'TLT'
-    'BILL: 60000 912797HT7' → '912797HT7'
+    IBKR bucht FX-Ergebnis ausschliesslich auf Positionsschliessungen. Eine Zeile mit
+    realisiertem Ergebnis schliesst also eine Position, und das Vorzeichen der
+    `quantity` sagt, welche (positive quantity = Waehrungszufluss):
+
+      quantity < 0 (Abfluss)  -> Long-Position wird geschlossen
+                                 = Veraeusserung von Fremdwaehrungsguthaben
+      quantity > 0 (Zufluss)  -> Short-Position wird geschlossen
+                                 = Tilgung einer Fremdwaehrungsschuld
+
+    Nur der erste Fall ist steuerbar. BMF 14.05.2025 Rn. 131 knuepft die Erfassung
+    nach §20 Abs. 2 S. 1 Nr. 7 i.V.m. Abs. 4 S. 1 EStG durchgaengig an ein
+    Fremdwaehrungs*guthaben* bzw. eine Kapital*forderung*. Bei der Tilgung einer
+    Verbindlichkeit fehlt dieses Bezugsobjekt; die Randnummer nennt den Fall nicht
+    ausdruecklich, die Nichtsteuerbarkeit folgt als Umkehrschluss (Issue #84).
+
+    Das ist in sich symmetrisch: Das Eroeffnen der Short-Position (Abfluss ins Minus)
+    traegt bei IBKR code='O' und realizedPL=0, ist also ebenfalls nicht erfasst.
+
+    Der `code` wird mitgeprueft, statt die Closing-Eigenschaft nur aus dem Vorhandensein
+    eines Ergebnisses zu folgern. Eine Zeile mit code='O' und realizedPL != 0 wider-
+    spraeche IBKRs Konvention; der Aufrufer meldet sie als Anomalie, statt sie still
+    ueber das Vorzeichen einzusortieren.
     """
-    import re
-    m = re.match(r'^(?:STK|OPT|FOP|FSFOP|BILL|BOND):\s+-?\d+\s+(\S+)', desc or '')
-    return m.group(1) if m else None
-
-
-def _resolve_fx_outflows(fx_pnl_rows, fx_balance_timeline, tax_year):
-    """Pre-resolve aller fx_realized_pnl-Outflows zu prev_balance in der Cash-Timeline.
-
-    Vier Match-Passes (greedy, mit consumed-Set pro Currency):
-      1. Exakter Match auf (date, currency, amount) zwischen fx_realized_pnl.quantity
-         und fx_transactions.amount. Trifft die Mehrheit der Single-Trade-Outflows.
-      2. Description-Aggregat: alle Outflows mit gleicher (date, currency, description)
-         werden zu einer Gruppe; ihre summierte quantity wird gegen amount gematched.
-         Trifft IBKRs FIFO-Splits einer Buchung (z.B. zwei Lot-Auflösungen einer
-         FRTAX-Buchung).
-      3. OPT-Description-Parser: fx_realized_pnl-Beschreibungen vom Format
-         'OPT: 1 TLT 240126P00095000' werden gegen StmtFunds-Rows mit passendem
-         symbol/strike/expiry/putCall gematched (entkoppelt von amount).
-      4. Symbol-Aggregat: ungematchte Outflows pro (date, currency, symbol) werden
-         summiert und gegen einen größeren Cash-Event gematched. Trifft Multi-Split
-         eines einzigen STK-Trades (z.B. STK: 2 QQQ + STK: 6 QQQ + ... vs.
-         'Buy 30 INVESCO QQQ TRUST').
-
-    Returns (resolved_dict, consumed_dict):
-        resolved_dict[row_idx] = {'prev_balance': float, 'aggregat_qty': float,
-                                  'match_type': 'exact'/'aggregat'/'opt_parse'/'symbol_aggregat'}
-        consumed_dict[currency] = set(timeline_idx) — verbrauchte Cash-Events.
-            Muss in einen nachfolgenden Fallback-Matcher weitergereicht werden,
-            damit derselbe Cash-Event nicht zweimal als prev-Balance-Quelle dient
-            (siehe Codex-Hinweis 2026-05-27 zum Duplicate-Split-Bug).
-    """
-    import re
-    from collections import defaultdict
-
-    # Sammle alle relevanten Outflows mit ihrem Listen-Index.
-    # WICHTIG (Codex-Fix 2026-05-27): KEIN abs(pnl)-Filter hier. IBKR emittiert
-    # FIFO-Splits, bei denen eine Leg zufällig realizedPL=0 haben kann (z.B. wenn
-    # Lot-Rate exakt der Disposal-Rate entspricht oder bei BookTrade-Settlements).
-    # Würden diese Null-PnL-Legs verworfen, würde die Aggregat-Summe in Pass 2/4
-    # nicht mehr zum Cash-Event passen und die Geschwister-Rows mit echtem PnL
-    # blieben fälschlich im IBKR-Rohwert. Der Aufrufer (Option-A-Loop) filtert
-    # Null-PnL-Rows danach sowieso aus der PnL-Buchung aus.
-    outflows = []
-    for idx, row in enumerate(fx_pnl_rows):
-        rd = parse_date(row.get('reportDate'))
-        if not rd or rd.year != tax_year:
-            continue
-        qty = safe_float(row.get('quantity'), 0)
-        curr = row.get('fxCurrency', '')
-        if qty >= 0 or not curr:
-            continue
-        if not fx_balance_timeline.get(curr):
-            continue
-        outflows.append({
-            'idx': idx,
-            'date_short': row.get('reportDate', '')[:10],
-            'curr': curr,
-            'qty': qty,
-            'desc': row.get('activityDescription', ''),
-        })
-
-    resolved = {}
-    # Per-Currency consumed-Set der Timeline-Indices
-    consumed = defaultdict(set)
-
-    def _find_exact_match(curr, date_short, target_amt, require_unique=False):
-        """Liefert (timeline_idx, prev_balance) oder (None, None).
-
-        require_unique=False (Default, Pass 1): greedy, gibt den ersten passenden
-        Cash-Event zurück. Bei mehreren passenden Events am Tag verteilt sich die
-        Korrelation natürlich, wenn mehrere fx_realized_pnl-Rows die gleiche
-        quantity haben (jeder Single-Row matched einen anderen Cash-Event).
-
-        require_unique=True (Pass 2/4): matched nur, wenn am Tag GENAU EIN
-        passender Cash-Event existiert. Bei Aggregat-Matches sind mehrere
-        fx_realized_pnl-Rows zu einer Gruppe zusammengefasst — wenn am Tag zwei
-        unabhängige Cash-Events mit dem aggregierten amount existieren, ist nicht
-        klar, welcher zur Gruppe gehört. Konservativ: kein Match, Fallback nutzen.
-        (Codex-Hinweis 2026-05-27.)
-        """
-        timeline = fx_balance_timeline.get(curr, [])
-        matches = []
-        for i, (d, _txid, amt, prev, _after) in enumerate(timeline):
-            if i in consumed[curr]:
-                continue
-            if d != date_short:
-                continue
-            if amt * target_amt <= 0:  # opposite sign
-                continue
-            if abs(amt - target_amt) < 0.01:
-                if not require_unique:
-                    return i, prev
-                matches.append((i, prev))
-        if require_unique and len(matches) == 1:
-            return matches[0]
-        return None, None
-
-    # Pass 1: Exakter (date, currency, amount)-Match (greedy)
-    for ev in outflows:
-        ti, prev = _find_exact_match(ev['curr'], ev['date_short'], ev['qty'])
-        if ti is not None:
-            consumed[ev['curr']].add(ti)
-            resolved[ev['idx']] = {'prev_balance': prev, 'aggregat_qty': ev['qty'],
-                                   'match_type': 'exact'}
-
-    # Pass 2: Aggregat pro (date, currency, description) — IBKR FIFO-Splits einer Buchung
-    # require_unique: bei zwei Cash-Events mit gleichem amount am Tag ist die
-    # Zuordnung nicht eindeutig.
-    buckets = defaultdict(list)
-    for ev in outflows:
-        if ev['idx'] in resolved:
-            continue
-        buckets[(ev['date_short'], ev['curr'], ev['desc'])].append(ev)
-    for (date_short, curr, _desc), group in buckets.items():
-        if not group:
-            continue
-        sum_qty = sum(g['qty'] for g in group)
-        ti, prev = _find_exact_match(curr, date_short, sum_qty, require_unique=True)
-        if ti is not None:
-            consumed[curr].add(ti)
-            for g in group:
-                resolved[g['idx']] = {'prev_balance': prev, 'aggregat_qty': sum_qty,
-                                      'match_type': 'aggregat'}
-
-    # Pass 3: OPT-Description-Parser — Match auf symbol/strike/expiry/putCall
-    for ev in outflows:
-        if ev['idx'] in resolved:
-            continue
-        opt = _parse_fx_opt_desc(ev['desc'])
-        if not opt:
-            continue
-        timeline = fx_balance_timeline.get(ev['curr'], [])
-        # Hier brauchen wir Zugriff auf die StmtFunds-Attribute (symbol/strike/expiry/putCall).
-        # Die fx_balance_timeline hat aber nur (date, txid, amount, prev, after). Daher
-        # Pass 3 nur sinnvoll, wenn wir Timeline mit Description erweitern. Tun wir hier
-        # nicht — überspringe, weil Pass 1+2 für die meisten Fälle reicht und Pass 4
-        # ähnliche Fälle abdeckt.
-        # (Lass den Match-Type 'opt_parse' im API für künftige Erweiterung)
-        pass
-
-    # Pass 4: Symbol-Aggregat — mehrere Split-Outflows pro (date, currency, symbol)
-    # Auch hier require_unique, weil mehrere Cash-Events mit gleichem aggregierten
-    # amount nicht sicher dem Symbol-Bucket zugeordnet werden können.
-    sym_buckets = defaultdict(list)
-    for ev in outflows:
-        if ev['idx'] in resolved:
-            continue
-        sym = _parse_fx_inst_symbol(ev['desc'])
-        if not sym:
-            continue
-        sym_buckets[(ev['date_short'], ev['curr'], sym)].append(ev)
-    for (date_short, curr, _sym), group in sym_buckets.items():
-        if len(group) < 2:
-            continue  # Single-row hätte Pass 1 oder 2 erwischt
-        sum_qty = sum(g['qty'] for g in group)
-        ti, prev = _find_exact_match(curr, date_short, sum_qty, require_unique=True)
-        if ti is not None:
-            consumed[curr].add(ti)
-            for g in group:
-                resolved[g['idx']] = {'prev_balance': prev, 'aggregat_qty': sum_qty,
-                                      'match_type': 'symbol_aggregat'}
-
-    return resolved, dict(consumed)
+    return (quantity > 0
+            and abs(realized_pnl) >= 0.001
+            and is_fx_closing_row(code))
 
 
 def _fx_event_sort_key(date_str, txid):
@@ -5178,8 +5042,16 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         csv_category_totals = csv_data['category_totals']
         csv_income_totals = csv_data.get('income_totals', {})
 
-    # --- Saldo-Timeline aus fx_transactions.csv (Margin-Korrektur, Issue #59) ---
-    # Wird sowohl für Option A (Filter) als auch für Option B (Entwertung) gebraucht.
+    # --- Saldo-Timeline aus fx_transactions.csv ---
+    # Nur noch Anzeige: Margin-Tage pro Währung und der Hinweis, dass es überhaupt
+    # eine Schuldphase gab. Die steuerliche Entscheidung trifft seit Issue #84 das
+    # Vorzeichen der FxTransaction (siehe is_fx_debt_repayment), nicht dieser Saldo.
+    #
+    # Quelle ist IBKRs eigene `balance`-Spalte (Saldo NACH der Buchung), nicht mehr
+    # eine Kumulation über `amount`: Bei gemergten Mehrjahres-Exporten driftet eine
+    # Eigenkumulation weg (audit2: 40.520 statt 826,73 USD am Jahresende), wodurch
+    # echte Margin-Phasen unsichtbar blieben. Zeilen ohne `balance` (synthetische
+    # Fixtures) fallen auf die Kumulation zurück.
     fx_tx_path = os.path.join(ib_tax_dir, 'fx_transactions.csv')
     fx_balance_timeline = defaultdict(list)  # curr -> [(date, txid, amount, prev_balance, after_balance)]
     fx_has_negative_balance = False
@@ -5202,15 +5074,18 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             _amt = safe_float(_tx.get('amount'), 0)
             if abs(_amt) < 0.001:
                 continue
-            _d = _tx.get('date', '')
-            _txid = _tx.get('transactionID', '')
-            _curr_events[_curr].append((_d, _txid, _amt))
+            _raw_bal = (_tx.get('balance') or '').strip()
+            _bal_reported = safe_float(_raw_bal, None) if _raw_bal else None
+            _curr_events[_curr].append(
+                (_tx.get('date', ''), _tx.get('transactionID', ''), _amt, _bal_reported))
         for _curr, _evs in _curr_events.items():
             _evs.sort(key=lambda x: _fx_event_sort_key(x[0], x[1]))
             _bal = float(_curr_sbs.get(_curr, 0.0))
-            for _d, _txid, _amt in _evs:
-                _prev = _bal
-                _bal += _amt
+            for _d, _txid, _amt, _bal_reported in _evs:
+                if _bal_reported is None:
+                    _prev, _bal = _bal, _bal + _amt
+                else:
+                    _prev, _bal = _bal_reported - _amt, _bal_reported
                 fx_balance_timeline[_curr].append((_d, _txid, _amt, _prev, _bal))
             if _negative_days_from_balance_timeline(
                     fx_balance_timeline[_curr],
@@ -5219,108 +5094,23 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     tax_year):
                 fx_has_negative_balance = True
 
-    def _lookup_balance_before_event(curr, target_date_short, target_qty, consumed_per_curr):
-        """Findet balance VOR einem Event in fx_realized_pnl.csv.
-
-        Match-Strategie (greedy mit per-Currency-consumed-Set):
-          1. Same date + same sign + |amount| ≈ |target_qty| → exakter prev-balance.
-          2. Kein Event am Target-Tag → Saldo nach letztem Event davor (EXAKT, weil
-             keine Events dazwischen).
-          3. Same-Day-Fallback: Events am Tag vorhanden, kein exakter |amount|-Match.
-             Hier ist der Tagesanfangs-Saldo (`first_prev`) nur asymmetrisch
-             belastbar:
-             - `first_prev ≤ 0` und alle Same-Sign-Outflows → unser tatsächlicher
-               prev bleibt für jeden Same-Sign-Outflow zwischenzeitlich ≤ 0
-               (jeder Outflow drückt nur weiter ins Minus). scale=0 ist sicher.
-             - `first_prev > 0` → der Tagesanfangs-Saldo ist eine OBERE Schranke
-               für den echten prev. Bei mehreren same-day-Outflows hat der echte
-               prev bereits Cash verbraucht, sodass `first_prev/|qty|` (partial)
-               systematisch zu großzügig wäre (besteuert mehr als nötig).
-               Codex-Hinweis 2026-05-27: prev_is_exact=False, IBKR-Rohwert behalten.
-             - Mixed-Sign-Tag → zwischenzeitliche Inflows könnten den Saldo
-               hochgezogen haben → in jedem Fall unsicher.
-
-        P2-2: consumed_per_curr ist dict[currency] → set[idx], damit Indices verschiedener
-        Currencies nicht kollidieren.
-        P2-3: target_qty trägt das Vorzeichen; gematched wird nur, wenn amt dasselbe
-        Vorzeichen hat — verhindert falsches Matching eines gleichgroßen Inflows auf
-        einen gesuchten Outflow.
-        Markiert gefundene Events als consumed.
-
-        Returns (prev_balance, matched_event_amount, prev_is_exact):
-            prev_is_exact=True → prev_balance darf ohne Vorbehalt für die scale-Logik
-                                 genutzt werden (exakter Match, No-Event-Tag oder
-                                 Same-Sign-Tag mit first_prev ≤ 0).
-            prev_is_exact=False → prev_balance ist eine Approximation; der Aufrufer
-                                  sollte nur den Counter bumpen, nicht skalieren.
-        """
-        timeline = fx_balance_timeline.get(curr, [])
-        if not timeline:
-            return None, None, False
-        consumed = consumed_per_curr.setdefault(curr, set())
-        target_abs = abs(target_qty)
-        target_sign = 1 if target_qty > 0 else -1
-
-        # 1) Exakter Match auf (date, same-sign, |amount|)
-        for idx, (d, txid, amt, prev, after) in enumerate(timeline):
-            if idx in consumed:
-                continue
-            if d != target_date_short:
-                continue
-            if amt * target_sign <= 0:  # opposite sign oder Null → kein Match
-                continue
-            if abs(abs(amt) - target_abs) < 0.01:
-                consumed.add(idx)
-                return prev, amt, True
-
-        # Sammle alle Events am Target-Tag (für Fall 3 oder Fall 2)
-        same_day_events = [ev for ev in timeline if ev[0] == target_date_short]
-
-        if same_day_events:
-            # 3) Same-Day-Fallback: erster prev des Tages
-            first_prev = same_day_events[0][3]
-            all_same_sign = all(ev[2] * target_sign > 0 for ev in same_day_events)
-            # Nur sicher, wenn der Tagesanfangs-Saldo bereits ≤ 0 ist (sichere untere
-            # Schranke für skipped_full). Bei first_prev > 0 würde same-day-Verbrauch
-            # durch andere unmatched Outflows die scale-Logik verfälschen → approx.
-            prev_is_exact = all_same_sign and first_prev <= 0
-            return first_prev, None, prev_is_exact
-
-        # 2) Kein Event am Target-Tag: Saldo NACH dem letzten Event davor ist exakt.
-        prev_after = float(timeline[0][3])
-        for d, txid, amt, prev, after in timeline:
-            if d < target_date_short:
-                prev_after = after
-            else:
-                break
-        return prev_after, None, True
-
     # Option A: Exact FX from XML FxTransactions (IBKR's own FIFO, per-transaction realizedPL)
-    # Mit Saldo-Korrektur (Issue #59): Abflüsse aus negativem Saldo erzeugen keinen
-    # steuerbaren FX-PnL; teilweise gedeckte Abflüsse werden proportional gekürzt.
+    # Schuldtilgungs-Gate (Issue #84): Zeilen, die eine Fremdwährungs-SCHULD schliessen
+    # (quantity > 0), sind keine Veräusserung von Guthaben und bleiben unberücksichtigt.
+    # Abflüsse werden ungekürzt übernommen — IBKR weist auf einer nur teilweise
+    # gedeckten Buchung bereits nur das Ergebnis des gedeckten Teils aus (der neu
+    # eröffnete Short geht zum Tageskurs ein und trägt null bei). Die früher hier
+    # angesetzte proportionale Kürzung war deshalb eine zweite Kürzung desselben
+    # Betrags; sie ist zusammen mit dem Saldo-Matching entfallen.
     fx_pnl_path = os.path.join(ib_tax_dir, 'fx_realized_pnl.csv')
     fx_option_a_meta = {}
     if not fx_results and os.path.exists(fx_pnl_path):
         fx_pnl_rows = load_csv(fx_pnl_path)
         fx_by_curr = {}
-        approx_matches = 0  # Events ohne sicheren prev_balance (IBKR-Rohwert behalten)
-        skipped_full = 0    # Events aus negativem Saldo (kein PnL)
-        partial_count = 0   # Events mit proportionaler Kürzung
-        # Pre-resolve: 4 strukturelle Match-Passes über fx_realized_pnl ↔ fx_transactions.
-        # Liefert dict[row_idx] = {prev_balance, aggregat_qty, match_type}.
-        # Match-Typen: exact (Pass 1, 1:1 amount-Match) | aggregat (Pass 2, FIFO-Splits
-        # einer Cash-Buchung) | symbol_aggregat (Pass 4, mehrere Splits eines STK-Trades).
-        # Das consumed-Dict trägt die im Pre-Resolve bereits verbrauchten Cash-Events
-        # in den Fallback-Matcher hinein — Codex-Fix 2026-05-27: ohne diesen Transfer
-        # könnte der Fallback denselben Cash-Event ein zweites Mal exact-matchen
-        # (z.B. wenn fx_realized_pnl unabhängig vom Pre-Resolve eine duplizierte
-        # quantity hat, die zufällig auf eine bereits konsumierte Cash-Buchung passt).
-        fx_resolved, consumed_timeline_idx = _resolve_fx_outflows(
-            fx_pnl_rows, fx_balance_timeline, tax_year)
-        # Sets aus Pre-Resolve mutierbar machen, damit der Fallback weiter konsumieren kann
-        consumed_timeline_idx = {curr: set(idxs) for curr, idxs in consumed_timeline_idx.items()}
-        resolved_counts = {'exact': 0, 'aggregat': 0, 'symbol_aggregat': 0}
-        for row_idx, row in enumerate(fx_pnl_rows):
+        debt_repayments = 0       # verworfene Zeilen (Schuldtilgung)
+        debt_repayment_pnl = 0.0  # deren IBKR-Ergebnis, für die UI-Transparenz
+        fx_open_with_pnl = []     # Anomalie: Opening-Zeile trägt ein Ergebnis
+        for row in fx_pnl_rows:
             rd = parse_date(row.get('reportDate'))
             if not rd or rd.year != tax_year:
                 continue
@@ -5330,47 +5120,26 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             if not curr or abs(pnl_raw) < 0.001:
                 continue
 
-            # Saldo-Korrektur nur bei Abflüssen (quantity < 0) anwenden.
-            # Zuflüsse erzeugen kein realizedPL > 0 in IBKRs FIFO (Lots werden gebildet, nicht aufgelöst).
-            #
-            # Match-Strategie:
-            #  1. Pre-Resolve-Dict (strukturelle Matches Pass 1-4) liefert präzisen prev_balance.
-            #     Bei Aggregat-Match teilen mehrere Rows einen prev_balance und nutzen die
-            #     aggregierte qty-Summe als Referenz für die scale-Logik (nicht die Einzel-qty).
-            #  2. Fallback _lookup_balance_before_event deckt No-Event-am-Tag und Same-Sign-
-            #     Tag mit first_prev ≤ 0 ab (sichere konservative Approximation).
-            #  3. Sonst: approx_matches, IBKR-Rohwert behalten.
-            scale = 1.0
-            if qty < 0 and fx_balance_timeline.get(curr):
-                resolution = fx_resolved.get(row_idx)
-                if resolution is not None:
-                    prev_bal = resolution['prev_balance']
-                    aggregat_qty = resolution['aggregat_qty']
-                    resolved_counts[resolution['match_type']] = resolved_counts.get(
-                        resolution['match_type'], 0) + 1
-                    if prev_bal <= 0:
-                        scale = 0.0
-                        skipped_full += 1
-                    elif prev_bal < abs(aggregat_qty):
-                        # Proportionale Kürzung auf Basis der Aggregat-Summe: alle Rows
-                        # der Gruppe teilen denselben gedeckten Anteil.
-                        scale = prev_bal / abs(aggregat_qty)
-                        partial_count += 1
-                else:
-                    # Fallback für ungelöste Rows: alte heuristische Logik (No-Event-Tag,
-                    # Same-Sign-Day mit first_prev ≤ 0). P2-3: qty mit Vorzeichen.
-                    prev_bal, _matched_amt, prev_is_exact = _lookup_balance_before_event(
-                        curr, row.get('reportDate', '')[:10], qty, consumed_timeline_idx)
-                    if not prev_is_exact or prev_bal is None:
-                        approx_matches += 1
-                    elif prev_bal <= 0:
-                        scale = 0.0
-                        skipped_full += 1
-                    elif prev_bal < abs(qty):
-                        scale = prev_bal / abs(qty)
-                        partial_count += 1
+            # Eine Opening-Zeile mit realisiertem Ergebnis widerspricht IBKRs
+            # Konvention. Statt sie still über das Vorzeichen einzusortieren, wird
+            # sie als Prüffall gemeldet und wie bisher (steuerbar) behandelt.
+            code = row.get('code', '')
+            if not is_fx_closing_row(code):
+                fx_open_with_pnl.append({
+                    'date': (row.get('reportDate') or '')[:10],
+                    'currency': curr,
+                    'code': code,
+                    'quantity': qty,
+                    'realized_pnl': pnl_raw,
+                    'description': row.get('activityDescription', ''),
+                })
 
-            pnl_corrected_raw = pnl_raw * scale
+            # Der Toggle wirkt erst im Postprocessing (raw_* statt corrected_*),
+            # damit beide Sichten für den UI-Vergleich gefüllt bleiben.
+            is_debt_repayment = is_fx_debt_repayment(qty, pnl_raw, code)
+            if is_debt_repayment:
+                debt_repayments += 1
+            pnl_corrected_raw = 0.0 if is_debt_repayment else pnl_raw
 
             # EUR base: realizedPL already in EUR; USD base: realizedPL in USD → convert
             if base_currency == 'EUR':
@@ -5380,6 +5149,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 rate_eur = get_rate_for_date(rd, usd_to_eur_rates)
                 pnl = pnl_corrected_raw * rate_eur
                 pnl_raw_eur = pnl_raw * rate_eur
+            if is_debt_repayment:
+                debt_repayment_pnl += pnl_raw_eur
             if curr not in fx_by_curr:
                 fx_by_curr[curr] = {'gain': 0, 'loss': 0, 'net': 0, 'lots_remaining': 0, 'disposals_count': 0,
                                     'raw_gain': 0.0, 'raw_loss': 0.0, 'raw_net': 0.0,
@@ -5441,26 +5212,26 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             fx_total_loss = sum(d['loss'] for d in fx_by_curr.values())
             fx_source = 'xml'
             fx_option_a_meta = {
-                'approx_matches': approx_matches,
-                'skipped_full': skipped_full,
-                'partial_count': partial_count,
+                'debt_repayments': debt_repayments,
+                'debt_repayment_pnl': debt_repayment_pnl,
+                'open_rows_with_pnl': fx_open_with_pnl,
                 'has_negative_balance': fx_has_negative_balance,
                 'correction_enabled': fx_margin_correction_enabled,
                 'corrected_total': sum(d.get('corrected_net', d.get('net', 0.0)) for d in fx_by_curr.values()),
                 'raw_total': sum(d.get('raw_net', d.get('net', 0.0)) for d in fx_by_curr.values()),
-                # Pass-Counter aus der strukturellen Pre-Resolve-Engine (Pass 1-4):
-                'resolve_exact': resolved_counts.get('exact', 0),
-                'resolve_aggregat': resolved_counts.get('aggregat', 0),
-                'resolve_symbol_aggregat': resolved_counts.get('symbol_aggregat', 0),
             }
-            fx_label = 'USD' if base_currency == 'USD' else '/'.join(fx_by_curr.keys())
             print(f"FX: Exakte Werte aus XML FxTransactions übernommen ({len(fx_pnl_rows)} Einträge).")
-            if (skipped_full or partial_count) and fx_margin_correction_enabled:
-                print(f"  Saldo-Korrektur aktiv: {skipped_full} Events aus Schuld (kein PnL), "
-                      f"{partial_count} proportional gekürzt, {approx_matches} approximative Matches.")
-            elif (skipped_full or partial_count) and not fx_margin_correction_enabled:
-                print(f"  Saldo-Korrektur deaktiviert: IBKR-Rohwerte übernommen "
-                      f"({skipped_full} Events aus Schuld, {partial_count} proportional wären betroffen).")
+            if fx_open_with_pnl:
+                print(f"  WARNUNG: {len(fx_open_with_pnl)} FX-Zeilen tragen ein realisiertes "
+                      f"Ergebnis, obwohl IBKR sie als Eroeffnung ausweist (code != 'C'). "
+                      f"Sie wurden als steuerbar behandelt und sollten geprueft werden.")
+            if debt_repayments and fx_margin_correction_enabled:
+                print(f"  Schuldtilgung ausgenommen: {debt_repayments} Buchungen "
+                      f"({debt_repayment_pnl:+.2f} EUR) schliessen eine Fremdwaehrungsschuld "
+                      f"statt Guthaben zu veraeussern.")
+            elif debt_repayments and not fx_margin_correction_enabled:
+                print(f"  Schuldtilgungs-Filter deaktiviert: IBKR-Rohwerte uebernommen "
+                      f"({debt_repayments} Buchungen, {debt_repayment_pnl:+.2f} EUR waeren betroffen).")
             if base_currency == 'USD':
                 print(f"  USD-Konto: FX-Gewinne/-Verluste aus EUR-Transaktionen (IBKR trackt EUR als Fremdwährung).")
 
@@ -5514,9 +5285,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             fx_total_loss = csv_data['fx_total_loss']
             fx_source = 'csv'
             fx_option_a_meta = {
-                'approx_matches': 0,
-                'skipped_full': 0,
-                'partial_count': 0,
+                'debt_repayments': 0,
+                'debt_repayment_pnl': 0.0,
+                'open_rows_with_pnl': [],
                 'has_negative_balance': fx_has_negative_balance,
                 'correction_enabled': fx_margin_correction_enabled,
                 'csv_raw_only': fx_has_negative_balance and not fx_margin_correction_enabled,
@@ -5549,9 +5320,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             fx_total_gain = sum(d.get('gain', 0.0) for d in fx_results.values())
             fx_total_loss = sum(d.get('loss', 0.0) for d in fx_results.values())
         fx_option_a_meta = {
-            'approx_matches': 0,
-            'skipped_full': 0,
-            'partial_count': 0,
+            'debt_repayments': 0,
+            'debt_repayment_pnl': 0.0,
+            'open_rows_with_pnl': [],
             'has_negative_balance': fx_has_negative_balance,
             'correction_enabled': fx_margin_correction_enabled,
             'corrected_total': sum(d.get('corrected_net', d.get('net', 0.0)) for d in fx_results.values()),

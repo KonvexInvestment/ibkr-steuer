@@ -129,6 +129,84 @@ def test_quarterly_tax_year_with_history_keeps_tax_year_sections():
         assert account_info[0].get("tax_year") == "2025"
 
 
+def test_repeated_transaction_id_keeps_every_ledger_row():
+    """IBKR vergibt dieselbe transactionID fuer Folgebuchungen derselben Position.
+
+    Realfall: alle taeglichen MTM-Abrechnungen eines Futures teilen sich eine ID
+    (audit1_2024.xml, tid 654722380 = 40+ Zeilen "M6E 18MAR24 Position MTM"), und
+    auch am selben Tag kollidieren fachlich verschiedene Buchungen. Ein Dedupe ueber
+    die ID allein loeschte diese Zeilen: audit1 verlor netto -2.004,15 USD, audit2
+    -39.693,75 USD, wodurch der kumulierte Saldo und die FIFO-Naeherung (Option C)
+    verfaelscht wurden. Nur bitidentische Zeilen sind echte Duplikate.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        history = write_xml(tmp, "history_2024.xml", "2024-01-01", "2024-12-31", """
+      <StmtFunds>
+        <StatementOfFunds transactionID="SB" levelOfDetail="Currency"
+               activityDescription="Starting Balance" date="2024-01-01"
+               currency="USD" amount="0" balance="0" fxRateToBase="0.92" />
+        <StatementOfFunds transactionID="MTM1" levelOfDetail="Currency"
+               activityCode="ADJ" activityDescription="M6E 18MAR24 Position MTM"
+               date="2024-12-30" currency="USD" amount="-100" balance="-100"
+               fxRateToBase="0.92" />
+      </StmtFunds>
+""")
+        # Gleiche ID, gleicher Tag, andere Buchung + gleiche ID an Folgetagen.
+        current = write_xml(tmp, "tax_2025.xml", "2025-01-01", "2025-12-31", """
+      <StmtFunds>
+        <StatementOfFunds transactionID="MTM1" levelOfDetail="Currency"
+               activityCode="ADJ" activityDescription="M6E 18MAR24 Position MTM"
+               date="2025-01-02" currency="USD" amount="-250" balance="-350"
+               fxRateToBase="0.91" />
+        <StatementOfFunds transactionID="MTM1" levelOfDetail="Currency"
+               activityCode="ADJ" activityDescription="M6E 18MAR24 Position MTM"
+               date="2025-01-03" currency="USD" amount="400" balance="50"
+               fxRateToBase="0.91" />
+        <StatementOfFunds transactionID="SAMEDAY" levelOfDetail="Currency"
+               activityCode="" activityDescription="USD Borrow Fees for Dec-2024"
+               date="2025-01-06" currency="USD" amount="-19.63" balance="30.37"
+               fxRateToBase="0.91" />
+        <StatementOfFunds transactionID="SAMEDAY" levelOfDetail="Currency"
+               activityCode="CINT" activityDescription="SYEP Interest"
+               date="2025-01-06" currency="USD" amount="1.82" balance="32.19"
+               fxRateToBase="0.91" />
+        <StatementOfFunds transactionID="MTM1" levelOfDetail="Currency"
+               activityCode="ADJ" activityDescription="M6E 18MAR24 Position MTM"
+               date="2025-01-02" currency="USD" amount="-250" balance="-350"
+               fxRateToBase="0.91" />
+      </StmtFunds>
+""")
+        out_dir = os.path.join(tmp, "out")
+        os.makedirs(out_dir, exist_ok=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            extract_fx_multi_xml([current, history], out_dir)
+
+        rows = [r for r in read_csv(os.path.join(out_dir, "fx_transactions.csv"))
+                if r.get("activityDescription") != "Starting Balance"]
+
+        mtm = [r for r in rows if r.get("transactionID") == "MTM1"]
+        assert len(mtm) == 3, (
+            f"Folgebuchungen derselben ID muessen erhalten bleiben, sind {len(mtm)}: "
+            f"{[(r.get('date'), r.get('amount')) for r in mtm]}"
+        )
+
+        sameday = [r for r in rows if r.get("transactionID") == "SAMEDAY"]
+        assert len(sameday) == 2, (
+            f"Verschiedene Buchungen mit gleicher ID am selben Tag muessen beide "
+            f"bleiben, sind {len(sameday)}"
+        )
+
+        # Die bitidentische Wiederholung (2025-01-02, -250) ist ein echtes Duplikat.
+        dupes = [r for r in mtm if r.get("date") == "2025-01-02"]
+        assert len(dupes) == 1, "Bitidentische Zeile muss dedupliziert werden"
+
+        # Der kumulierte Saldo trifft damit wieder IBKRs gemeldeten Endstand.
+        total = sum(float(r["amount"]) for r in rows)
+        assert abs(total - 32.19) < 0.01, f"Saldo-Kumulation: erwartet 32.19, ist {total}"
+
+
 if __name__ == "__main__":
     test_quarterly_tax_year_with_history_keeps_tax_year_sections()
     print("OK: quarterly-history extraction")
+    test_repeated_transaction_id_keeps_every_ledger_row()
+    print("OK: wiederholte transactionID verliert keine Ledgerzeile")

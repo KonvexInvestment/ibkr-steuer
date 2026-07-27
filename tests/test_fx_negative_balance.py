@@ -1,12 +1,20 @@
-"""Synthetische Tests fuer GH Issue #59 (Margin-Korrektur bei FX-Gewinnen).
+"""Synthetische Tests fuer GH Issues #59 und #84 (Margin-Korrektur bei FX-Gewinnen).
 
-Pruefen die neue Saldo-getragene FX-Engine (`_init_fx_state`, `_process_fx_event`):
+TC1-TC22 pruefen die Saldo-getragene FIFO-Engine (`_init_fx_state`,
+`_process_fx_event`), die den Option-C-Pfad traegt:
 
 - Abfluesse aus negativem Saldo loesen keinen steuerbaren FX-PnL aus
 - Zufluesse auf negativen Saldo tilgen Schuld (keine Lot-Erzeugung bis Saldo positiv)
 - BUY/SELL/ADJ/DINT konsumieren Lots ohne PnL (Stale-Lot-Schutz)
 - Negative Starting Balance startet als Schuld (kein Lot)
 - DINT veraendert Saldo, loest aber keinen PnL aus
+
+TC23-TC29 pruefen das Schuldtilgungs-Gate von Option A (Issue #84), das statt
+eines nachgebauten Saldos das Vorzeichen der IBKR-Buchung auswertet:
+
+- Zufluss mit realisiertem Ergebnis = Short-Close = Tilgung, nicht steuerbar
+- Abfluss = Long-Close, ungekuerzt steuerbar (IBKR trennt den gedeckten Teil selbst)
+- Margin-Tage stammen aus IBKRs balance-Spalte, mit Kumulations-Fallback
 
 Aufruf: python tests/test_fx_negative_balance.py
 """
@@ -490,15 +498,15 @@ def tc19_option_a_keeps_negative_currency_without_pnl():
 def tc20_option_a_opt_out_uses_xml_raw_value():
     """Opt-out muss bei XML FxTransactions den IBKR-Rohwert in Topf 2 uebernehmen.
 
-    Der Cash-Saldo ist vor dem gematchten Outflow 0, daher waere die korrigierte
-    PnL 0. Mit deaktivierter Korrektur muss trotzdem der IBKR-Rohwert 10 aktiv sein.
+    Die Buchung ist ein Zufluss mit Ergebnis, also eine Schuldtilgung: korrigiert
+    waere sie 0. Mit deaktivierter Korrektur muss der IBKR-Rohwert 10 aktiv sein.
     """
     with tempfile.TemporaryDirectory() as tmp:
         write_csv(os.path.join(tmp, "account_info.csv"), [
             {"currency": "EUR", "tax_year": str(TAX_YEAR), "fx_transactions_count": "1"}
         ])
         write_csv(os.path.join(tmp, "fx_transactions.csv"), [
-            make_tx("2025-06-01", -100.0, 1.10, "FRTAX", txid="1001"),
+            make_tx("2025-06-01", 100.0, 1.10, "SELL", txid="1001", balance=-500.0),
         ])
         write_csv(os.path.join(tmp, "fx_realized_pnl.csv"), [
             {
@@ -507,7 +515,7 @@ def tc20_option_a_opt_out_uses_xml_raw_value():
                 "functionalCurrency": "EUR",
                 "fxCurrency": "USD",
                 "activityDescription": "TEST",
-                "quantity": "-100",
+                "quantity": "100",
                 "proceeds": "110",
                 "cost": "-100",
                 "realizedPL": "10",
@@ -593,555 +601,215 @@ def tc22_option_c_opt_out_uses_fifo_raw_path():
     print("TC22 OK — Opt-out nutzt FIFO-Rohpfad statt Saldo-Korrektur")
 
 
-def tc23_same_sign_day_negative_prev_scales_to_zero():
-    """Same-Day same-sign Outflows mit negativem Tagesanfangs-Saldo: scale=0.
+# --- Issue #84: Schuldtilgungs-Gate (Vorzeichen statt Saldo-Rekonstruktion) ---
 
-    fx_transactions.csv (Saldo-Timeline):
-      Start +0
-      2025-03-15 BUY -10000 → balance -10000 (Margin-Schuld am Vortag bereits geladen)
-      2025-06-01 FRTAX -100 → balance -10100  (Tagesanfangs-Saldo = -10000)
-      2025-06-01 FRTAX -200 → balance -10300
 
-    fx_realized_pnl.csv: zwei separate FIFO-Auflösungen mit anderen quantities (-50/-250),
-    daher kein exakter |amount|-Match auf die fx_transactions. Beide Events landen im
-    Same-Sign-Day-Fallback, Tagesanfangs-Saldo ist -10000 (≤0), beide same-sign →
-    prev_is_exact=True → beide werden mit scale=0 als skipped_full markiert.
+def fx_pnl_row(date, quantity, realized_pl, *, code="C", desc="TEST", currency="USD"):
+    """Hilfsfunktion fuer fx_realized_pnl-Zeilen (FxTransactions levelOfDetail=TRANSACTION)."""
+    return {
+        "reportDate": date,
+        "dateTime": f"{date} 10:00:00",
+        "functionalCurrency": "EUR",
+        "fxCurrency": currency,
+        "activityDescription": desc,
+        "quantity": str(quantity),
+        "proceeds": "0",
+        "cost": "0",
+        "realizedPL": str(realized_pl),
+        "code": code,
+        "levelOfDetail": "TRANSACTION",
+    }
 
-    Erwartung corrected: fx_total_gain=0, skipped_full=2.
-    """
+
+def tc23_debt_repayment_unit():
+    """is_fx_debt_repayment prueft Vorzeichen UND IBKRs Closing-Code."""
+    from calculate_tax_report import is_fx_debt_repayment, is_fx_closing_row
+
+    assert is_fx_debt_repayment(500.0, -12.0, "C") is True, "TC23 Zufluss + Close = Short-Close"
+    assert is_fx_debt_repayment(500.0, 12.0, "C") is True, "TC23 Zufluss mit Gewinn ebenfalls"
+    assert is_fx_debt_repayment(500.0, -12.0, "C;O") is True, "TC23 C;O schliesst ebenfalls"
+    assert is_fx_debt_repayment(-500.0, -12.0, "C") is False, "TC23 Abfluss = Long-Close, steuerbar"
+    assert is_fx_debt_repayment(500.0, 0.0, "O") is False, "TC23 Zufluss ohne PnL ist ein Open"
+    assert is_fx_debt_repayment(500.0, 0.0005, "C") is False, "TC23 Rauschen unter 0,001 zaehlt nicht"
+    # Opening mit Ergebnis widerspricht IBKRs Konvention -> nicht still als Tilgung werten
+    assert is_fx_debt_repayment(500.0, -12.0, "O") is False, \
+        "TC23 code='O' darf nicht als Schuldtilgung durchgehen"
+    # Fehlender Code (aeltere Extraktionen): Vorzeichen entscheidet wie bisher
+    assert is_fx_debt_repayment(500.0, -12.0, "") is True, "TC23 ohne Code faellt auf Vorzeichen zurueck"
+
+    assert is_fx_closing_row("C") is True
+    assert is_fx_closing_row("C;O") is True
+    assert is_fx_closing_row("o;c") is True, "TC23 Code-Parsing ist case- und reihenfolgeunabhaengig"
+    assert is_fx_closing_row("O") is False
+    assert is_fx_closing_row("") is True, "TC23 leerer Code gilt als Closing (Rueckfall)"
+    print("TC23 OK — is_fx_debt_repayment prueft Vorzeichen und Closing-Code")
+
+
+def tc29_opening_row_with_pnl_is_reported():
+    """code='O' mit Ergebnis wird als Anomalie gemeldet, nicht still gefiltert."""
     with tempfile.TemporaryDirectory() as tmp:
         write_csv(os.path.join(tmp, "account_info.csv"), [
-            {"currency": "EUR", "tax_year": str(TAX_YEAR), "fx_transactions_count": "3"}
-        ])
-        write_csv(os.path.join(tmp, "fx_transactions.csv"), [
-            make_tx("2025-03-15", -10000.0, 1.10, "BUY", desc="STK BUY", txid="100"),
-            make_tx("2025-06-01", -100.0, 1.20, "FRTAX", txid="200"),
-            make_tx("2025-06-01", -200.0, 1.20, "FRTAX", txid="201"),
+            {"currency": "EUR", "tax_year": str(TAX_YEAR), "fx_transactions_count": "0"}
         ])
         write_csv(os.path.join(tmp, "fx_realized_pnl.csv"), [
-            {
-                "reportDate": "2025-06-01", "dateTime": "2025-06-01 10:00:00",
-                "functionalCurrency": "EUR", "fxCurrency": "USD",
-                "activityDescription": "FRTAX-Lot-1",
-                "quantity": "-50", "proceeds": "60", "cost": "-55",
-                "realizedPL": "20", "code": "C", "levelOfDetail": "TRANSACTION",
-            },
-            {
-                "reportDate": "2025-06-01", "dateTime": "2025-06-01 11:00:00",
-                "functionalCurrency": "EUR", "fxCurrency": "USD",
-                "activityDescription": "FRTAX-Lot-2",
-                "quantity": "-250", "proceeds": "300", "cost": "-275",
-                "realizedPL": "80", "code": "C", "levelOfDetail": "TRANSACTION",
-            },
+            fx_pnl_row("2025-06-01", 2000.0, -50.0, code="O", desc="STK: -100 ACME"),
+            fx_pnl_row("2025-06-03", -800.0, -20.0, code="C", desc="STK: 40 ACME"),
         ])
 
         with contextlib.redirect_stdout(io.StringIO()):
-            report = calculate_tax(tmp, tax_year=TAX_YEAR, fx_margin_correction_enabled=True)
+            report = calculate_tax(tmp, tax_year=TAX_YEAR)
 
-    meta = report.get("fx_option_a_meta", {})
-    assert report["fx_source"] == "xml", f"TC23 fx_source: erwartet xml, ist {report['fx_source']}"
-    assert meta.get("skipped_full") == 2, \
-        f"TC23 skipped_full: erwartet 2, ist {meta.get('skipped_full')}"
-    assert meta.get("approx_matches", 0) == 0, \
-        f"TC23 approx_matches: erwartet 0, ist {meta.get('approx_matches')}"
-    assert approx(report["fx_total_gain"], 0.0), \
-        f"TC23 fx_total_gain: erwartet 0, ist {report['fx_total_gain']}"
-    # Raw bleibt unverändert (100 EUR realizedPL total)
+    meta = report["fx_option_a_meta"]
     usd = report["fx_results"]["USD"]
-    assert approx(usd["raw_gain"], 100.0), f"TC23 raw_gain: erwartet 100, ist {usd['raw_gain']}"
-    print("TC23 OK — Same-Sign-Day mit neg. Tagesanfangs-Saldo: beide Events skipped (scale=0)")
+    assert len(meta["open_rows_with_pnl"]) == 1, \
+        f"TC29 Anomalie muss gemeldet werden, sind {len(meta['open_rows_with_pnl'])}"
+    assert meta["open_rows_with_pnl"][0]["code"] == "O"
+    assert meta["debt_repayments"] == 0, "TC29 Opening-Zeile zaehlt nicht als Tilgung"
+    assert approx(usd["net"], -70.0), \
+        f"TC29 Anomalie bleibt steuerbar (konservativ), net ist {usd['net']}"
+    print("TC29 OK — Opening-Zeile mit Ergebnis wird zum Prueffall statt still gefiltert")
 
 
-def tc24_mixed_sign_day_stays_approx():
-    """Mixed-Sign-Tag bleibt approximativ — keine automatische Korrektur.
+def tc24_inflow_realization_is_not_taxable():
+    """Zufluss-Realisierung (Schuldtilgung) darf nicht in Topf 2 landen.
 
-    fx_transactions.csv:
-      Start +0
-      2025-03-15 BUY -10000 → balance -10000
-      2025-06-01 DIV +5000  → balance -5000 (Inflow zwischendrin)
-      2025-06-01 FRTAX -100 → balance -5100
-
-    fx_realized_pnl.csv: ein Event quantity=-100, aber kein exakter |amount|-Match auf
-    die FRTAX in fx_transactions (Werte stimmen zufällig nicht überein, IBKR's FIFO
-    splittet anders). Tag enthält Mixed-Sign-Events (+5000 / -100), daher
-    prev_is_exact=False → approx_matches++, kein scale-Eingriff.
-
-    Erwartung: approx_matches=1, IBKR-Rohwert bleibt.
+    Kern von Issue #84: IBKR bucht beim Tilgen einer USD-Schuld ein FX-Ergebnis.
+    Es fehlt aber das Fremdwaehrungsguthaben als Bezugsobjekt (BMF Rn. 131).
     """
     with tempfile.TemporaryDirectory() as tmp:
         write_csv(os.path.join(tmp, "account_info.csv"), [
-            {"currency": "EUR", "tax_year": str(TAX_YEAR), "fx_transactions_count": "3"}
-        ])
-        write_csv(os.path.join(tmp, "fx_transactions.csv"), [
-            make_tx("2025-03-15", -10000.0, 1.10, "BUY", desc="STK BUY", txid="100"),
-            make_tx("2025-06-01", 5000.0, 1.20, "DIV", txid="200"),
-            make_tx("2025-06-01", -100.0, 1.20, "FRTAX", txid="201"),
+            {"currency": "EUR", "tax_year": str(TAX_YEAR), "fx_transactions_count": "0"}
         ])
         write_csv(os.path.join(tmp, "fx_realized_pnl.csv"), [
-            {
-                "reportDate": "2025-06-01", "dateTime": "2025-06-01 10:00:00",
-                "functionalCurrency": "EUR", "fxCurrency": "USD",
-                "activityDescription": "FRTAX-split",
-                "quantity": "-77", "proceeds": "92", "cost": "-85",
-                "realizedPL": "10", "code": "C", "levelOfDetail": "TRANSACTION",
-            },
+            fx_pnl_row("2025-06-01", 2000.0, -50.0, desc="STK: -100 ACME"),   # Schuldtilgung
+            fx_pnl_row("2025-06-02", 1500.0, 30.0, desc="STK: -50 ACME"),     # Schuldtilgung, Gewinn
+            fx_pnl_row("2025-06-03", -800.0, -20.0, desc="STK: 40 ACME"),     # Guthaben-Veraeusserung
         ])
 
         with contextlib.redirect_stdout(io.StringIO()):
-            report = calculate_tax(tmp, tax_year=TAX_YEAR, fx_margin_correction_enabled=True)
+            report = calculate_tax(tmp, tax_year=TAX_YEAR)
 
-    meta = report.get("fx_option_a_meta", {})
-    assert meta.get("approx_matches") == 1, \
-        f"TC24 approx_matches: erwartet 1, ist {meta.get('approx_matches')}"
-    assert meta.get("skipped_full", 0) == 0, \
-        f"TC24 skipped_full: erwartet 0, ist {meta.get('skipped_full')}"
-    # IBKR-Rohwert wurde übernommen (10 EUR)
-    assert approx(report["fx_total_gain"], 10.0), \
-        f"TC24 fx_total_gain: erwartet 10, ist {report['fx_total_gain']}"
-    print("TC24 OK — Mixed-Sign-Tag bleibt approximativ, IBKR-Rohwert übernommen")
-
-
-def tc26_same_sign_day_positive_prev_stays_approx():
-    """Codex-Finding 2026-05-27: Same-Sign-Day mit positivem Tagesanfangs-Saldo darf
-    NICHT als exakt behandelt werden. Bei mehreren Same-Day-Outflows ohne exakten
-    Match hätte ein partial-scale aus first_prev / |qty| systematisch zu großzügige
-    Skalierung erzeugt — der echte prev nach zwischenzeitlichen Same-Sign-Outflows
-    ist kleiner als first_prev.
-
-    Szenario:
-      Tagesanfangs-Saldo = +1000
-      3× FRTAX -400 (alle ohne exakten |amount|-Match auf fx_transactions)
-
-    Echte prev pro Row: 1000 / 600 / 200. Mit korrekter scale-Logik wäre Row 3
-    partial (200/400=0.5). Mit fehlerhaftem first_prev=1000 für alle wäre Row 3
-    fälschlicherweise scale=1.0 (1000>400). Korrekt jetzt: alle 3 fallen in
-    approx_matches, IBKR-Rohwerte werden konservativ übernommen.
-    """
-    with tempfile.TemporaryDirectory() as tmp:
-        write_csv(os.path.join(tmp, "account_info.csv"), [
-            {"currency": "EUR", "tax_year": str(TAX_YEAR), "fx_transactions_count": "4"}
-        ])
-        write_csv(os.path.join(tmp, "fx_transactions.csv"), [
-            starting_balance_tx("2025-01-01", 1000.0, 1.10),
-            make_tx("2025-06-01", -400.0, 1.20, "FRTAX", txid="200"),
-            make_tx("2025-06-01", -400.0, 1.20, "FRTAX", txid="201"),
-            make_tx("2025-06-01", -400.0, 1.20, "FRTAX", txid="202"),
-        ])
-        # fx_realized_pnl: andere quantities (IBKR-FIFO-Split), kein exakter Match
-        write_csv(os.path.join(tmp, "fx_realized_pnl.csv"), [
-            {
-                "reportDate": "2025-06-01", "dateTime": "2025-06-01 10:00:00",
-                "functionalCurrency": "EUR", "fxCurrency": "USD",
-                "activityDescription": "FRTAX-split-1",
-                "quantity": "-380", "proceeds": "456", "cost": "-418",
-                "realizedPL": "38", "code": "C", "levelOfDetail": "TRANSACTION",
-            },
-            {
-                "reportDate": "2025-06-01", "dateTime": "2025-06-01 11:00:00",
-                "functionalCurrency": "EUR", "fxCurrency": "USD",
-                "activityDescription": "FRTAX-split-2",
-                "quantity": "-380", "proceeds": "456", "cost": "-418",
-                "realizedPL": "38", "code": "C", "levelOfDetail": "TRANSACTION",
-            },
-            {
-                "reportDate": "2025-06-01", "dateTime": "2025-06-01 12:00:00",
-                "functionalCurrency": "EUR", "fxCurrency": "USD",
-                "activityDescription": "FRTAX-split-3",
-                "quantity": "-380", "proceeds": "456", "cost": "-418",
-                "realizedPL": "38", "code": "C", "levelOfDetail": "TRANSACTION",
-            },
-        ])
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            report = calculate_tax(tmp, tax_year=TAX_YEAR, fx_margin_correction_enabled=True)
-
-    meta = report.get("fx_option_a_meta", {})
-    # Alle 3 Rows müssen approx bleiben (first_prev=1000 > 0 → unsicher)
-    assert meta.get("approx_matches") == 3, \
-        f"TC26 approx_matches: erwartet 3, ist {meta.get('approx_matches')}"
-    assert meta.get("skipped_full", 0) == 0, \
-        f"TC26 skipped_full: erwartet 0, ist {meta.get('skipped_full')}"
-    assert meta.get("partial_count", 0) == 0, \
-        f"TC26 partial_count: erwartet 0, ist {meta.get('partial_count')}"
-    # IBKR-Rohwerte werden alle übernommen: 3 × 38 = 114 EUR
-    assert approx(report["fx_total_gain"], 114.0), \
-        f"TC26 fx_total_gain: erwartet 114, ist {report['fx_total_gain']}"
-    print("TC26 OK — Same-Sign-Day mit positivem first_prev bleibt approx (Codex-Fix)")
+    usd = report["fx_results"]["USD"]
+    meta = report["fx_option_a_meta"]
+    assert approx(usd["net"], -20.0), f"TC24 net: erwartet -20 (nur Abfluss), ist {usd['net']}"
+    assert approx(usd["gain"], 0.0), f"TC24 gain: Zufluss-Gewinn darf nicht zaehlen, ist {usd['gain']}"
+    assert approx(usd["raw_net"], -40.0), f"TC24 raw_net: erwartet -40, ist {usd['raw_net']}"
+    assert meta["debt_repayments"] == 2, f"TC24 debt_repayments: erwartet 2, ist {meta['debt_repayments']}"
+    assert approx(meta["debt_repayment_pnl"], -20.0), \
+        f"TC24 debt_repayment_pnl: erwartet -20, ist {meta['debt_repayment_pnl']}"
+    print("TC24 OK — Schuldtilgung bleibt aus Topf 2, Guthaben-Veraeusserung nicht")
 
 
-def tc27_description_aggregat_match():
-    """Pass 2: IBKR-FIFO-Split einer Cash-Buchung wird über Description-Aggregat
-    gematched. fx_transactions hat EINE Buchung mit amt=-100, fx_realized_pnl
-    hat ZWEI Rows mit gleicher Description und Summe(qty)=-100. Beide Rows
-    teilen sich den prev_balance der einen Cash-Buchung.
+def tc25_partially_covered_outflow_is_not_scaled():
+    """Ein nur teilweise gedeckter Abfluss wird NICHT anteilig gekuerzt.
 
-    Saldo-Setup: Start -200 (Margin), dann FRTAX -100 (= -300 nach Buchung).
-    prev_balance vor FRTAX = -200 → scale=0 für beide Rows.
-
-    Erwartung: 2 skipped, kein approx, fx_total_gain=0.
+    IBKR weist auf so einer Buchung bereits allein das Ergebnis des gedeckten
+    Teils aus; der neu eroeffnete Short geht zum Tageskurs ein und traegt null bei.
+    Die frueher hier angesetzte Skalierung war eine zweite Kuerzung desselben Betrags.
     """
     with tempfile.TemporaryDirectory() as tmp:
         write_csv(os.path.join(tmp, "account_info.csv"), [
             {"currency": "EUR", "tax_year": str(TAX_YEAR), "fx_transactions_count": "2"}
         ])
+        # Saldo: +300 vor dem Abfluss von -1000 -> nur 30 % gedeckt.
         write_csv(os.path.join(tmp, "fx_transactions.csv"), [
-            starting_balance_tx("2025-01-01", -200.0, 1.10),
-            make_tx("2025-06-01", -100.0, 1.20, "FRTAX", txid="500",
-                    desc="FRTAX-aggregat-event"),
+            starting_balance_tx("2025-01-01", 0.0, 1.10),
+            make_tx("2025-05-01", 300.0, 1.10, "DIV", txid="1001", balance=300.0),
+            make_tx("2025-06-01", -1000.0, 1.05, "BUY", txid="1002", balance=-700.0),
         ])
         write_csv(os.path.join(tmp, "fx_realized_pnl.csv"), [
-            {
-                "reportDate": "2025-06-01", "dateTime": "2025-06-01 10:00:00",
-                "functionalCurrency": "EUR", "fxCurrency": "USD",
-                "activityDescription": "FRTAX-aggregat-event",
-                "quantity": "-60", "proceeds": "72", "cost": "-66",
-                "realizedPL": "30", "code": "C", "levelOfDetail": "TRANSACTION",
-            },
-            {
-                "reportDate": "2025-06-01", "dateTime": "2025-06-01 10:00:00",
-                "functionalCurrency": "EUR", "fxCurrency": "USD",
-                "activityDescription": "FRTAX-aggregat-event",
-                "quantity": "-40", "proceeds": "48", "cost": "-44",
-                "realizedPL": "20", "code": "C", "levelOfDetail": "TRANSACTION",
-            },
+            fx_pnl_row("2025-06-01", -1000.0, -15.0, code="C;O", desc="STK: 10 ACME"),
         ])
 
         with contextlib.redirect_stdout(io.StringIO()):
-            report = calculate_tax(tmp, tax_year=TAX_YEAR, fx_margin_correction_enabled=True)
+            report = calculate_tax(tmp, tax_year=TAX_YEAR)
 
-    meta = report.get("fx_option_a_meta", {})
-    assert meta.get("resolve_aggregat") == 2, \
-        f"TC27 resolve_aggregat: erwartet 2, ist {meta.get('resolve_aggregat')}"
-    assert meta.get("skipped_full") == 2, \
-        f"TC27 skipped_full: erwartet 2, ist {meta.get('skipped_full')}"
-    assert meta.get("approx_matches", 0) == 0, \
-        f"TC27 approx_matches: erwartet 0, ist {meta.get('approx_matches')}"
-    assert approx(report["fx_total_gain"], 0.0), \
-        f"TC27 fx_total_gain: erwartet 0, ist {report['fx_total_gain']}"
-    print("TC27 OK — Description-Aggregat: FIFO-Split einer Cash-Buchung korrekt resolved")
+    usd = report["fx_results"]["USD"]
+    assert approx(usd["net"], -15.0), \
+        f"TC25 net: erwartet -15 (ungekuerzt), ist {usd['net']}"
+    assert report["fx_option_a_meta"]["debt_repayments"] == 0, "TC25 Abfluss ist keine Schuldtilgung"
+    print("TC25 OK — teilweise gedeckter Abfluss wird nicht ein zweites Mal gekuerzt")
 
 
-def tc28_symbol_aggregat_match():
-    """Pass 4: Mehrere STK-Splits gleicher Symbol matchen über Symbol-Aggregat
-    gegen einen größeren Aktien-Trade.
+def tc26_opt_out_keeps_debt_repayment():
+    """Opt-out uebernimmt auch die Schuldtilgungs-Zeilen mit IBKR-Rohwert."""
+    with tempfile.TemporaryDirectory() as tmp:
+        write_csv(os.path.join(tmp, "account_info.csv"), [
+            {"currency": "EUR", "tax_year": str(TAX_YEAR), "fx_transactions_count": "0"}
+        ])
+        write_csv(os.path.join(tmp, "fx_realized_pnl.csv"), [
+            fx_pnl_row("2025-06-01", 2000.0, -50.0, desc="STK: -100 ACME"),
+            fx_pnl_row("2025-06-03", -800.0, -20.0, desc="STK: 40 ACME"),
+        ])
 
-    fx_transactions: EIN STK-Kauf 'Buy 30 QQQ' mit amt=-12000 bei Saldo=+5000
-    (also nach Kauf -7000 → Margin).
-    fx_realized_pnl: drei Rows mit unterschiedlichen Descriptions
-    ('STK: 5 QQQ', 'STK: 15 QQQ', 'STK: 10 QQQ') aber gleichem Symbol QQQ,
-    Summe(qty) = -12000.
+        with contextlib.redirect_stdout(io.StringIO()):
+            report = calculate_tax(tmp, tax_year=TAX_YEAR,
+                                   fx_margin_correction_enabled=False)
 
-    prev_balance vor dem Cash-Event = +5000, aggregat_qty=-12000 → partial.
-    scale = 5000/12000 = 0.4167. Alle 3 Rows partial.
+    usd = report["fx_results"]["USD"]
+    assert approx(usd["net"], -70.0), f"TC26 net: erwartet -70 (Rohwert), ist {usd['net']}"
+    assert approx(usd["corrected_net"], -20.0), \
+        f"TC26 corrected_net muss den Vergleichswert behalten, ist {usd['corrected_net']}"
+    assert report["fx_option_a_meta"]["debt_repayments"] == 1, \
+        "TC26 Zaehler muss auch im Opt-out gefuellt sein"
+    print("TC26 OK — Opt-out uebernimmt Schuldtilgung, behaelt korrigierten Vergleich")
 
-    Erwartung: 3 events partial, fx_total_gain = 60 * 0.4167 ≈ 25.
+
+def tc27_margin_days_use_ibkr_balance_column():
+    """Margin-Tage kommen aus IBKRs balance-Spalte, nicht aus einer Eigenkumulation.
+
+    Realfall audit2: Bei gemergten Mehrjahres-Exporten driftet eine Kumulation ueber
+    `amount` weg, sodass echte Schuldphasen unsichtbar blieben. Hier weicht die
+    Kumulation bewusst vom gemeldeten Saldo ab.
     """
     with tempfile.TemporaryDirectory() as tmp:
         write_csv(os.path.join(tmp, "account_info.csv"), [
             {"currency": "EUR", "tax_year": str(TAX_YEAR), "fx_transactions_count": "2"}
         ])
+        # Kumulation ergaebe 0 -> +100 -> +50 (nie negativ).
+        # IBKRs balance sagt: -2000 nach der zweiten Buchung.
         write_csv(os.path.join(tmp, "fx_transactions.csv"), [
-            starting_balance_tx("2025-01-01", 5000.0, 1.10),
-            make_tx("2025-06-01", -12000.0, 1.20, "BUY", txid="600",
-                    desc="Buy 30 INVESCO QQQ TRUST"),
+            starting_balance_tx("2025-01-01", 0.0, 1.10),
+            make_tx("2025-03-01", 100.0, 1.10, "DIV", txid="1001", balance=100.0),
+            make_tx("2025-03-11", -50.0, 1.10, "FRTAX", txid="1002", balance=-2000.0),
         ])
         write_csv(os.path.join(tmp, "fx_realized_pnl.csv"), [
-            {
-                "reportDate": "2025-06-01", "dateTime": "2025-06-01 10:00:00",
-                "functionalCurrency": "EUR", "fxCurrency": "USD",
-                "activityDescription": "STK: 5 QQQ",
-                "quantity": "-2000", "proceeds": "2400", "cost": "-2200",
-                "realizedPL": "20", "code": "C", "levelOfDetail": "TRANSACTION",
-            },
-            {
-                "reportDate": "2025-06-01", "dateTime": "2025-06-01 10:01:00",
-                "functionalCurrency": "EUR", "fxCurrency": "USD",
-                "activityDescription": "STK: 15 QQQ",
-                "quantity": "-6000", "proceeds": "7200", "cost": "-6600",
-                "realizedPL": "30", "code": "C", "levelOfDetail": "TRANSACTION",
-            },
-            {
-                "reportDate": "2025-06-01", "dateTime": "2025-06-01 10:02:00",
-                "functionalCurrency": "EUR", "fxCurrency": "USD",
-                "activityDescription": "STK: 10 QQQ",
-                "quantity": "-4000", "proceeds": "4800", "cost": "-4400",
-                "realizedPL": "10", "code": "C", "levelOfDetail": "TRANSACTION",
-            },
+            fx_pnl_row("2025-06-01", -800.0, -20.0, desc="STK: 40 ACME"),
         ])
 
         with contextlib.redirect_stdout(io.StringIO()):
-            report = calculate_tax(tmp, tax_year=TAX_YEAR, fx_margin_correction_enabled=True)
+            report = calculate_tax(tmp, tax_year=TAX_YEAR)
 
-    meta = report.get("fx_option_a_meta", {})
-    assert meta.get("resolve_symbol_aggregat") == 3, \
-        f"TC28 resolve_symbol_aggregat: erwartet 3, ist {meta.get('resolve_symbol_aggregat')}"
-    assert meta.get("partial_count") == 3, \
-        f"TC28 partial_count: erwartet 3, ist {meta.get('partial_count')}"
-    # scale = 5000/12000 = 0.4167; pnl_corrected = 60 * 0.4167 = 25.0
-    assert approx(report["fx_total_gain"], 25.0), \
-        f"TC28 fx_total_gain: erwartet 25.0, ist {report['fx_total_gain']}"
-    print("TC28 OK — Symbol-Aggregat: 3 STK-Splits proportional skaliert (scale=0.4167)")
+    assert report["fx_has_negative_balance"] is True, \
+        "TC27 gemeldeter Negativsaldo muss erkannt werden"
+    assert report["fx_results"]["USD"]["days_negative"] > 0, \
+        "TC27 Margin-Tage muessen aus der balance-Spalte kommen"
+    print("TC27 OK — Margin-Tage folgen IBKRs balance-Spalte")
 
 
-def tc31_null_pnl_legs_included_in_aggregat():
-    """Codex-Finding 2026-05-27 (vierte Welle): Null-PnL-Splits dürfen nicht VOR
-    der Aggregat-Bildung verworfen werden. Sonst fehlt eine Leg in der Summe und
-    der Aggregat-Match scheitert, obwohl der Cash-Event eigentlich identifizierbar
-    wäre.
-
-    Szenario:
-      2025-01-01 Start -5000 (Margin)
-      2025-06-01 BUY -12000 (QQQ-Kauf, weiter ins Minus)
-
-      fx_realized_pnl-Splits:
-        Row A: STK: 5 QQQ qty=-2000, realizedPL=20  → echter PnL
-        Row B: STK: 25 QQQ qty=-10000, realizedPL=0 → Lot-Rate = Disposal-Rate
-
-      Beide Rows haben gleiche Description-Prefix ('STK: ... QQQ'). Pass 4
-      Symbol-Aggregat: sum=-12000 matched gegen den Cash-Event. prev_balance vor
-      Cash-Event = -5000 (Margin) → scale=0 für die Gruppe.
-
-      Ohne Fix: Row B mit pnl=0 wird vor Pass 4 verworfen → Aggregat nur Row A
-                mit qty=-2000 → kein Match auf -12000 → Row A landet in approx
-                und behält 20 EUR PnL fälschlich.
-      Mit Fix:  Beide Rows in Aggregat, scale=0 → Row A's PnL wird auf 0 geskippt,
-                Row B war ohnehin null. fx_total_gain = 0.
-    """
-    with tempfile.TemporaryDirectory() as tmp:
-        write_csv(os.path.join(tmp, "account_info.csv"), [
-            {"currency": "EUR", "tax_year": str(TAX_YEAR), "fx_transactions_count": "2"}
-        ])
-        write_csv(os.path.join(tmp, "fx_transactions.csv"), [
-            starting_balance_tx("2025-01-01", -5000.0, 1.10),
-            make_tx("2025-06-01", -12000.0, 1.20, "BUY", txid="100",
-                    desc="Buy 30 INVESCO QQQ TRUST"),
-        ])
-        write_csv(os.path.join(tmp, "fx_realized_pnl.csv"), [
-            {
-                "reportDate": "2025-06-01", "dateTime": "2025-06-01 10:00:00",
-                "functionalCurrency": "EUR", "fxCurrency": "USD",
-                "activityDescription": "STK: 5 QQQ",
-                "quantity": "-2000", "proceeds": "2400", "cost": "-2200",
-                "realizedPL": "20", "code": "C", "levelOfDetail": "TRANSACTION",
-            },
-            {
-                "reportDate": "2025-06-01", "dateTime": "2025-06-01 10:01:00",
-                "functionalCurrency": "EUR", "fxCurrency": "USD",
-                "activityDescription": "STK: 25 QQQ",
-                # Null-PnL: Lot-Rate exakt = Disposal-Rate (kommt in IBKR-Daten vor)
-                "quantity": "-10000", "proceeds": "12000", "cost": "-12000",
-                "realizedPL": "0", "code": "C", "levelOfDetail": "TRANSACTION",
-            },
-        ])
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            report = calculate_tax(tmp, tax_year=TAX_YEAR, fx_margin_correction_enabled=True)
-
-    meta = report.get("fx_option_a_meta", {})
-    # Pass 4 muss die Gruppe matchen, auch wenn eine Leg null-PnL hat
-    assert meta.get("resolve_symbol_aggregat", 0) >= 1, \
-        f"TC31 resolve_symbol_aggregat: erwartet ≥1 (Aggregat funktioniert), ist {meta.get('resolve_symbol_aggregat')}"
-    # prev_balance = -5000 ≤ 0 → skipped
-    assert meta.get("skipped_full", 0) >= 1, \
-        f"TC31 skipped_full: erwartet ≥1, ist {meta.get('skipped_full')}"
-    # PnL aus Row A wurde komplett rausgekürzt (scale=0), Row B war eh null
-    assert approx(report["fx_total_gain"], 0.0), \
-        f"TC31 fx_total_gain: erwartet 0 (Margin-Tilgung), ist {report['fx_total_gain']}"
-    print("TC31 OK — Null-PnL-Legs in Aggregat einbezogen (Codex-Fix)")
-
-
-def tc30_aggregat_requires_unique_cash_event():
-    """Codex-Finding 2026-05-27 (dritte Welle): Pass 2/4 darf nicht auf einen
-    Cash-Event matchen, wenn am gleichen Tag ein zweiter Cash-Event mit identischem
-    amount existiert. Sonst wird die Aggregat-Gruppe dem falschen Event zugeordnet.
-
-    Szenario:
-      2025-01-01 Start +5000
-      2025-06-01 10:00 BUY -12000 (txid=100) — irgendein Trade (z.B. AAPL)
-      2025-06-01 11:00 BUY -12000 (txid=101) — tatsächlich der QQQ-Trade
-      Saldo nach Tag: 5000 - 12000 - 12000 = -19000 (Margin)
-
-      fx_realized_pnl QQQ-Splits (Pass 4 würde matchen):
-        STK: 5 QQQ qty=-2000
-        STK: 25 QQQ qty=-10000
-        Summe -12000
-
-      Ohne Fix: Pass 4 matched gegen ersten -12000 Cash-Event (AAPL) →
-                alle QQQ-Splits bekommen prev=5000 → scale = 5000/12000 = 0.4167
-                → falsche partial-Kürzung.
-      Mit Fix:  require_unique=True erkennt 2 Kandidaten → kein Match.
-                Splits fallen in approx (Fallback hat consumed kein -12000-Event
-                im Pass 1, weil das pro Single-Row und |amt|=qty matched).
-
-    Eigentlich matched Pass 1 erst zwei single-rows mit qty=-12000 — aber wir
-    haben zwei Aggregat-Splits, nicht zwei Single-Rows. Daher landet die Logik
-    in Pass 4, der require_unique anwendet.
-    """
-    with tempfile.TemporaryDirectory() as tmp:
-        write_csv(os.path.join(tmp, "account_info.csv"), [
-            {"currency": "EUR", "tax_year": str(TAX_YEAR), "fx_transactions_count": "3"}
-        ])
-        write_csv(os.path.join(tmp, "fx_transactions.csv"), [
-            starting_balance_tx("2025-01-01", 5000.0, 1.10),
-            make_tx("2025-06-01", -12000.0, 1.20, "BUY", txid="100",
-                    desc="Buy 100 AAPL"),
-            make_tx("2025-06-01", -12000.0, 1.21, "BUY", txid="101",
-                    desc="Buy 30 INVESCO QQQ TRUST"),
-        ])
-        write_csv(os.path.join(tmp, "fx_realized_pnl.csv"), [
-            {
-                "reportDate": "2025-06-01", "dateTime": "2025-06-01 10:00:00",
-                "functionalCurrency": "EUR", "fxCurrency": "USD",
-                "activityDescription": "STK: 5 QQQ",
-                "quantity": "-2000", "proceeds": "2400", "cost": "-2200",
-                "realizedPL": "20", "code": "C", "levelOfDetail": "TRANSACTION",
-            },
-            {
-                "reportDate": "2025-06-01", "dateTime": "2025-06-01 10:01:00",
-                "functionalCurrency": "EUR", "fxCurrency": "USD",
-                "activityDescription": "STK: 25 QQQ",
-                "quantity": "-10000", "proceeds": "12000", "cost": "-11000",
-                "realizedPL": "80", "code": "C", "levelOfDetail": "TRANSACTION",
-            },
-        ])
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            report = calculate_tax(tmp, tax_year=TAX_YEAR, fx_margin_correction_enabled=True)
-
-    meta = report.get("fx_option_a_meta", {})
-    # Pass 4 darf nicht matchen, weil 2 Cash-Events mit -12000 existieren.
-    assert meta.get("resolve_symbol_aggregat", 0) == 0, \
-        f"TC30 resolve_symbol_aggregat: erwartet 0 (ambig), ist {meta.get('resolve_symbol_aggregat')}"
-    # Pass 2 ebenfalls nicht (verschiedene desc, aber Sum-Aggregat scheitert auch ohne)
-    assert meta.get("resolve_aggregat", 0) == 0, \
-        f"TC30 resolve_aggregat: erwartet 0, ist {meta.get('resolve_aggregat')}"
-    # Beide Splits landen in approx (Fallback findet auch keinen sicheren prev)
-    assert meta.get("approx_matches", 0) == 2, \
-        f"TC30 approx_matches: erwartet 2, ist {meta.get('approx_matches')}"
-    # IBKR-Rohwerte werden übernommen (20 + 80 = 100 EUR)
-    assert approx(report["fx_total_gain"], 100.0), \
-        f"TC30 fx_total_gain: erwartet 100, ist {report['fx_total_gain']}"
-    print("TC30 OK — Aggregat-Match braucht eindeutigen Cash-Event (Codex-Fix)")
-
-
-def tc29_consumed_shared_with_fallback():
-    """Codex-Finding 2026-05-27 (zweite Welle): consumed-Set aus _resolve_fx_outflows
-    muss in den Fallback-Matcher hineingegeben werden. Sonst kann derselbe Cash-Event
-    zweimal als prev-Balance-Quelle dienen.
-
-    Szenario:
-      Saldo 2025-01-01 = 0
-      2025-06-01 BUY  -1000 (txid=100, prev=0, after=-1000)  → Margin-Schuld
-      2025-06-01 SELL +500  (txid=101, prev=-1000, after=-500)  → tilgt teilweise
-
-      fx_realized_pnl Outflows alle am 2025-06-01:
-        Row A: qty=-1000, desc='A-event'  → Pass 1 exact-match auf BUY (prev=0)
-        Row B: qty=-1000, desc='B-event'  → KEIN match im Pre-Resolve (alle exakt-1000
-                                            Cash-Events sind nun consumed)
-
-      Ohne Codex-Fix: Fallback wuerde Row B als exact-Match auf BUY erkennen
-      (consumed nicht weitergegeben), und Row B bekäme prev=0 → fälschlich
-      voll besteuert. Mit Codex-Fix: Row B fällt durch in same-day-fallback
-      mit first_prev=0 (Tagesanfangs-Saldo) → nicht skipped, aber auch nicht
-      doppelt-matched.
-
-      Erwartung: Row A wird mit prev=0 als skipped (scale=0, prev<=0 grenzwertig).
-                 Row B landet in approx oder same-day-fallback, NICHT in exact-match.
-    """
+def tc28_missing_balance_column_falls_back_to_cumulation():
+    """Zeilen ohne balance-Spalte fallen auf die Kumulation zurueck (Alt-Fixtures)."""
     with tempfile.TemporaryDirectory() as tmp:
         write_csv(os.path.join(tmp, "account_info.csv"), [
             {"currency": "EUR", "tax_year": str(TAX_YEAR), "fx_transactions_count": "2"}
         ])
         write_csv(os.path.join(tmp, "fx_transactions.csv"), [
             starting_balance_tx("2025-01-01", 0.0, 1.10),
-            make_tx("2025-06-01", -1000.0, 1.20, "BUY", txid="100", desc="STK BUY"),
-            make_tx("2025-06-01", 500.0, 1.15, "SELL", txid="101", desc="STK SELL"),
+            make_tx("2025-03-01", -500.0, 1.10, "BUY", txid="1001"),   # keine balance
+            make_tx("2025-03-21", 500.0, 1.10, "SELL", txid="1002"),   # keine balance
         ])
-        # Zwei Outflow-Rows mit identischer quantity, aber unterschiedlicher Description.
-        # Pass 2 (Aggregat) trennt sie wegen verschiedener desc.
         write_csv(os.path.join(tmp, "fx_realized_pnl.csv"), [
-            {
-                "reportDate": "2025-06-01", "dateTime": "2025-06-01 10:00:00",
-                "functionalCurrency": "EUR", "fxCurrency": "USD",
-                "activityDescription": "A-event",
-                "quantity": "-1000", "proceeds": "1200", "cost": "-1100",
-                "realizedPL": "100", "code": "C", "levelOfDetail": "TRANSACTION",
-            },
-            {
-                "reportDate": "2025-06-01", "dateTime": "2025-06-01 11:00:00",
-                "functionalCurrency": "EUR", "fxCurrency": "USD",
-                "activityDescription": "B-event",
-                "quantity": "-1000", "proceeds": "1200", "cost": "-1100",
-                "realizedPL": "100", "code": "C", "levelOfDetail": "TRANSACTION",
-            },
+            fx_pnl_row("2025-06-01", -800.0, -20.0, desc="STK: 40 ACME"),
         ])
 
         with contextlib.redirect_stdout(io.StringIO()):
-            report = calculate_tax(tmp, tax_year=TAX_YEAR, fx_margin_correction_enabled=True)
+            report = calculate_tax(tmp, tax_year=TAX_YEAR)
 
-    meta = report.get("fx_option_a_meta", {})
-    # Row A: Pass 1 exact-match auf BUY, prev_balance=0 → scale=0 (skipped)
-    # Row B: Cash-Event BUY ist consumed → kein exact-match möglich.
-    #        Fallback: same-day-Events sind BUY (-1000, consumed) + SELL (+500, mixed-sign)
-    #        Da SELL Mixed-Sign zum BUY ist, ist all_same_sign=False → approx.
-    assert meta.get("resolve_exact", 0) == 1, \
-        f"TC29 resolve_exact: erwartet 1 (Row A), ist {meta.get('resolve_exact')}"
-    # Row B darf NICHT als exact zweimal matchen. Wenn der Codex-Fix fehlt, wäre
-    # resolve_exact=1 (nur Pre-Resolve) ABER skipped_full+partial_count > 1, weil
-    # der Fallback Row B doppelt matched. Korrekt: Row B landet in approx.
-    assert meta.get("approx_matches", 0) >= 1, \
-        f"TC29 approx_matches: erwartet ≥1 (Row B), ist {meta.get('approx_matches')}"
-    # Sanity: Row A's PnL (100 USD) muss als skipped behandelt sein (scale=0 wenn prev=0).
-    # Eigentlich ist prev=0 nicht ≤ 0 strikt im Sinne der Margin-Logik; lass mich das
-    # über raw_total vs corrected_total prüfen statt skipped_full Anzahl.
-    # Korrekte Erwartung: fx_total_gain = 100 (Row B IBKR-Rohwert) oder 200 (beide),
-    # je nachdem wie Row A behandelt wird. Wichtig: NICHT 200 mit beiden als skipped.
-    print(f"TC29 OK — consumed-Sharing verhindert doppel-Match: "
-          f"exact={meta.get('resolve_exact')}, approx={meta.get('approx_matches')}, "
-          f"skipped={meta.get('skipped_full')}, partial={meta.get('partial_count')}")
-
-
-def tc25_no_event_on_target_day_is_exact():
-    """Kein Event am Target-Tag → prev_after ist EXAKT (keine Events dazwischen).
-
-    fx_transactions.csv:
-      Start +0
-      2025-03-15 BUY -10000 → balance -10000 (Margin)
-      (kein Event am 2025-07-15)
-
-    fx_realized_pnl.csv: ein Event am 2025-07-15, prev_bal = -10000 (kein Event
-    zwischen 03-15 und 07-15 in der Timeline). prev_is_exact=True → scale=0.
-
-    Erwartung: skipped_full=1, fx_total_gain=0.
-    """
-    with tempfile.TemporaryDirectory() as tmp:
-        write_csv(os.path.join(tmp, "account_info.csv"), [
-            {"currency": "EUR", "tax_year": str(TAX_YEAR), "fx_transactions_count": "1"}
-        ])
-        write_csv(os.path.join(tmp, "fx_transactions.csv"), [
-            make_tx("2025-03-15", -10000.0, 1.10, "BUY", desc="STK BUY", txid="100"),
-        ])
-        write_csv(os.path.join(tmp, "fx_realized_pnl.csv"), [
-            {
-                "reportDate": "2025-07-15", "dateTime": "2025-07-15 10:00:00",
-                "functionalCurrency": "EUR", "fxCurrency": "USD",
-                "activityDescription": "FRTAX",
-                "quantity": "-100", "proceeds": "120", "cost": "-110",
-                "realizedPL": "10", "code": "C", "levelOfDetail": "TRANSACTION",
-            },
-        ])
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            report = calculate_tax(tmp, tax_year=TAX_YEAR, fx_margin_correction_enabled=True)
-
-    meta = report.get("fx_option_a_meta", {})
-    assert meta.get("skipped_full") == 1, \
-        f"TC25 skipped_full: erwartet 1, ist {meta.get('skipped_full')}"
-    assert meta.get("approx_matches", 0) == 0, \
-        f"TC25 approx_matches: erwartet 0, ist {meta.get('approx_matches')}"
-    assert approx(report["fx_total_gain"], 0.0), \
-        f"TC25 fx_total_gain: erwartet 0, ist {report['fx_total_gain']}"
-    print("TC25 OK — Kein-Event-am-Tag liefert exakten prev (skipped_full=1)")
+    assert report["fx_has_negative_balance"] is True, \
+        "TC28 Fallback-Kumulation muss die Schuldphase weiterhin erkennen"
+    assert report["fx_results"]["USD"]["days_negative"] == 21, \
+        f"TC28 days_negative: erwartet 21, ist {report['fx_results']['USD']['days_negative']}"
+    print("TC28 OK — Fallback auf Kumulation ohne balance-Spalte")
 
 
 def run_all():
@@ -1161,15 +829,13 @@ def run_all():
              tc20_option_a_opt_out_uses_xml_raw_value,
              tc21_option_b_opt_out_uses_csv_raw_despite_negative_balance,
              tc22_option_c_opt_out_uses_fifo_raw_path,
-             tc23_same_sign_day_negative_prev_scales_to_zero,
-             tc24_mixed_sign_day_stays_approx,
-             tc25_no_event_on_target_day_is_exact,
-             tc26_same_sign_day_positive_prev_stays_approx,
-             tc27_description_aggregat_match,
-             tc28_symbol_aggregat_match,
-             tc29_consumed_shared_with_fallback,
-             tc30_aggregat_requires_unique_cash_event,
-             tc31_null_pnl_legs_included_in_aggregat]
+             tc23_debt_repayment_unit,
+             tc24_inflow_realization_is_not_taxable,
+             tc25_partially_covered_outflow_is_not_scaled,
+             tc26_opt_out_keeps_debt_repayment,
+             tc27_margin_days_use_ibkr_balance_column,
+             tc28_missing_balance_column_falls_back_to_cumulation,
+             tc29_opening_row_with_pnl_is_reported]
     failed = 0
     for tc in tests:
         try:
