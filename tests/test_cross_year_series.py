@@ -22,8 +22,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from calculate_tax_report import (
     _build_stillhalter_details_for_assignment,
+    _claim_long_put_exercise_short_shares,
     _consume_open_sells_fifo,
+    _correction_matches_row,
     _get_open_option_sells,
+    _long_put_exercise_short_openings,
     calculate_tax,
     safe_float,
 )
@@ -2036,6 +2039,425 @@ def test_cross_year_split_put_assignment_uses_new_contract_quantity():
     print("    Voller Zufluss 119.23 EUR bleibt dem Verkaufsjahr 2024 zugeordnet")
 
 
+def test_put_ratio_assignment_corrects_closed_short_slice():
+    """TC39: 1x2 Put-Ratio-Spread mit gemischtem Aktien-BUY (C;O).
+
+    Der Long Put eröffnet 100 Aktien short. Zwei Short-Put-Andienungen kaufen
+    200 Aktien: 100 decken den Short, 100 bleiben long. IBKR mischt Long-Put-
+    Kosten und eine Short-Put-Prämie in den sofort realisierten Short-Cover-PnL.
+    Die absolute Lot-Basis liegt dadurch ÜBER dem Short-Put-Strike; die normale
+    strike-cost-Heuristik darf die notwendige Prämienkorrektur nicht verwerfen.
+    """
+    short_put_sell = make_sell(
+        "2025-03-03", 2, 1.5, strike="100", expiry="2025-03-21",
+        pc="P", underlying="RATIO", commission=0,
+    )
+    short_put_sell.update({
+        "tradeID": "ratio_short_put_sell",
+        "currency": "EUR",
+        "fxRateToBase": "1",
+    })
+    short_put_assignment = make_assignment(
+        "2025-03-21", 2, strike="100", expiry="2025-03-21",
+        pc="P", underlying="RATIO",
+    )
+    short_put_assignment.update({
+        "tradeID": "ratio_short_put_assignment",
+        "currency": "EUR",
+        "fxRateToBase": "1",
+    })
+    long_put_open = {
+        "tradeID": "ratio_long_put_open",
+        "assetCategory": "OPT", "transactionType": "ExchTrade",
+        "buySell": "BUY", "openCloseIndicator": "O",
+        "putCall": "P", "strike": "105", "expiry": "2025-03-21",
+        "underlyingSymbol": "RATIO", "symbol": "RATIO 105 2025-03-21 P",
+        "quantity": "1", "tradePrice": "2", "multiplier": "100",
+        "ibCommission": "0", "fxRateToBase": "1",
+        "currency": "EUR", "dateTime": "2025-03-03 11:00:00",
+        "tradeDate": "2025-03-03", "reportDate": "2025-03-03",
+        "fifoPnlRealized": "0",
+    }
+    long_put_exercise = {
+        "tradeID": "ratio_long_put_exercise",
+        "assetCategory": "OPT", "transactionType": "BookTrade",
+        "buySell": "SELL", "openCloseIndicator": "C",
+        "putCall": "P", "strike": "105", "expiry": "2025-03-21",
+        "underlyingSymbol": "RATIO", "symbol": "RATIO 105 2025-03-21 P",
+        "quantity": "-1", "tradePrice": "0", "multiplier": "100",
+        "ibCommission": "0", "fxRateToBase": "1",
+        "currency": "EUR", "dateTime": "2025-03-21 16:20:00",
+        "tradeDate": "2025-03-21", "reportDate": "2025-03-21",
+        "fifoPnlRealized": "0", "cost": "-200", "proceeds": "0",
+    }
+    stock_short_open = {
+        "tradeID": "ratio_stock_short_open",
+        "assetCategory": "STK", "transactionType": "BookTrade",
+        "buySell": "SELL", "openCloseIndicator": "O",
+        "underlyingSymbol": "RATIO", "symbol": "RATIO",
+        "quantity": "-100", "tradePrice": "105", "multiplier": "1",
+        "ibCommission": "0", "fxRateToBase": "1",
+        "currency": "EUR", "dateTime": "2025-03-21 16:20:00",
+        "tradeDate": "2025-03-21", "reportDate": "2025-03-21",
+        "fifoPnlRealized": "0", "cost": "-10500",
+        "proceeds": "10500",
+    }
+    mixed_stock_buy = {
+        "tradeID": "ratio_mixed_stock_buy",
+        "assetCategory": "STK", "transactionType": "BookTrade",
+        "buySell": "BUY", "openCloseIndicator": "C;O",
+        "underlyingSymbol": "RATIO", "symbol": "RATIO",
+        "quantity": "200", "tradePrice": "100", "multiplier": "1",
+        "ibCommission": "0", "fxRateToBase": "1",
+        "currency": "EUR", "dateTime": "2025-03-21 16:20:00",
+        "tradeDate": "2025-03-21", "reportDate": "2025-03-21",
+        "fifoPnlRealized": "450", "cost": "10300",
+        "proceeds": "-20000",
+    }
+    closed_lots = [{
+        "assetCategory": "STK", "currency": "EUR",
+        "reportDate": "2025-03-21", "dateTime": "2025-03-21 16:20:00",
+        "openDateTime": "2025-03-21 16:20:00",
+        "quantity": "-100", "buySell": "BUY", "cost": "-10300",
+        "fifoPnlRealized": "450", "fxRateToBase": "1",
+        "symbol": "RATIO", "underlyingSymbol": "RATIO",
+    }]
+
+    rd = calculate_for_trades(
+        [
+            short_put_sell, short_put_assignment,
+            long_put_open, long_put_exercise,
+            stock_short_open, mixed_stock_buy,
+        ],
+        tax_year=2025,
+        closed_lots=closed_lots,
+    )
+    stock_rows = [
+        row for row in rd["trade_details"]
+        if row.get("symbol") == "RATIO" and row.get("source") == "trades"
+    ]
+    assert len(stock_rows) == 1
+    row = stock_rows[0]
+
+    half_short_premium_raw = 150
+    assert row.get("stillhalter_adjusted")
+    assert_close(
+        row.get("stillhalter_adjustment_raw", 0),
+        half_short_premium_raw,
+        label="TC39 herausgerechnete Short-Put-Praemie",
+    )
+    assert_close(row["fifoPnlRealized"], 300,
+                 label="TC39 korrigierter Aktien-PnL raw")
+    assert_close(row["pnl_eur"], 300,
+                 label="TC39 korrigierter Aktien-PnL EUR")
+    assert_close(row["cost"], 10450,
+                 label="TC39 korrigierte Cover-Kosten")
+    assert_close(rd["audit"]["stillhalter_premium_eur"], 300,
+                 label="TC39 volle Stillhalterpraemie Topf 2")
+    assert_close(rd["audit"]["put_nosell_premium_eur"], 150,
+                 label="TC39 offene Long-Haelfte")
+    assert_close(rd["stocks_gain_eur"], 300,
+                 label="TC39 Topf 1")
+    assert_close(rd["options_gain_eur"], 300,
+                 label="TC39 Topf 2")
+    assert rd["audit"].get("stillhalter_corrections_dropped", []) == []
+
+    print("  TC39 Put-Ratio-Assignment: geschlossener Short-Anteil korrigiert: OK")
+    print("    Aktien-PnL 450 -> 300 EUR, volle Prämie separat in Topf 2")
+
+
+def test_same_day_independent_stock_short_keeps_strike_basis():
+    """TC40: Fremder Same-Day-Short bleibt trotz Long-Put-Ausübung unverändert.
+
+    Der Short Put deckt FIFO einen um 10:00 Uhr manuell eröffneten Aktien-Short.
+    Um 16:20 Uhr wird zwar zusätzlich ein Long Put ausgeübt, dessen Aktien-SELL
+    eröffnet aber einen anderen, noch offenen Short-Lot. Ein bloßer Same-Day-
+    Marker darf die beiden Lots nicht vermischen.
+    """
+    short_put_sell = make_sell(
+        "2025-06-01", 1, 2.0, strike="100", expiry="2025-06-20",
+        pc="P", underlying="SAFE", commission=0,
+    )
+    short_put_sell.update({"currency": "EUR"})
+    short_put_assignment = make_assignment(
+        "2025-06-20", 1, strike="100", expiry="2025-06-20",
+        pc="P", underlying="SAFE",
+    )
+    short_put_assignment.update({"currency": "EUR"})
+    long_put_open = {
+        "tradeID": "safe_long_put_open",
+        "assetCategory": "OPT", "transactionType": "ExchTrade",
+        "buySell": "BUY", "openCloseIndicator": "O",
+        "putCall": "P", "strike": "105", "expiry": "2025-06-20",
+        "underlyingSymbol": "SAFE", "symbol": "SAFE 105 2025-06-20 P",
+        "quantity": "1", "tradePrice": "1", "multiplier": "100",
+        "ibCommission": "0", "fxRateToBase": "1",
+        "currency": "EUR", "dateTime": "2025-06-01 11:00:00",
+        "tradeDate": "2025-06-01", "reportDate": "2025-06-01",
+        "fifoPnlRealized": "0",
+    }
+    long_put_exercise = {
+        "tradeID": "safe_long_put_exercise",
+        "assetCategory": "OPT", "transactionType": "BookTrade",
+        "buySell": "SELL", "openCloseIndicator": "C",
+        "putCall": "P", "strike": "105", "expiry": "2025-06-20",
+        "underlyingSymbol": "SAFE", "symbol": "SAFE 105 2025-06-20 P",
+        "quantity": "-1", "tradePrice": "0", "multiplier": "100",
+        "ibCommission": "0", "fxRateToBase": "1",
+        "currency": "EUR", "dateTime": "2025-06-20 16:20:00",
+        "tradeDate": "2025-06-20", "reportDate": "2025-06-20",
+        "fifoPnlRealized": "0", "cost": "-100", "proceeds": "0",
+    }
+    stock_short_open = {
+        "tradeID": "safe_stock_short_open",
+        "assetCategory": "STK", "transactionType": "ExchTrade",
+        "buySell": "SELL", "openCloseIndicator": "O",
+        "underlyingSymbol": "SAFE", "symbol": "SAFE",
+        "quantity": "-100", "tradePrice": "110", "multiplier": "1",
+        "ibCommission": "0", "fxRateToBase": "1",
+        "currency": "EUR", "dateTime": "2025-06-20 10:00:00",
+        "tradeDate": "2025-06-20", "reportDate": "2025-06-20",
+        "fifoPnlRealized": "0", "cost": "-11000", "proceeds": "11000",
+    }
+    exercise_stock_short_open = {
+        "tradeID": "safe_exercise_stock_short_open",
+        "assetCategory": "STK", "transactionType": "BookTrade",
+        "buySell": "SELL", "openCloseIndicator": "O",
+        "underlyingSymbol": "SAFE", "symbol": "SAFE",
+        "quantity": "-100", "tradePrice": "105", "multiplier": "1",
+        "ibCommission": "0", "fxRateToBase": "1",
+        "currency": "EUR", "dateTime": "2025-06-20 16:20:00",
+        "tradeDate": "2025-06-20", "reportDate": "2025-06-20",
+        "fifoPnlRealized": "0", "cost": "-10500", "proceeds": "10500",
+    }
+    stock_cover = {
+        "tradeID": "safe_stock_cover",
+        "assetCategory": "STK", "transactionType": "BookTrade",
+        "buySell": "BUY", "openCloseIndicator": "C",
+        "underlyingSymbol": "SAFE", "symbol": "SAFE",
+        "quantity": "100", "tradePrice": "100", "multiplier": "1",
+        "ibCommission": "0", "fxRateToBase": "1",
+        "currency": "EUR", "dateTime": "2025-06-20 16:20:00",
+        "tradeDate": "2025-06-20", "reportDate": "2025-06-20",
+        "fifoPnlRealized": "1000", "cost": "10000", "proceeds": "-10000",
+    }
+    closed_lots = [{
+        "assetCategory": "STK", "currency": "EUR",
+        "reportDate": "2025-06-20", "dateTime": "2025-06-20 16:20:00",
+        "openDateTime": "2025-06-20 10:00:00",
+        "quantity": "-100", "buySell": "BUY", "cost": "-10000",
+        "fifoPnlRealized": "1000", "fxRateToBase": "1",
+        "symbol": "SAFE", "underlyingSymbol": "SAFE",
+    }]
+
+    rd = calculate_for_trades(
+        [
+            short_put_sell, short_put_assignment,
+            long_put_open, long_put_exercise,
+            stock_short_open, exercise_stock_short_open, stock_cover,
+        ],
+        tax_year=2025,
+        closed_lots=closed_lots,
+    )
+    stock_rows = [
+        row for row in rd["trade_details"]
+        if row.get("symbol") == "SAFE" and row.get("source") == "trades"
+    ]
+    assert len(stock_rows) == 1
+    row = stock_rows[0]
+
+    assert not row.get("stillhalter_adjusted")
+    assert_close(row["fifoPnlRealized"], 1000,
+                 label="TC40 unveraenderter Aktien-PnL")
+    assert_close(row["cost"], 10000,
+                 label="TC40 unveraenderte Cover-Kosten")
+    assert_close(rd["stocks_gain_eur"], 1000,
+                 label="TC40 Topf 1")
+    assert_close(rd["options_gain_eur"], 200,
+                 label="TC40 Topf 2")
+
+    print("  TC40 Fremder Same-Day-Short trotz Long-Put-Exercise unangetastet: OK")
+
+
+def test_long_put_exercise_evidence_is_quantity_capped():
+    """TC41: Ein Long-Put-Kontrakt belegt höchstens 100 Stock-Short-Aktien."""
+    det = {
+        "putCall": "P", "strike": "100", "currency": "EUR",
+        "underlyingSymbol": "CAP", "symbol": "CAP 100 2025-06-20 P",
+        "assignment_date": "2025-06-20",
+        "assignment_trade_date": "2025-06-20",
+    }
+    long_put_exercise = {
+        "tradeID": "cap_long_put_exercise",
+        "assetCategory": "OPT", "transactionType": "BookTrade",
+        "buySell": "SELL", "openCloseIndicator": "C",
+        "putCall": "P", "strike": "105", "expiry": "2025-06-20",
+        "underlyingSymbol": "CAP", "symbol": "CAP 105 2025-06-20 P",
+        "quantity": "-1", "tradePrice": "0", "multiplier": "100",
+        "currency": "EUR", "dateTime": "2025-06-20 16:20:00",
+        "tradeDate": "2025-06-20", "reportDate": "2025-06-20",
+        "fifoPnlRealized": "0",
+    }
+    consolidated_stock_short = {
+        "tradeID": "cap_stock_short_open",
+        "assetCategory": "STK", "transactionType": "BookTrade",
+        "buySell": "SELL", "openCloseIndicator": "O",
+        "underlyingSymbol": "CAP", "symbol": "CAP",
+        "quantity": "-200", "tradePrice": "105", "multiplier": "1",
+        "currency": "EUR", "dateTime": "2025-06-20 16:20:00",
+        "tradeDate": "2025-06-20", "reportDate": "2025-06-20",
+        "fifoPnlRealized": "0",
+    }
+
+    evidence = _long_put_exercise_short_openings(
+        [long_put_exercise, consolidated_stock_short],
+        det, "CAP",
+    )
+    assert_close(sum(item["shares"] for item in evidence), 100,
+                 label="TC41 Evidenz-Cap aus Optionsmultiplikator")
+
+    match = {
+        "is_short_lot": True,
+        "open_datetime": "2025-06-20 16:20:00",
+        "shares": 200,
+    }
+    consumed = {}
+    assert_close(
+        _claim_long_put_exercise_short_shares(match, evidence, consumed),
+        100,
+        label="TC41 erster Claim",
+    )
+    assert_close(
+        _claim_long_put_exercise_short_shares(match, evidence, consumed),
+        0,
+        label="TC41 Evidenz nicht doppelt konsumierbar",
+    )
+
+    print("  TC41 Long-Put-Evidenz: auf 100 Aktien gecappt und einmalig: OK")
+
+
+def test_long_put_exercise_override_requires_embedded_premium():
+    """TC42: Override verweigert, wenn der Cover-PnL die Prämie nicht trägt.
+
+    Gleiche synthetische Konstellation wie TC39, aber IBKR hat den
+    Andienungs-BUY zum reinen Strike gebucht: der realisierte Short-Cover-PnL
+    (300 = Basis − Strike×100) enthält KEINE eingebettete Prämie. Der Beleg allein
+    darf die Korrektur dann nicht erzwingen (das wäre ein Doppelabzug in
+    Topf 1); stattdessen erscheint ein sichtbarer Prüffall.
+    """
+    short_put_sell = make_sell(
+        "2025-03-03", 2, 1.5, strike="100", expiry="2025-03-21",
+        pc="P", underlying="RATIO", commission=0,
+    )
+    short_put_sell.update({
+        "tradeID": "ratio_short_put_sell",
+        "currency": "EUR",
+        "fxRateToBase": "1",
+    })
+    short_put_assignment = make_assignment(
+        "2025-03-21", 2, strike="100", expiry="2025-03-21",
+        pc="P", underlying="RATIO",
+    )
+    short_put_assignment.update({
+        "tradeID": "ratio_short_put_assignment",
+        "currency": "EUR",
+        "fxRateToBase": "1",
+    })
+    long_put_exercise = {
+        "tradeID": "ratio_long_put_exercise",
+        "assetCategory": "OPT", "transactionType": "BookTrade",
+        "buySell": "SELL", "openCloseIndicator": "C",
+        "putCall": "P", "strike": "105", "expiry": "2025-03-21",
+        "underlyingSymbol": "RATIO", "symbol": "RATIO 105 2025-03-21 P",
+        "quantity": "-1", "tradePrice": "0", "multiplier": "100",
+        "ibCommission": "0", "fxRateToBase": "1",
+        "currency": "EUR", "dateTime": "2025-03-21 16:20:00",
+        "tradeDate": "2025-03-21", "reportDate": "2025-03-21",
+        "fifoPnlRealized": "0", "cost": "-200", "proceeds": "0",
+    }
+    stock_short_open = {
+        "tradeID": "ratio_stock_short_open",
+        "assetCategory": "STK", "transactionType": "BookTrade",
+        "buySell": "SELL", "openCloseIndicator": "O",
+        "underlyingSymbol": "RATIO", "symbol": "RATIO",
+        "quantity": "-100", "tradePrice": "105", "multiplier": "1",
+        "ibCommission": "0", "fxRateToBase": "1",
+        "currency": "EUR", "dateTime": "2025-03-21 16:20:00",
+        "tradeDate": "2025-03-21", "reportDate": "2025-03-21",
+        "fifoPnlRealized": "0", "cost": "-10500",
+        "proceeds": "10500",
+    }
+    mixed_stock_buy_plain_strike = {
+        "tradeID": "ratio_mixed_stock_buy",
+        "assetCategory": "STK", "transactionType": "BookTrade",
+        "buySell": "BUY", "openCloseIndicator": "C;O",
+        "underlyingSymbol": "RATIO", "symbol": "RATIO",
+        "quantity": "200", "tradePrice": "100", "multiplier": "1",
+        "ibCommission": "0", "fxRateToBase": "1",
+        "currency": "EUR", "dateTime": "2025-03-21 16:20:00",
+        "tradeDate": "2025-03-21", "reportDate": "2025-03-21",
+        "fifoPnlRealized": "300", "cost": "10000",
+        "proceeds": "-20000",
+    }
+    closed_lots = [{
+        "assetCategory": "STK", "currency": "EUR",
+        "reportDate": "2025-03-21", "dateTime": "2025-03-21 16:20:00",
+        "openDateTime": "2025-03-21 16:20:00",
+        "quantity": "-100", "buySell": "BUY", "cost": "-10300",
+        "fifoPnlRealized": "300", "fxRateToBase": "1",
+        "symbol": "RATIO", "underlyingSymbol": "RATIO",
+    }]
+
+    rd = calculate_for_trades(
+        [
+            short_put_sell, short_put_assignment,
+            long_put_exercise,
+            stock_short_open, mixed_stock_buy_plain_strike,
+        ],
+        tax_year=2025,
+        closed_lots=closed_lots,
+    )
+    stock_rows = [
+        row for row in rd["trade_details"]
+        if row.get("symbol") == "RATIO" and row.get("source") == "trades"
+    ]
+    assert len(stock_rows) == 1
+    row = stock_rows[0]
+
+    assert not row.get("stillhalter_adjusted")
+    assert_close(row["fifoPnlRealized"], 300,
+                 label="TC42 unveraenderter Aktien-PnL")
+    dropped = rd["audit"].get("stillhalter_corrections_dropped", [])
+    mismatch = [d for d in dropped
+                if d.get("reason") == "long_put_exercise_pnl_mismatch"]
+    assert len(mismatch) == 1, f"TC42 erwartet 1 Pruef-Fall, got {dropped}"
+    assert mismatch[0]["underlying"] == "RATIO"
+    assert_close(mismatch[0]["leftover_raw"], 150,
+                 label="TC42 Pruef-Fall-Betrag")
+    assert_close(rd["options_gain_eur"], 300,
+                 label="TC42 Praemie bleibt voll in Topf 2")
+
+    print("  TC42 Override ohne eingebettete Praemie verweigert + Pruef-Fall: OK")
+
+
+def test_correction_stage3_respects_target_direction():
+    """TC43: Stufe-3-Fallback matcht BUY-Korrekturen nicht auf SELL-Rows."""
+    corr_buy = {"close_date": "2025-06-20", "target_buysell": "BUY"}
+    sell_row = {"buySell": "SELL", "reportDate": "2025-06-20"}
+    buy_row = {"buySell": "BUY", "reportDate": "2025-06-20"}
+
+    assert not _correction_matches_row(corr_buy, sell_row), \
+        "TC43: BUY-Korrektur darf SELL-Row nicht matchen"
+    assert _correction_matches_row(corr_buy, buy_row), \
+        "TC43: BUY-Korrektur muss BUY-Row matchen"
+
+    corr_legacy = {"close_date": "2025-06-20"}
+    assert _correction_matches_row(corr_legacy, sell_row), \
+        "TC43: Korrektur ohne target_buysell behaelt Altverhalten"
+
+    print("  TC43 Stufe-3-Richtungs-Gate: OK")
+
+
 if __name__ == "__main__":
     test_cross_year_put_series()
     test_cross_year_call_series()
@@ -2075,4 +2497,9 @@ if __name__ == "__main__":
     test_option_split_matches_by_conid_and_cost_basis()
     test_split_call_assignment_reclassifies_premium_and_stock_pnl()
     test_cross_year_split_put_assignment_uses_new_contract_quantity()
-    print("\nOK: alle 38 TCs gruen")
+    test_put_ratio_assignment_corrects_closed_short_slice()
+    test_same_day_independent_stock_short_keeps_strike_basis()
+    test_long_put_exercise_evidence_is_quantity_capped()
+    test_long_put_exercise_override_requires_embedded_premium()
+    test_correction_stage3_respects_target_direction()
+    print("\nOK: alle 43 TCs gruen")

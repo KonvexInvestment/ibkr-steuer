@@ -1841,6 +1841,199 @@ def _alias_currency_ok(row_currency, option_currency):
     return row_currency == option_currency
 
 
+def _long_put_exercise_short_openings(trades, det, underlying, alias_map=None):
+    """Return quantity-capped stock shorts proven to stem from long-put exercise.
+
+    The narrow ratio/debit-spread exception needs two linked IBKR BookTrades:
+    a zero-price long-put close and an opening stock SELL at the exercised
+    strike. Both must have the exact same timestamp, underlying and currency.
+    The returned capacity is capped by both option multiplier quantity and
+    stock quantity, so unrelated same-day stock shorts cannot borrow the marker.
+    """
+    relevant_dates = _put_assignment_relevant_dates(det)
+    if not relevant_dates:
+        return []
+
+    option_currency = det.get('currency')
+    exercises = []
+    stock_openings = []
+    for trade in trades:
+        if trade.get('assetCategory') != 'OPT':
+            continue
+        if trade.get('transactionType') != 'BookTrade':
+            continue
+        if (trade.get('buySell') or '').upper() != 'SELL':
+            continue
+        if (trade.get('putCall') or '').upper() != 'P':
+            continue
+        open_close = {
+            part.strip().upper()
+            for part in (trade.get('openCloseIndicator') or '').split(';')
+        }
+        if 'C' not in open_close:
+            continue
+        if safe_float(trade.get('quantity'), 0) >= 0:
+            continue
+        if abs(safe_float(trade.get('tradePrice'), 0)) > 0.000001:
+            continue
+        if abs(safe_float(trade.get('fifoPnlRealized'), 0)) > 0.01:
+            continue
+
+        timestamp = (trade.get('dateTime') or '').strip()
+        strike = safe_float(trade.get('strike'), 0)
+        shares = (
+            abs(safe_float(trade.get('quantity'), 0))
+            * abs(safe_float(trade.get('multiplier'), 100))
+        )
+        if not timestamp or strike <= 0 or shares <= 0:
+            continue
+        trade_underlying = (
+            (trade.get('underlyingSymbol') or '').strip()
+            or _symbol_root(trade.get('symbol'))
+        )
+        if not _symbols_equivalent(trade_underlying, underlying, alias_map):
+            continue
+        if not _alias_currency_ok(trade.get('currency'), option_currency):
+            continue
+
+        trade_dates = {
+            (trade.get('reportDate') or '')[:10],
+            (trade.get('tradeDate') or '')[:10],
+            (trade.get('dateTime') or '')[:10],
+        } - {''}
+        if trade_dates & relevant_dates:
+            exercises.append({
+                'trade': trade,
+                'timestamp': timestamp,
+                'strike': strike,
+                'shares': shares,
+                'currency': trade.get('currency'),
+            })
+
+    if not exercises:
+        return []
+
+    for trade in trades:
+        if trade.get('assetCategory') != 'STK':
+            continue
+        if trade.get('transactionType') != 'BookTrade':
+            continue
+        if (trade.get('buySell') or '').upper() != 'SELL':
+            continue
+        if safe_float(trade.get('quantity'), 0) >= 0:
+            continue
+        open_close = {
+            part.strip().upper()
+            for part in (trade.get('openCloseIndicator') or '').split(';')
+        }
+        if 'O' not in open_close:
+            continue
+
+        timestamp = (trade.get('dateTime') or '').strip()
+        trade_price = safe_float(trade.get('tradePrice'), 0)
+        shares = abs(safe_float(trade.get('quantity'), 0))
+        if not timestamp or trade_price <= 0 or shares <= 0:
+            continue
+        trade_underlying = _stock_symbol_for_matching(trade, alias_map)
+        if not _symbols_equivalent(trade_underlying, underlying, alias_map):
+            continue
+        if not _alias_currency_ok(trade.get('currency'), option_currency):
+            continue
+        trade_dates = {
+            (trade.get('reportDate') or '')[:10],
+            (trade.get('tradeDate') or '')[:10],
+            (trade.get('dateTime') or '')[:10],
+        } - {''}
+        if not trade_dates & relevant_dates:
+            continue
+        stock_openings.append({
+            'trade': trade,
+            'timestamp': timestamp,
+            'trade_price': trade_price,
+            'shares': shares,
+            'currency': trade.get('currency'),
+        })
+
+    evidence = []
+    stock_used = {}
+    for exercise in exercises:
+        remaining = exercise['shares']
+        for stock in stock_openings:
+            if remaining <= 0:
+                break
+            if stock['timestamp'] != exercise['timestamp']:
+                continue
+            if not _alias_currency_ok(stock['currency'], exercise['currency']):
+                continue
+            price_tolerance = max(0.01, abs(exercise['strike']) * 0.000001)
+            if abs(stock['trade_price'] - exercise['strike']) > price_tolerance:
+                continue
+            stock_key = id(stock['trade'])
+            available = stock['shares'] - stock_used.get(stock_key, 0.0)
+            if available <= 0:
+                continue
+            take = min(available, remaining)
+            stock_used[stock_key] = stock_used.get(stock_key, 0.0) + take
+            evidence.append({
+                'key': (id(exercise['trade']), stock_key, 'P_LONG_EXERCISE'),
+                'open_datetime': exercise['timestamp'],
+                'shares': take,
+            })
+            remaining -= take
+    return evidence
+
+
+def _claim_long_put_exercise_short_shares(match, evidence, consumed):
+    """Claim the exercise-backed portion of one closed stock-short lot."""
+    if not match.get('is_short_lot'):
+        return 0.0
+    open_datetime = (match.get('open_datetime') or '').strip()
+    remaining = abs(safe_float(match.get('shares'), 0))
+    if not open_datetime or remaining <= 0:
+        return 0.0
+
+    claimed = 0.0
+    for item in evidence:
+        if remaining <= 0:
+            break
+        if item.get('open_datetime') != open_datetime:
+            continue
+        key = item['key']
+        available = item['shares'] - consumed.get(key, 0.0)
+        if available <= 0:
+            continue
+        take = min(available, remaining)
+        consumed[key] = consumed.get(key, 0.0) + take
+        claimed += take
+        remaining -= take
+    return claimed
+
+
+def _short_cover_pnl_carries_premium(match, det, premium_per_share_raw):
+    """Plausibilität: trägt der realisierte Short-Cover-PnL die Prämie?
+
+    IBKR bucht den Andienungs-BUY normalerweise zu (Strike − Prämie) je Aktie;
+    der sofort realisierte Cover-PnL je Aktie ist dann Basis − Strike + Prämie.
+    Der Exercise-Beleg allein beweist nur die Herkunft des Short-Lots, nicht
+    die Einbettung — bucht IBKR zum reinen Strike, würde der Override die
+    Prämie doppelt abziehen (Topf 1 zu niedrig). Deshalb wird die Formel hier
+    am Lot nachgerechnet, bevor der Override die Kostenheuristik übersteuert.
+    """
+    shares = abs(safe_float(match.get('shares'), 0))
+    if shares <= 0:
+        return False
+    pnl_per_share = match.get('pnl_per_share')
+    if pnl_per_share is None:
+        return False
+    strike = safe_float(det.get('strike'), 0)
+    if strike <= 0:
+        return False
+    cost_per_share = abs(safe_float(match.get('cost'), 0)) / shares
+    expected_per_share = cost_per_share - strike + premium_per_share_raw
+    tolerance = max(0.01, abs(premium_per_share_raw) * 0.05)
+    return abs(safe_float(pnl_per_share, 0) - expected_per_share) <= tolerance
+
+
 def _propagate_alias_isins(symbol_to_isin, alias_map):
     """Traegt die ISIN eines Alias-Gruppenmitglieds fuer alle Mitglieder nach.
 
@@ -1906,7 +2099,8 @@ def _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares, con
         open_date = (lot.get('openDateTime') or '')[:10]
         if relevant_dates and open_date not in relevant_dates:
             continue
-        qty = abs(safe_float(lot.get('quantity'), 0))
+        signed_qty = safe_float(lot.get('quantity'), 0)
+        qty = abs(signed_qty)
         if qty <= 0:
             continue
         avail = qty if consumed is None else qty - consumed.get(id(lot), 0.0)
@@ -1914,11 +2108,23 @@ def _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares, con
             continue
         take = min(avail, remaining)
         close_date = (lot.get('reportDate') or lot.get('dateTime') or '')[:10]
+        close_buysell = (lot.get('buySell') or '').upper()
+        is_short_lot = signed_qty < 0
+        if close_buysell not in ('BUY', 'SELL'):
+            close_buysell = 'BUY' if is_short_lot else 'SELL'
         matches.append({
             'shares': take,
             'cost': abs(safe_float(lot.get('cost'), 0)) * take / qty,
+            'pnl_per_share': safe_float(lot.get('fifoPnlRealized'), 0) / qty,
             'open_date': open_date,
+            'open_datetime': lot.get('openDateTime') or '',
             'close_date': close_date,
+            # Ein Put-Assignment kann einen durch einen Long-Put eröffneten
+            # Aktien-Short decken und zugleich einen Long-Bestand eröffnen
+            # (1x2-Ratio-Spread). Die Lot-Richtung entscheidet dann, ob die
+            # realisierte Zielzeile ein BUY oder ein SELL ist.
+            'is_short_lot': is_short_lot,
+            'target_buysell': close_buysell,
         })
         if consumed is not None:
             consumed[id(lot)] = consumed.get(id(lot), 0.0) + take
@@ -2274,15 +2480,17 @@ def _correction_matches_row(corr, row):
     3. `close_date` (Put-Pfad ohne OIDs): einzelnes Datum gegen das erste
        nicht-leere Row-Datum. ACHTUNG: bewusst first-nonempty (reportDate vor
        dateTime), NICHT Set-Schnitt wie Stufe 2 — delayed bookings (1a13795)
-       würden sonst zusätzlich über dateTime matchen.
+       würden sonst zusätzlich über dateTime matchen. `target_buysell` gilt
+       wie in Stufe 2: eine BUY-getargete Korrektur (gedeckter Short) darf
+       nicht auf eine Same-Date-SELL-Row ausweichen.
     """
     corr_oids = corr.get('row_oids')
     if corr_oids is not None:
         return row.get('_trade_oid') in corr_oids
+    target_bs = corr.get('target_buysell', '')
+    if target_bs and (row.get('buySell') or '').upper() != target_bs:
+        return False
     if corr.get('close_dates') is not None:
-        target_bs = corr.get('target_buysell', '')
-        if target_bs and (row.get('buySell') or '').upper() != target_bs:
-            return False
         row_dates = {(row.get('reportDate') or '')[:10],
                      (row.get('dateTime') or '')[:10]} - {''}
         return bool(row_dates & set(corr.get('close_dates')))
@@ -2291,13 +2499,16 @@ def _correction_matches_row(corr, row):
     return not corr_close_date or corr_close_date == row_close_date
 
 
-def _put_assignment_lot_cost_correction_per_share(closed_lots, det, underlying, shares, default_per_share,
-                                                  require_match=False, matches=None, alias_map=None):
+def _put_assignment_lot_cost_correction_per_share(
+        closed_lots, det, underlying, shares, default_per_share,
+        require_match=False, matches=None, alias_map=None):
     """Use realized STK lot cost to decide whether IBKR embedded the put premium.
 
     `matches`: vorberechnete Lot-Matches durchreichen, wenn der Aufrufer bereits
     mit geteiltem Konsum-State gematcht hat — ein interner Neu-Scan würde sonst
-    Lots doppelt konsumieren bzw. eine abweichende Zuordnung sehen.
+    Lots doppelt konsumieren bzw. eine abweichende Zuordnung sehen. Der Aufrufer
+    reicht die Matches einzeln durch, weil ein Assignment sowohl Short-Lots
+    decken als auch Long-Lots eröffnen kann.
     """
     if det.get('putCall') != 'P':
         return default_per_share
@@ -3740,6 +3951,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # Eigener Konsum-State für diese Schleife (gleiche det-Reihenfolge und
         # Lot-Sortierung wie oben → identische Zuordnung wie das Routing).
         _correction_lot_claims = {}
+        _long_put_short_claims = {}
         for det in stillhalter_details:
             underlying_raw = (
                 (det.get('underlyingSymbol') or '').strip()
@@ -3757,6 +3969,12 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     consumed=_correction_lot_claims,
                     alias_map=underlying_alias_map
                 )
+            long_put_short_openings = []
+            if det['putCall'] == 'P':
+                long_put_short_openings = \
+                    _long_put_exercise_short_openings(
+                        trades, det, underlying, underlying_alias_map
+                    )
             if det['putCall'] == 'P' and not put_lot_matches:
                 source_topf = 'Topf2'  # put_nosell: premium only in Topf 2, no subtraction
             elif u_isin and u_isin in etf_isins and _effective_classification(u_isin) == 'anlage_so':
@@ -3789,32 +4007,70 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             if total_shares > 0:
                 premium_per_share_raw = det['premium_raw'] / total_shares
                 if det['putCall'] == 'P':
-                    premium_per_share_raw = _put_assignment_lot_cost_correction_per_share(
-                        closed_lots_for_put_basis, det, underlying, total_shares,
-                        premium_per_share_raw, require_match=True,
-                        matches=put_lot_matches, alias_map=underlying_alias_map
-                    )
-                    if premium_per_share_raw is None:
-                        continue
                     for match in put_lot_matches:
-                        # Row-Identität der Ziel-Verkaufszeile: cost-präferiert
-                        # (die Andienungs-Lots tragen die charakteristische
-                        # Strike−Prämie-Basis), damit fremde Same-Day-Verkäufe
-                        # die Korrektur nicht konsumieren.
+                        match_premium_per_share_raw = \
+                            _put_assignment_lot_cost_correction_per_share(
+                                closed_lots_for_put_basis, det, underlying,
+                                match['shares'], premium_per_share_raw,
+                                require_match=True, matches=[match],
+                                alias_map=underlying_alias_map
+                            )
+                        exercise_backed_shares = \
+                            _claim_long_put_exercise_short_shares(
+                                match, long_put_short_openings,
+                                _long_put_short_claims
+                            )
+                        correction_shares = match['shares']
+                        if not match_premium_per_share_raw:
+                            # Bei Ratio-/Debit-Spreads kann die Long-Put-Prämie
+                            # die Lot-Basis über den Short-Put-Strike anheben.
+                            # Nur der zeit- und mengengenau belegte Short-Anteil
+                            # darf dann die normale Kostenheuristik übersteuern.
+                            correction_shares = exercise_backed_shares
+                            if correction_shares <= 0:
+                                continue
+                            if not _short_cover_pnl_carries_premium(
+                                    match, det, premium_per_share_raw):
+                                # Exercise-Beleg vorhanden, aber der Lot-PnL
+                                # trägt die Prämie nicht → kein Override, die
+                                # Prämie bleibt eingebettet. Sichtbarer
+                                # Prüffall statt stillem Doppelabzug.
+                                stillhalter_corrections_dropped.append({
+                                    'underlying': underlying,
+                                    'leftover_shares': correction_shares,
+                                    'leftover_raw': premium_per_share_raw
+                                    * correction_shares,
+                                    'reason': 'long_put_exercise_pnl_mismatch',
+                                })
+                                print(f"  (!) WARNUNG: Long-Put-Exercise-Beleg für "
+                                      f"{underlying} passt nicht zum realisierten "
+                                      f"Cover-PnL des Short-Lots. Korrektur nicht "
+                                      f"angewendet, Prämie bleibt ggf. im Aktien-PnL "
+                                      f"eingebettet — bitte Trades pruefen.")
+                                continue
+                            match_premium_per_share_raw = premium_per_share_raw
+                        match_cost = match.get('cost')
+                        if match_cost is not None and match['shares'] > 0:
+                            match_cost *= correction_shares / match['shares']
+                        # Row-Identität der Zielzeile: Long-Lots werden per SELL,
+                        # gedeckte Short-Lots per BUY realisiert. cost-präferiert
+                        # bleiben fremde Same-Day-Trades unangetastet.
                         put_row_oids = _claim_stock_rows_for_date(
                             trades, underlying, match['close_date'],
-                            match['shares'], _correction_lot_claims,
-                            buysell='SELL', prefer_cost=match.get('cost'),
+                            correction_shares, _correction_lot_claims,
+                            buysell=match.get('target_buysell', 'SELL'),
+                            prefer_cost=match_cost,
                             claim_side='P', alias_map=underlying_alias_map,
                             option_currency=det.get('currency'),
                             raw_underlying=underlying_raw
                         )
                         pending_stk_corrections.setdefault(underlying, []).append({
-                            'premium_per_share_raw': premium_per_share_raw,
-                            'remaining_shares': match['shares'],
+                            'premium_per_share_raw': match_premium_per_share_raw,
+                            'remaining_shares': correction_shares,
                             'close_date': match['close_date'],
                             'side': 'P',
                             'row_oids': put_row_oids or None,
+                            'target_buysell': match.get('target_buysell', 'SELL'),
                             'raw_underlying': underlying_raw,
                             'currency': det.get('currency', ''),
                         })
