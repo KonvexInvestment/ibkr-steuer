@@ -784,6 +784,36 @@ def collect_notices(report, context=None):
             'prueffaelle', len(unhandled), unhandled,
         ))
 
+    transaction_tax = audit.get('transaction_tax', {}) or {}
+    ttax_applied = transaction_tax.get('applied_count', 0)
+    ttax_deferred = transaction_tax.get('deferred_count', 0)
+    ttax_embedded = transaction_tax.get('already_in_trade_count', 0)
+    if ttax_applied or ttax_deferred or ttax_embedded:
+        parts = []
+        if ttax_applied:
+            parts.append(
+                f"{ttax_applied} Buchung(en) über "
+                f"{transaction_tax.get('applied_eur', 0):,.2f} EUR wurden "
+                "im realisierten Ergebnis berücksichtigt"
+            )
+        if ttax_deferred:
+            parts.append(
+                f"{transaction_tax.get('deferred_eur', 0):,.2f} EUR entfallen "
+                "noch auf offene Positionen"
+            )
+        if ttax_embedded:
+            parts.append(
+                f"{ttax_embedded} Buchung(en) waren bereits im Trade enthalten"
+            )
+        notices.append(_notice(
+            'transaction_tax_processed', 'transparenz', 'normal',
+            'Transaktionssteuer berücksichtigt',
+            "; ".join(parts) + ".",
+            'methodik',
+            ttax_applied + ttax_deferred + ttax_embedded,
+            transaction_tax.get('details', []),
+        ))
+
     partnership = report.get('partnership_tax_items', {}) or {}
     if partnership:
         names = ", ".join(

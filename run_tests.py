@@ -55,6 +55,7 @@ SYNTHETIC_TESTS = [
     ("Tageskurs-Korrektur-Maps", "tests/test_tageskurs_adjustment_maps.py"),
     ("Underlying-Symbol-Aliasse", "tests/test_underlying_symbol_matching.py"),
     ("Instrumentenkategorie-Routing", "tests/test_asset_category_routing.py"),
+    ("Transaktionssteuern-TTAX", "tests/test_transaction_tax.py"),
     ("Merge-Completeness", "tests/test_merge_completeness.py"),
     ("UI-Eintragungsuebersicht", "tests/test_ui_result_summary.py"),
     ("UI-Model-Schicht", "tests/test_ui_model.py"),

@@ -151,6 +151,31 @@ def test_merge_keeps_partnership_blocker_and_observed_amounts():
     assert item['sources'] == ['https://www.sec.gov/example']
 
 
+def test_merge_sums_transaction_tax_audit():
+    merge_report_data = load_merge_report_data()
+    report = build_sample_report()
+    report['audit']['transaction_tax'] = {
+        'found_count': 3,
+        'applied_count': 1,
+        'applied_eur': 0.05,
+        'deferred_count': 1,
+        'deferred_eur': 0.02,
+        'already_in_trade_count': 1,
+        'historical_count': 0,
+        'unmatched_count': 0,
+        'details': [{'status': 'applied_to_close', 'symbol': 'ITALYOPT'}],
+    }
+    merged = merge_report_data([copy.deepcopy(report), copy.deepcopy(report)])
+    audit = merged['audit']['transaction_tax']
+    assert audit['found_count'] == 6
+    assert audit['applied_count'] == 2
+    assert abs(audit['applied_eur'] - 0.10) < 1e-9
+    assert audit['deferred_count'] == 2
+    assert abs(audit['deferred_eur'] - 0.04) < 1e-9
+    assert audit['already_in_trade_count'] == 2
+    assert len(audit['details']) == 2
+
+
 if __name__ == '__main__':
     test_merge_keeps_every_report_data_field()
     print('OK: Merge verliert keine report_data-Felder')
@@ -158,3 +183,5 @@ if __name__ == '__main__':
     print('OK: topf2_by_category wird summiert')
     test_merge_keeps_partnership_blocker_and_observed_amounts()
     print('OK: Partnership-Blocker wird gemergt')
+    test_merge_sums_transaction_tax_audit()
+    print('OK: TTAX-Audit wird gemergt')

@@ -490,6 +490,11 @@ def full_trigger_report():
             'unhandled_activity_codes': [
                 {'code': 'TTAX', 'count': 1, 'amount_eur': -3.0,
                  'descriptions': []}],
+            'transaction_tax': {
+                'applied_count': 2, 'applied_eur': 0.05,
+                'deferred_count': 1, 'deferred_eur': 0.02,
+                'already_in_trade_count': 1, 'details': [],
+            },
             'fx_rate_parse_failures': {'funds': 1, 'trades': 0},
             'occ_rename_matches': [{'sell_symbol': 'MMM', 'sell_date': 'x',
                                     'close_symbol': 'MMM1', 'close_date': 'y',
@@ -525,6 +530,7 @@ NOTICE_REGISTRY = {
     'stillhalter_unmatched', 'stillhalter_prior_lot_unmatched',
     'zufluss_unmatched', 'unrouted_asset_categories',
     'unhandled_activity_codes', 'partnership_blocked',
+    'transaction_tax_processed',
     'classification_review', 'etf_unknown_classification',
     'kap_inv_form_warning', 'kap_inv_paid_distributions',
     'kap_inv_sale_preliminary', 'dba_wht_review', 'fx_open_rows_with_pnl',

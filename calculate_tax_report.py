@@ -80,9 +80,8 @@ FEE_ACTIVITY_CODES = frozenset({'OFEE', 'STAX'})
 
 # IBKR meldet TTAX als separat von Trades gebuchte Transaktionssteuer. Solche
 # unmittelbaren Transaktionskosten sind grundsaetzlich nach §20 Abs. 4 EStG
-# ergebniswirksam; ohne belastbare Zuordnung zu Trade und Steuertopf darf der
-# Betrag aber weder pauschal Topf 1 noch Topf 2 zugeschlagen werden. Deshalb
-# sichtbarer manueller Prueffall statt falscher Automatik.
+# ergebniswirksam. Eindeutige Trade-/Lot-Matches werden unten automatisch
+# verarbeitet; nicht eindeutig zuordenbare Zeilen bleiben sichtbare Prueffaelle.
 MANUAL_REVIEW_ACTIVITY_CODES = frozenset({'TTAX'})
 
 
@@ -2702,11 +2701,19 @@ def _apply_stillhalter_row_correction(row, total_correction_raw, base_currency,
     )
     fx = row.get('fxRateToBase', 1.0)
     if base_currency == 'EUR':
-        row['pnl_eur'] = round(row['fifoPnlRealized'] * fx, 5)
+        recalculated_pnl_eur = row['fifoPnlRealized'] * fx
     else:
         d = parse_date(row.get('dateTime', ''))
         r_eur = get_rate_for_date(d, usd_to_eur_rates)
-        row['pnl_eur'] = round(row['fifoPnlRealized'] * fx * r_eur, 5)
+        recalculated_pnl_eur = row['fifoPnlRealized'] * fx * r_eur
+    # TTAX bleibt ein separates EUR-Feld, weil StmtFunds bei EUR-Basiskonten
+    # bereits BaseCurrency liefert. Eine nachfolgende Stillhalter-Neuberechnung
+    # darf die zuvor angewandte Transaktionssteuer nicht wieder ueberschreiben.
+    row['pnl_eur'] = round(
+        recalculated_pnl_eur
+        + safe_float(row.get('transaction_tax_eur'), 0.0),
+        5,
+    )
     row['stillhalter_adjusted'] = True
     return original_pnl_eur - row['pnl_eur']
 
@@ -3385,6 +3392,386 @@ def _dedupe_funds(all_funds):
     return funds, funds_duplicates
 
 
+def _normalize_ibkr_timestamp(value):
+    """Normalisiert IBKRs ``YYYY-MM-DD;HH:MM:SS``-/Space-Varianten."""
+    return (value or '').strip().replace(';', ' ')
+
+
+def _trade_value_eur(value_raw, trade, base_currency, usd_to_eur_rates):
+    """Rechnet ein Trade-Rohfeld (z.B. ``taxes``) nach EUR um."""
+    value = safe_float(value_raw, 0.0)
+    fx_to_base = safe_float(trade.get('fxRateToBase'), 1.0)
+    if base_currency == 'EUR':
+        return value * fx_to_base
+    trade_date = (
+        parse_date(trade.get('dateTime'))
+        or parse_date(trade.get('tradeDate'))
+        or parse_date(trade.get('reportDate'))
+    )
+    return value * fx_to_base * get_rate_for_date(
+        trade_date, usd_to_eur_rates)
+
+
+def _stmtfund_value_eur(row, base_currency, usd_to_eur_rates):
+    """Rechnet eine StmtFunds-BaseCurrency-Zeile wie der Funds-Loop um."""
+    amount_raw = safe_float(row.get('amount'), 0.0)
+    if base_currency == 'EUR':
+        return amount_raw
+    date = parse_date(row.get('date')) or parse_date(row.get('reportDate'))
+    rate_eur = get_rate_for_date(date, usd_to_eur_rates)
+    currency = row.get('currency')
+    if currency == 'EUR':
+        return amount_raw
+    if currency == 'USD':
+        return amount_raw * rate_eur
+    return (
+        amount_raw
+        * safe_float(row.get('fxRateToBase'), 1.0)
+        * rate_eur
+    )
+
+
+def _transaction_tax_trade_candidates(row, trades):
+    """Liefert konservative Trade-Kandidaten fuer eine TTAX-Tagesbuchung.
+
+    IBKRs TTAX-``tradeID`` ist im belegten Export eine eigene Daily-Charge-ID
+    und stimmt nicht mit ``Trades.tradeID`` ueberein. Direkte IDs werden daher
+    zuerst versucht; belastbarer Fallback ist genau ein Trade mit derselben
+    conid (sonst ISIN/Symbol), Asset-Kategorie und demselben Handelstag.
+    """
+    row_ids = {
+        str(row.get(field) or '').strip()
+        for field in ('tradeID', 'relatedTradeID')
+        if str(row.get(field) or '').strip()
+    }
+    direct = []
+    if row_ids:
+        for trade in trades:
+            trade_ids = {
+                str(trade.get(field) or '').strip()
+                for field in ('tradeID', 'origTradeID', 'relatedTradeID')
+                if str(trade.get(field) or '').strip()
+            }
+            if row_ids & trade_ids:
+                direct.append(trade)
+    if len(direct) == 1:
+        return direct
+
+    row_date = parse_date(row.get('date')) or parse_date(row.get('reportDate'))
+    if not row_date:
+        return []
+    row_category = (row.get('assetCategory') or '').strip()
+    row_conid = str(row.get('conid') or '').strip()
+    row_isin = (row.get('isin') or '').strip()
+    row_symbol = (row.get('symbol') or '').strip()
+    candidates = []
+    for trade in trades:
+        trade_date = parse_date(
+            trade.get('tradeDate') or trade.get('dateTime')
+            or trade.get('reportDate')
+        )
+        if trade_date != row_date:
+            continue
+        if row_category and trade.get('assetCategory') != row_category:
+            continue
+        if row_conid:
+            identity_match = str(trade.get('conid') or '').strip() == row_conid
+        elif row_isin:
+            identity_match = (trade.get('isin') or '').strip() == row_isin
+        else:
+            identity_match = bool(
+                row_symbol and (trade.get('symbol') or '').strip() == row_symbol
+            )
+        if identity_match:
+            candidates.append(trade)
+    return candidates
+
+
+def _transaction_tax_open_lots(open_trade, closed_lots):
+    """Findet CLOSED_LOTs, die exakt aus dem belasteten Opening stammen."""
+    open_timestamp = _normalize_ibkr_timestamp(open_trade.get('dateTime'))
+    if not open_timestamp:
+        return []
+    open_conid = str(open_trade.get('conid') or '').strip()
+    open_symbol = (open_trade.get('symbol') or '').strip()
+    matches = []
+    for lot in closed_lots:
+        lot_open = _normalize_ibkr_timestamp(
+            lot.get('openDateTime') or lot.get('holdingPeriodDateTime')
+        )
+        if lot_open != open_timestamp:
+            continue
+        if open_conid:
+            identity_match = str(lot.get('conid') or '').strip() == open_conid
+        else:
+            identity_match = bool(
+                open_symbol and (lot.get('symbol') or '').strip() == open_symbol
+            )
+        if identity_match:
+            matches.append(lot)
+    return matches
+
+
+def _transaction_tax_lot_close_candidates(lot, trades):
+    """Ordnet einen CLOSED_LOT seinem realisierten Schluss-Trade zu."""
+    close_timestamp = _normalize_ibkr_timestamp(
+        lot.get('dateTime') or lot.get('reportDate')
+    )
+    lot_conid = str(lot.get('conid') or '').strip()
+    lot_symbol = (lot.get('symbol') or '').strip()
+    candidates = []
+    for trade in trades:
+        if _normalize_ibkr_timestamp(trade.get('dateTime')) != close_timestamp:
+            continue
+        if lot_conid:
+            identity_match = str(trade.get('conid') or '').strip() == lot_conid
+        else:
+            identity_match = bool(
+                lot_symbol and (trade.get('symbol') or '').strip() == lot_symbol
+            )
+        if identity_match:
+            candidates.append(trade)
+    return candidates
+
+
+def _collect_transaction_tax_adjustments(
+        funds, trades, closed_lots, tax_year, base_currency,
+        usd_to_eur_rates, eligible_trade=None):
+    """Ermittelt TTAX-Korrekturen ohne unsichere Pauschalzuordnung.
+
+    Returns ``(adjustments, resolved_oids, audit)``. ``adjustments`` ist nach
+    ``id(close_trade)`` gruppiert und enthaelt EUR-PnL-Reduktionen. Negative
+    TTAX-Cashwerte werden positiv als Kostenreduktion des PnL gefuehrt.
+    """
+    ttax_rows = [
+        row for row in funds
+        if (row.get('activityCode') or '').strip().upper() == 'TTAX'
+    ]
+    adjustments = defaultdict(list)
+    resolved_oids = set()
+    details = []
+    audit = {
+        'found_count': len(ttax_rows),
+        'applied_count': 0,
+        'applied_eur': 0.0,
+        'deferred_count': 0,
+        'deferred_eur': 0.0,
+        'already_in_trade_count': 0,
+        'historical_count': 0,
+        'unmatched_count': 0,
+        'details': details,
+    }
+    epsilon = 0.0000001
+
+    def add_unmatched(row, amount_eur, reason):
+        audit['unmatched_count'] += 1
+        details.append({
+            'status': 'unmatched',
+            'reason': reason,
+            'symbol': row.get('symbol', ''),
+            'date': row.get('date') or row.get('reportDate') or '',
+            'amount_eur': amount_eur,
+            'applied_eur': 0.0,
+            'deferred_eur': 0.0,
+        })
+
+    for row in ttax_rows:
+        amount_eur = _stmtfund_value_eur(
+            row, base_currency, usd_to_eur_rates)
+        reduction_eur = -amount_eur
+        candidates = _transaction_tax_trade_candidates(row, trades)
+        if len(candidates) != 1:
+            add_unmatched(
+                row, amount_eur,
+                'kein_eindeutiger_trade' if not candidates
+                else 'mehrere_trades_am_selben_tag',
+            )
+            continue
+        trade = candidates[0]
+        if eligible_trade is not None and not eligible_trade(trade):
+            add_unmatched(row, amount_eur, 'steuerroute_nicht_automatisierbar')
+            continue
+
+        embedded_eur = _trade_value_eur(
+            trade.get('taxes'), trade, base_currency, usd_to_eur_rates)
+        tolerance = max(0.0001, abs(amount_eur) * 0.001)
+        if abs(embedded_eur) > epsilon:
+            if abs(embedded_eur - amount_eur) <= tolerance:
+                resolved_oids.add(id(row))
+                audit['already_in_trade_count'] += 1
+                details.append({
+                    'status': 'already_in_trade',
+                    'symbol': row.get('symbol', ''),
+                    'date': row.get('date') or row.get('reportDate') or '',
+                    'amount_eur': amount_eur,
+                    'applied_eur': 0.0,
+                    'deferred_eur': 0.0,
+                })
+            else:
+                add_unmatched(row, amount_eur, 'trade_taxes_weicht_ab')
+            continue
+
+        trade_report_date = (
+            parse_date(trade.get('reportDate'))
+            or parse_date(trade.get('dateTime'))
+            or parse_date(trade.get('tradeDate'))
+        )
+        pnl_value = trade.get('fifoPnlRealized')
+        is_close = (
+            (trade.get('openCloseIndicator') or '').upper() == 'C'
+            or abs(safe_float(pnl_value, 0.0)) > epsilon
+        )
+        if is_close:
+            if trade_report_date and trade_report_date.year < tax_year:
+                resolved_oids.add(id(row))
+                audit['historical_count'] += 1
+                details.append({
+                    'status': 'historical_close',
+                    'symbol': row.get('symbol', ''),
+                    'date': row.get('date') or row.get('reportDate') or '',
+                    'amount_eur': amount_eur,
+                    'applied_eur': 0.0,
+                    'deferred_eur': 0.0,
+                })
+                continue
+            if not trade_report_date or trade_report_date.year != tax_year:
+                add_unmatched(row, amount_eur, 'schluss_ausserhalb_steuerjahr')
+                continue
+            if pnl_value in (None, ''):
+                add_unmatched(row, amount_eur, 'schluss_ohne_fifo_pnl')
+                continue
+            adjustments[id(trade)].append({
+                'fund_oid': id(row),
+                'reduction_eur': reduction_eur,
+                'source': 'closing_trade',
+            })
+            resolved_oids.add(id(row))
+            audit['applied_count'] += 1
+            audit['applied_eur'] += reduction_eur
+            details.append({
+                'status': 'applied_to_close',
+                'symbol': row.get('symbol', ''),
+                'date': row.get('date') or row.get('reportDate') or '',
+                'amount_eur': amount_eur,
+                'applied_eur': reduction_eur,
+                'deferred_eur': 0.0,
+            })
+            continue
+
+        if (trade.get('openCloseIndicator') or '').upper() != 'O':
+            add_unmatched(row, amount_eur, 'trade_nicht_oeffnung_oder_schluss')
+            continue
+
+        # Bei einem Optionsverkauf entsteht die Stillhalterpraemie bereits im
+        # Eroeffnungsjahr (§11 EStG). Dessen TTAX darf deshalb nicht wie die
+        # Anschaffungsnebenkosten einer Long-Position bis zum Close getragen
+        # werden. Ohne Eingriff in die separate Zufluss-FIFO bleibt der seltene
+        # Fall bewusst manuell statt die Steuer ins falsche Jahr zu verschieben.
+        if (
+            trade.get('assetCategory') in ('OPT', 'FOP', 'FSFOP')
+            and (trade.get('buySell') or '').upper() == 'SELL'
+        ):
+            add_unmatched(row, amount_eur, 'short_option_eroeffnung')
+            continue
+
+        open_quantity = abs(safe_float(trade.get('quantity'), 0.0))
+        if open_quantity <= epsilon:
+            add_unmatched(row, amount_eur, 'eroeffnungsmenge_fehlt')
+            continue
+        open_lots = sorted(
+            _transaction_tax_open_lots(trade, closed_lots),
+            key=lambda lot: (
+                lot.get('reportDate') or lot.get('dateTime') or ''
+            ),
+        )
+        remaining_quantity = open_quantity
+        applied_eur = 0.0
+        historical_eur = 0.0
+        ambiguous = False
+        for lot in open_lots:
+            lot_quantity = min(
+                remaining_quantity,
+                abs(safe_float(lot.get('quantity'), 0.0)),
+            )
+            if lot_quantity <= epsilon:
+                continue
+            remaining_quantity -= lot_quantity
+            lot_share = lot_quantity / open_quantity
+            lot_reduction = reduction_eur * lot_share
+            lot_report_date = (
+                parse_date(lot.get('reportDate'))
+                or parse_date(lot.get('dateTime'))
+            )
+            if not lot_report_date:
+                ambiguous = True
+                break
+            if lot_report_date.year < tax_year:
+                historical_eur += lot_reduction
+                continue
+            if lot_report_date.year > tax_year:
+                remaining_quantity += lot_quantity
+                continue
+            close_candidates = _transaction_tax_lot_close_candidates(
+                lot, trades)
+            if len(close_candidates) != 1:
+                ambiguous = True
+                break
+            close_trade = close_candidates[0]
+            if eligible_trade is not None and not eligible_trade(close_trade):
+                ambiguous = True
+                break
+            if close_trade.get('fifoPnlRealized') in (None, ''):
+                ambiguous = True
+                break
+            adjustments[id(close_trade)].append({
+                'fund_oid': id(row),
+                'reduction_eur': lot_reduction,
+                'source': 'opening_basis',
+            })
+            applied_eur += lot_reduction
+
+        if ambiguous:
+            # Teilanwendungen dieses Events zurueckrollen: Ein TTAX-Event wird
+            # nur ganz behandelt, wenn alle im Steuerjahr betroffenen Lots
+            # eindeutig sind.
+            for trade_oid in list(adjustments):
+                adjustments[trade_oid] = [
+                    item for item in adjustments[trade_oid]
+                    if item['fund_oid'] != id(row)
+                ]
+                if not adjustments[trade_oid]:
+                    del adjustments[trade_oid]
+            add_unmatched(row, amount_eur, 'closed_lot_nicht_eindeutig')
+            continue
+
+        deferred_eur = reduction_eur * remaining_quantity / open_quantity
+        resolved_oids.add(id(row))
+        if abs(applied_eur) > epsilon:
+            audit['applied_count'] += 1
+            audit['applied_eur'] += applied_eur
+        if abs(deferred_eur) > epsilon:
+            audit['deferred_count'] += 1
+            audit['deferred_eur'] += deferred_eur
+        if abs(historical_eur) > epsilon:
+            audit['historical_count'] += 1
+        status = (
+            'partially_applied' if abs(applied_eur) > epsilon
+            and abs(deferred_eur) > epsilon
+            else 'applied_via_closed_lot' if abs(applied_eur) > epsilon
+            else 'deferred_open_position'
+        )
+        details.append({
+            'status': status,
+            'symbol': row.get('symbol', ''),
+            'date': row.get('date') or row.get('reportDate') or '',
+            'amount_eur': amount_eur,
+            'applied_eur': applied_eur,
+            'deferred_eur': deferred_eur,
+        })
+
+    return dict(adjustments), resolved_oids, audit
+
+
 def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrides=None,
                   fx_margin_correction_enabled=True,
                   dba_wht_beta_enabled=False):
@@ -3528,6 +3915,31 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             _members.sort()
             print(f"Symbol-Alias erkannt (conid/ISIN-Identitaet): "
                   f"{', '.join(_members)} = {_canon}")
+
+    def _transaction_tax_trade_is_eligible(trade):
+        category = trade.get('assetCategory')
+        if category in TOPF2_ASSET_CATEGORIES:
+            return True
+        if category != 'STK':
+            return False
+        isin = (trade.get('isin') or '').strip()
+        subcategory = trade.get('subCategory', '')
+        if not isin or not (
+                subcategory == 'ETF' or is_known_etf(isin)):
+            return True
+        # Anlage SO und transparente Personengesellschaften haben eigene,
+        # nicht aus den KAP-Pools ableitbare Rechenwege. Sie bleiben Prueffall.
+        return _effective_classification(isin) not in (
+            'anlage_so', 'personengesellschaft',
+        )
+
+    transaction_tax_adjustments, transaction_tax_resolved_oids, \
+        transaction_tax_audit = _collect_transaction_tax_adjustments(
+            funds, trades, _alias_closed_lots, tax_year, base_currency,
+            usd_to_eur_rates,
+            eligible_trade=_transaction_tax_trade_is_eligible,
+        )
+    transaction_tax_target_trade_oids = set(transaction_tax_adjustments)
 
     # 3. Capital Gains (Stocks & Options)
     stocks_gain = 0.0
@@ -3677,7 +4089,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
 
         # Check if Realized PnL event
         pnl_str = t.get('fifoPnlRealized')
-        if not pnl_str or float(pnl_str) == 0:
+        has_transaction_tax_adjustment = id(t) in transaction_tax_target_trade_oids
+        if not pnl_str or (
+                float(pnl_str) == 0 and not has_transaction_tax_adjustment):
             continue
 
         pnl_raw = float(pnl_str)
@@ -3807,6 +4221,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             'fifoPnlRealized': pnl_raw,
             'fxRateToBase': fx_to_base,
             'ibCommission': safe_float(t.get('ibCommission'), 0),
+            # Separates signed-cash EUR-Feld: negativ = Steuerbelastung. Der
+            # IBKR-Rohwert fifoPnlRealized bleibt zur Abstimmung unveraendert.
+            'transaction_tax_eur': 0.0,
             'pnl_eur': round(pnl_eur, 5),
             'topf': topf,
             'strike': t.get('strike', ''),
@@ -3821,6 +4238,53 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             # Unterstrich-Felder werden nicht exportiert und nach dem Apply entfernt.
             '_trade_oid': id(t),
         })
+
+    # TTAX wird erst nach dem normalen Trade-Routing angewandt. Dadurch kann
+    # ein Kostenbetrag einen Null-/Gewinn-Trade korrekt in den Verlust-Bucket
+    # verschieben, ohne Topf 1, Topf 2 und KAP-INV pauschal zu vermischen.
+    for row in debug_rows:
+        corrections = transaction_tax_adjustments.get(
+            row.get('_trade_oid'), [])
+        if not corrections:
+            continue
+        reduction_eur = sum(item['reduction_eur'] for item in corrections)
+        old_pnl = safe_float(row.get('pnl_eur'), 0.0)
+        new_pnl = old_pnl - reduction_eur
+        gain_delta = max(new_pnl, 0.0) - max(old_pnl, 0.0)
+        loss_delta = min(new_pnl, 0.0) - min(old_pnl, 0.0)
+        row['transaction_tax_eur'] = round(
+            safe_float(row.get('transaction_tax_eur'), 0.0) - reduction_eur,
+            5,
+        )
+        row['pnl_eur'] = round(new_pnl, 5)
+
+        topf = row.get('topf')
+        category = row.get('assetCategory')
+        isin = (row.get('isin') or '').strip()
+        if topf == 'Topf1':
+            stocks_gain += gain_delta
+            stocks_loss += loss_delta
+        elif topf == 'Topf2':
+            options_gain += gain_delta
+            options_loss += loss_delta
+            if category == 'STK':
+                # no_invstg ETPs sind die einzige STK-Untergruppe in Topf 2.
+                no_invstg_gain += gain_delta
+                no_invstg_loss += loss_delta
+                label = 'Crypto/Commodity ETPs'
+            else:
+                label = TOPF2_CAT_LABELS.get(category, category)
+            entry = topf2_by_category.setdefault(
+                label, {'gain': 0.0, 'loss': 0.0})
+            entry['gain'] += gain_delta
+            entry['loss'] += loss_delta
+        elif topf == 'KAP-INV' and isin:
+            etf_invstg_gain += gain_delta
+            etf_invstg_loss += loss_delta
+            entry = ensure_etf_fund_entry(
+                isin, _effective_classification(isin))
+            entry['gain'] += gain_delta
+            entry['loss'] += loss_delta
 
     # Write debug CSV
     if debug_rows:
@@ -4490,10 +4954,6 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                       f"{_leftover_shares:g} Stück ohne passende Verkaufszeile. Die Prämie "
                       f"bleibt im Aktien-PnL eingebettet (potenzielle Doppelversteuerung) — "
                       f"bitte Trades des Underlyings prüfen.")
-
-        # Interne Row-Identität nach dem Matching entfernen (kein Export-Leak).
-        for row in debug_rows:
-            row.pop('_trade_oid', None)
 
         # Apply per-trade gain/loss split (replaces old pauschal: stocks_gain -= stk_premium)
         stocks_gain -= stk_gain_corr_cy
@@ -5302,24 +5762,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             funds_skipped_year += 1
             continue
 
-        amount_raw = safe_float(f.get('amount'))
         curr = f.get('currency')
-
-        if base_currency == 'EUR':
-            # EUR base: StmtFunds shows BaseCurrency view — amounts already in EUR
-            amount_eur = amount_raw
-        else:
-            # USD base: convert from original currency to EUR
-            rate_eur = get_rate_for_date(date, usd_to_eur_rates)
-            amount_eur = 0.0
-            if curr == 'EUR':
-                amount_eur = amount_raw
-            elif curr == 'USD':
-                amount_eur = amount_raw * rate_eur
-            else:
-                fx = safe_float(f.get('fxRateToBase'), 1.0)
-                amount_usd = amount_raw * fx
-                amount_eur = amount_usd * rate_eur
+        amount_eur = _stmtfund_value_eur(
+            f, base_currency, usd_to_eur_rates)
 
         if code in FEE_ACTIVITY_CODES:
             # Laufende Gebuehren/Umsatzsteuer: nur nachrichtlich, nicht in der
@@ -5329,8 +5774,11 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             continue
 
         if code in MANUAL_REVIEW_ACTIVITY_CODES:
-            # TTAX kann steuerlich ergebniswirksam sein, ist in StmtFunds aber
-            # nicht sicher einem konkreten Trade/Steuertopf zuzuordnen.
+            # Eindeutig gematchte TTAX-Zeilen sind bereits trade-/lotgenau in
+            # den Pools enthalten oder als offene Anschaffungsnebenkosten
+            # vorgemerkt. Nur der Rest bleibt manueller Prueffall.
+            if code == 'TTAX' and id(f) in transaction_tax_resolved_oids:
+                continue
             register_unhandled_activity_code(
                 unhandled_activity_codes, code, amount_eur,
                 description=f.get('activityDescription', ''),
@@ -6681,6 +7129,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     zeile_23_stock_losses = abs(stocks_loss)
 
     # Sort trade details chronologically for reporting
+    # Alle Korrekturen sind abgeschlossen. Die interne Identität darf auch in
+    # Jahren ohne Stillhalter-Fall nicht in Report/Export gelangen.
+    for row in debug_rows:
+        row.pop('_trade_oid', None)
     debug_rows.sort(key=lambda r: r.get('dateTime', '') or r.get('reportDate', '') or 'zzzz')
 
     # Alle je in diesem Report vorkommenden ETF-ISINs (unabhängig von Bucket) —
@@ -6739,7 +7191,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         "interest_eur": interest_eur,
         "debit_interest_eur": debit_interest_eur,
         # Laufende Gebuehren/Umsatzsteuer (OFEE/STAX) — nachrichtlich,
-        # nicht Teil der Ertragsrechnung. TTAX ist ein manueller Prueffall.
+        # nicht Teil der Ertragsrechnung. TTAX wird nur bei eindeutigem
+        # Trade-/Lot-Match automatisch beruecksichtigt.
         "other_fees_eur": other_fees_eur,
         "stocks_gain_eur": stocks_gain,
         "stocks_loss_eur": stocks_loss,
@@ -6825,6 +7278,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             # Laufende Gebuehren/Umsatzsteuer je Code (nur nachrichtlich) und
             # Cash-Buchungen ohne sichere automatische Zuordnung (Prueffall).
             "fee_by_activity_code": dict(sorted(fee_by_activity_code.items())),
+            "transaction_tax": transaction_tax_audit,
             "unhandled_activity_codes": sorted(
                 unhandled_activity_codes.values(), key=lambda e: e['code']
             ),

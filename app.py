@@ -1188,6 +1188,18 @@ def merge_report_data(reports):
         'cfd_interest_income_eur': sum(r.get('audit', {}).get('cfd_interest_income_eur', 0) for r in reports),
         'cfd_financing_cost_eur': sum(r.get('audit', {}).get('cfd_financing_cost_eur', 0) for r in reports),
         'fee_by_activity_code': {},
+        'transaction_tax': {
+            key: sum(
+                r.get('audit', {}).get('transaction_tax', {}).get(key, 0)
+                for r in reports
+            )
+            for key in (
+                'found_count', 'applied_count', 'applied_eur',
+                'deferred_count', 'deferred_eur',
+                'already_in_trade_count', 'historical_count',
+                'unmatched_count',
+            )
+        },
         'unhandled_activity_codes': [],
         'fx_rate_parse_failures': {
             'funds': sum(r.get('audit', {}).get('fx_rate_parse_failures', {}).get('funds', 0) for r in reports),
@@ -1250,6 +1262,9 @@ def merge_report_data(reports):
         merged_audit['occ_rename_matches'].extend(a.get('occ_rename_matches', []))
         merged_audit['stillhalter_corrections_dropped'].extend(a.get('stillhalter_corrections_dropped', []))
         merged_audit['stillhalter_open_short'].extend(a.get('stillhalter_open_short', []))
+        merged_audit['transaction_tax'].setdefault('details', []).extend(
+            a.get('transaction_tax', {}).get('details', [])
+        )
         for year, val in a.get('cross_year_by_year', {}).items():
             merged_audit['cross_year_by_year'][year] = merged_audit['cross_year_by_year'].get(year, 0) + val
     merged['audit'] = merged_audit
@@ -4214,7 +4229,7 @@ Aus `statement_of_funds.csv` werden Cash-Positionen nach `activityCode` zugeordn
 | `CFD` | CFD-Zinsen und -Gebühren | Habenzinsen in Topf 2, Finanzierungskosten wie `DINT` nur nachrichtlich |
 | `FRTAX` / `WHT` | Quellensteuer (Withholding Tax) | Zeile 41 (anrechenbar). Ausnahmen: deutsche Kapitalertragsteuer auf DE-Wertpapieren geht nach Zeile 37/38; liegt sie auf einem DE-Fonds, wird sie als Prüffall gemeldet, da §32d Abs. 5 EStG nur ausländische Steuern erfasst und die Formularzuordnung nicht automatisierbar ist |
 | `OFEE` / `STAX` | Gebühren, Umsatzsteuer | Nicht abziehbar (§20 Abs. 9), nur nachrichtlich |
-| `TTAX` | Transaktionssteuer | Nach §20 Abs. 4 EStG ergebniswirksam, aber ohne belastbare Zuordnung zum Trade. Wird als Prüffall ausgewiesen statt automatisch verbucht |
+| `TTAX` | Transaktionssteuer | Nach §20 Abs. 4 EStG ergebniswirksam. Bei eindeutigem Match wird die Verkaufssteuer sofort und die Kaufsteuer über das geschlossene Lot anteilig im realisierten Ergebnis berücksichtigt. Bereits in `Trade.taxes` enthaltene Beträge werden nicht doppelt abgezogen; nicht eindeutige Fälle bleiben Prüffälle |
 | `BUY` / `SELL` / `ADJ` / `ASSIGN` / `EXE` | Trade- und Settlement-Buchungen | Übersprungen; das realisierte Ergebnis kommt aus den Trade-Daten |
 | `DEP` / `WITH` | Ein- und Auszahlungen | Übersprungen; kein eigener Kapitalertrag |
 | `FOREX` | Devisenumsatz | Übersprungen; das Ergebnis kommt aus der separaten FX-Rechnung |
