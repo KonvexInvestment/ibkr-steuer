@@ -537,24 +537,33 @@ def extract_quarterly_xmls(xml_files, output_dir):
         total_pnl = sum(float(r['realizedPL']) for r in fx_pnl_rows)
         print(f"  Saved {len(fx_pnl_rows)} FX realized PnL entries (Total: {total_pnl:,.2f})")
 
-    # FX currency transactions (dedup, earliest Starting Balance only)
+    # FX currency transactions (dedup, earliest Starting Balance only).
+    # WICHTIG: NICHT ueber transactionID allein deduplizieren — IBKR vergibt
+    # dieselbe ID fuer jede Folgebuchung derselben Position (siehe Kommentar in
+    # extract_fx_multi_xml). Duplikat ist eine Zeile nur, wenn alle sechs
+    # fachlichen Schluesselfelder uebereinstimmen: Waehrung, Datum,
+    # transactionID, Buchungstext, Betrag und Saldo.
     all_fx_currency.sort(key=lambda x: x.get('date', ''))
     sb_seen_curr = set()
     seen_fx_keys = set()
     final_fx = []
     for row in all_fx_currency:
         desc = row.get('activityDescription', '')
-        tid = row.get('transactionID', '')
         if desc == 'Starting Balance':
             curr = row.get('currency', '')
             if curr in sb_seen_curr:
                 continue
             sb_seen_curr.add(curr)
             key = ('SB', curr)
-        elif tid:
-            key = tid
         else:
-            key = (row.get('date'), row.get('currency'), row.get('amount'))
+            key = (
+                row.get('currency', ''),
+                row.get('date', ''),
+                row.get('transactionID', ''),
+                desc,
+                row.get('amount', ''),
+                row.get('balance', ''),
+            )
         if key not in seen_fx_keys:
             seen_fx_keys.add(key)
             final_fx.append(row)
@@ -605,13 +614,24 @@ def parse_ibkr_xml(xml_file_path, output_dir):
         tree = ET.parse(xml_file_path)
         root = tree.getroot()
     except Exception as e:
-        print(f"Error parsing XML: {e}")
-        return
+        # NICHT schlucken: ein stiller return liesse calculate_tax auf leeren
+        # CSVs laufen und produzierte einen Null-Report (0,00 EUR ueberall) —
+        # in der GUI/stlite ohne sichtbare Fehlermeldung. Die Aufrufer
+        # (app.py, CLI) behandeln die Exception sichtbar.
+        raise ValueError(
+            f"XML-Datei konnte nicht geparst werden "
+            f"({os.path.basename(xml_file_path)}): {e}"
+        ) from e
 
     # Multi-account check: the parser only reads the first FlexStatement
     # (root.find(...) returns the first match). Warn loudly if the export
     # bundles several accounts — otherwise the rest are silently dropped.
     flex_statements = root.findall('.//FlexStatement')
+    if not flex_statements:
+        raise ValueError(
+            f"Kein FlexStatement in {os.path.basename(xml_file_path)} gefunden — "
+            f"ist das ein IBKR-Flex-Query-Export?"
+        )
     if len(flex_statements) > 1:
         acct_ids = [s.get('accountId', '?') for s in flex_statements]
         print(f"WARNUNG: XML enthaelt {len(flex_statements)} Konten ({', '.join(acct_ids)}). "

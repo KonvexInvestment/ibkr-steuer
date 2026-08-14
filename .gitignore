@@ -33,3 +33,16 @@ test_data/
 
 # Claude Code local config (agents, settings) — internal, stays local like CLAUDE.md
 .claude/
+
+# Lokale Arbeitsdokumente (Audits, Plaene, Referenzmaterial) — nie committen
+AUDIT_FINDINGS.md
+planfix.md
+PLAN_*.md
+golden_master.py
+analysis/
+Grundlage/
+logo.png
+
+# Interne Plan- und Review-Dokumente
+PLAN.md
+PLAN-REVIEW-LOG.md

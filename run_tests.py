@@ -45,6 +45,7 @@ SYNTHETIC_TESTS = [
     ("KAP-INV-Tageskurs-TFS", "tests/test_kap_inv_tageskurs.py"),
     ("KAP-INV-Put-ROC-Basis", "tests/test_kap_inv_put_roc_basis.py"),
     ("QYLD-und-Sonderprodukte", "tests/test_qyld_and_special_products.py"),
+    ("Produktklassifikation-und-ISIN-Evidenz", "tests/test_product_classification_evidence.py"),
     ("German-Dividend-Tax", "-m unittest tests/test_german_dividend_tax.py"),
     ("FX-Margin-Negative-Balance", "tests/test_fx_negative_balance.py"),
     ("Stillhalter-Row-Korrektur", "tests/test_stillhalter_row_correction.py"),
@@ -54,69 +55,36 @@ SYNTHETIC_TESTS = [
     ("Tageskurs-Korrektur-Maps", "tests/test_tageskurs_adjustment_maps.py"),
     ("Underlying-Symbol-Aliasse", "tests/test_underlying_symbol_matching.py"),
     ("Instrumentenkategorie-Routing", "tests/test_asset_category_routing.py"),
+    ("Merge-Completeness", "tests/test_merge_completeness.py"),
+    ("UI-Eintragungsuebersicht", "tests/test_ui_result_summary.py"),
+    ("UI-Model-Schicht", "tests/test_ui_model.py"),
+    ("App-Verhalten (AppTest)", "tests/test_app_ui.py"),
 ]
 
 
 def compute_user_facing(rd):
-    """Repliziert das GUI-final-Dict mit allen Default-Toggles aktiv (Tageskurs,
-    InvStG, Zuflussprinzip). Die Werte entsprechen dem, was der User sieht.
-    Logik gespiegelt aus app.py."""
-    from calculate_tax_report import (
-        get_kap_inv_tageskurs_delta_for_reporting,
-        get_kap_inv_wht_for_reporting,
+    """Duenner Adapter auf den GEMEINSAMEN Builder (ui_model.build_final_values).
+
+    GUI (app.py) und Tests nutzen exakt dieselbe Arithmetik; hier wird nur
+    noch auf die Feldnamen der audit_expectations gemappt. Getestet werden
+    die GUI-Default-Toggles (Tageskurs, InvStG, Zuflussprinzip aktiv je nach
+    Verfuegbarkeit; DBA-Beta und Variante B aus)."""
+    import ui_model
+
+    availability = ui_model.toggle_availability(rd)
+    toggles = ui_model.effective_toggles(
+        ui_model.default_toggles(), availability,
     )
-
-    pre_z19 = rd.get('zeile_19_netto_eur', 0)
-    pre_z20 = rd.get('zeile_20_stock_gains_eur', 0)
-    pre_z22 = rd.get('zeile_22_other_losses_eur', 0)
-    pre_z23 = rd.get('zeile_23_stock_losses_eur', 0)
-    z41 = rd.get('zeile_41_withholding_tax_eur', 0)
-
-    fx_corr_total = rd.get('fx_correction_total', 0)
-    fx_corr = rd.get('fx_correction_by_topf', {}) or {}
-    tk_gain = rd.get('fx_corr_gain_adj', {}) or {}
-    tk_loss = rd.get('fx_corr_loss_adj', {}) or {}
-    kap_inv = rd.get('kap_inv', {}) or {}
-    audit = rd.get('audit', {}) or {}
-    stillhalter_details = audit.get('stillhalter_details', []) or []
-
-    # Zuflussprinzip default-on, aber nur sichtbar wenn cross_year_details
-    # vorhanden. Die GUI zieht audit['cross_year_premium_eur']
-    # ab; genau diesen Wert verwenden wir hier, damit ein falsch aggregiertes
-    # Audit-Feld (z.B. prior_zufluss doppelt enthalten) im Test sichtbar wird.
-    cross_year_details = [d for d in stillhalter_details if d.get('is_cross_year')]
-    cross_year_premium = audit.get('cross_year_premium_eur', 0)
-    has_cross_year_details = bool(cross_year_details)
-    adj_cross = cross_year_premium if has_cross_year_details else 0
-
-    # Tageskurs-Toggle wird in der GUI nur gezeigt wenn |fx_corr_total| > 0.01
-    # Wenn nicht gezeigt → tageskurs_aktiv=False → keine
-    # Korrekturen anwenden. Verhindert dass sich aufhebende Topf1/Topf2-Korrekturen
-    # den Test-Vergleich verfaelschen.
-    tageskurs_aktiv = abs(fx_corr_total) > 0.01
-
-    # InvStG aktiv → KAP-INV bleibt separat, Z19-Korrektur nur fuer Topf1+Topf2.
-    z19 = pre_z19 - adj_cross
-    z20 = pre_z20
-    z22 = pre_z22
-    z23 = pre_z23
-    if tageskurs_aktiv:
-        z19 += fx_corr.get('Topf1', 0) + fx_corr.get('Topf2', 0)
-        z20 += tk_gain.get('Topf1', 0)
-        z22 -= tk_loss.get('Topf2', 0)
-        z23 -= tk_loss.get('Topf1', 0)
-    has_etf = bool(kap_inv.get('etf_by_isin'))
-    kap_inv_tageskurs = get_kap_inv_tageskurs_delta_for_reporting(rd) if (has_etf and tageskurs_aktiv) else 0
-    etf_net = (kap_inv.get('etf_net_taxable_eur', 0) + kap_inv_tageskurs) if has_etf else 0
+    final = ui_model.build_final_values(rd, toggles)
     return {
-        'zeile_19': z19,
-        'zeile_20': z20,
-        'zeile_22': z22,
-        'zeile_23': z23,
-        'zeile_41': z41,
-        'etf_net_taxable': etf_net,
-        'etf_wht': get_kap_inv_wht_for_reporting(kap_inv) if has_etf else 0,
-        'kap_inv_tageskurs': kap_inv_tageskurs,
+        'zeile_19': final['zeile_19'],
+        'zeile_20': final['zeile_20'],
+        'zeile_22': final['zeile_22'],
+        'zeile_23': final['zeile_23'],
+        'zeile_41': final['quellensteuer'],
+        'etf_net_taxable': final['etf_net_taxable'],
+        'etf_wht': final['etf_wht'],
+        'kap_inv_tageskurs': final['tageskurs_kapinv_corr'],
     }
 
 

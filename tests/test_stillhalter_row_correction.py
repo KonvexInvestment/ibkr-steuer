@@ -130,6 +130,9 @@ def test_split_bucket_routing():
     # no_invstg gilt unabhaengig davon, ob die ISIN im etf_isins-Set steht
     assert _split_stillhalter_correction(10.0, 5.0, 'no_invstg', True)[0] == 'no_invstg'
     assert _split_stillhalter_correction(10.0, 5.0, 'no_invstg', False)[0] == 'no_invstg'
+    assert _split_stillhalter_correction(
+        10.0, 5.0, 'personengesellschaft', True
+    )[0] == 'partnership'
     assert _split_stillhalter_correction(10.0, 5.0, None, False)[0] == 'stk'
     assert _split_stillhalter_correction(10.0, 5.0, 'anlage_so', False)[0] == 'stk'
     print("  OK  Split: Bucket-Routing (anlage_so/etf/no_invstg/stk)")

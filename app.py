@@ -1,268 +1,603 @@
+"""IBKR Steuerbericht — Streamlit-UI.
+
+Architektur (siehe PLAN.md, Revision 6):
+  Upload-Snapshot (SHA-256, validiert)
+    -> kontoweiser Compute-Snapshot (unveraenderlich, Cache-Protokoll)
+    -> reiner View-Model-Builder (ui_model.build_view_model)
+    -> genau ein aktiver Renderer (Sidebar-Navigation)
+
+Fachliche Eingaben (Toggles, Fondsbestaetigungen, Anlage-SO-Overrides) leben
+als Domain-State in st.session_state, genamespaced per dataset_id — Widgets
+tragen nur _ui_*-Keys und kopieren per Callback in den Domain-State, weil
+Streamlit den State nicht gerenderter Widgets am Run-Ende loescht.
+
+Die Datei laeuft unveraendert unter lokalem Streamlit UND stlite/Pyodide
+(index.html) — keine Fremdkomponenten, keine externen Fonts, kein Netz.
+"""
+
+import contextlib
 import copy
 import html
+import io
 import os
 import tempfile
+import time
+from collections import defaultdict
 from datetime import datetime as _dt
 
 import streamlit as st
 
 import extract_ibkr_data
 import calculate_tax_report
-from etf_classification import get_etf_info, is_anlage_so, get_classification
+import ui_model
+from etf_classification import (
+    classification_catalog_to_csv,
+    get_classification,
+    get_classification_catalog,
+    get_etf_info,
+    is_anlage_so,
+)
 
 st.set_page_config(
     page_title="IBKR Steuerbericht",
-    page_icon="🇩🇪",
-    layout="centered",
-    initial_sidebar_state="collapsed"
+    page_icon=None,
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
+
+# ── Designsystem ─────────────────────────────────────────────────────────────
+# Apple-Dark im Konvex-Stil, Werkzeug-Variante: neutrale Grautoene, genau ein
+# Akzentblau, semantische Statusfarben, System-Font-Stack (Offline-Paritaet
+# lokal/stlite). Signatur: die ELSTER-Formularzeile als Objekt (Zeilen-Chip,
+# gepunktete Fuehrungslinie, tabellarischer Betrag).
 
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+    :root {
+        --bg: #0c0e12;
+        --bg-raised: #10131a;
+        --card: #151924;
+        --card-soft: rgba(255,255,255,0.025);
+        --line: rgba(255,255,255,0.07);
+        --line-soft: rgba(255,255,255,0.045);
+        --accent: #7aa5f8;
+        --accent-dim: rgba(122,165,248,0.13);
+        --accent-border: rgba(122,165,248,0.28);
+        --ok: #3ecf8e;
+        --ok-dim: rgba(62,207,142,0.10);
+        --warn: #e8b04b;
+        --warn-dim: rgba(232,176,75,0.10);
+        --crit: #f0716c;
+        --crit-dim: rgba(240,113,108,0.10);
+        --ink: #eef1f6;
+        --ink-2: #9aa3b2;
+        --ink-3: #667082;
+        --radius-xs: 6px;
+        --radius-sm: 10px;
+        --radius: 12px;
+        --radius-lg: 16px;
+    }
 
     html, body, [class*="css"] {
-        font-family: 'Inter', sans-serif;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+                     "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     }
+    .stApp { background: var(--bg); color: var(--ink-2); }
+    .block-container { padding: 1.4rem 2rem 3.5rem 2rem; max-width: 1080px; }
+    #MainMenu, footer { visibility: hidden; }
+    /* The Streamlit header owns the control that reopens a collapsed sidebar. */
+    [data-testid="stHeader"] { background: transparent; }
+    [data-testid="stAppDeployButton"] { display: none; }
 
-    .stApp {
-        background: #0f1117;
-        color: #e2e8f0;
-    }
-
-    .block-container {
-        padding: 1.5rem 1rem 3rem 1rem;
-        max-width: 720px;
-    }
-
-    /* ── Header ── */
+    /* ── Typo-Rollen ── */
     .page-title {
-        font-size: clamp(1.5rem, 5vw, 2rem);
-        font-weight: 800;
-        color: #f1f5f9;
-        letter-spacing: -0.5px;
-        margin: 0 0 0.25rem 0;
+        color: var(--ink);
+        font-size: 1.45rem;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        margin: 0 0 0.15rem 0;
     }
-    .page-sub {
-        font-size: 0.9rem;
-        color: #64748b;
-        margin: 0 0 1.75rem 0;
-    }
-
-    /* ── Upload area ── */
-    [data-testid="stFileUploader"] {
-        background: rgba(255,255,255,0.03);
-        border: 1px dashed rgba(255,255,255,0.12);
-        border-radius: 14px;
-        padding: 0.5rem;
-    }
-
-    /* ── Hero card (Zeile 19) ── */
-    .hero-card {
-        background: linear-gradient(135deg, #1e3a5f 0%, #1a2d4a 100%);
-        border: 1px solid rgba(96,165,250,0.25);
-        border-radius: 18px;
-        padding: 1.75rem 1.5rem;
-        margin: 1.5rem 0;
-        text-align: center;
-    }
-    .hero-label {
-        font-size: 0.75rem;
-        font-weight: 600;
+    .page-sub { color: var(--ink-3); font-size: 0.85rem; margin: 0 0 1.5rem 0; }
+    .eyebrow {
+        color: var(--ink-3);
+        font-size: 0.68rem;
+        font-weight: 700;
+        letter-spacing: 0.09em;
         text-transform: uppercase;
-        letter-spacing: 1.5px;
-        color: #60a5fa;
-        margin-bottom: 0.5rem;
+        margin: 0 0 0.5rem 0;
     }
-    .hero-value {
-        font-size: clamp(2rem, 8vw, 3rem);
-        font-weight: 800;
-        letter-spacing: -1px;
-        word-break: break-word;
-    }
-    .hero-formula {
-        font-size: 0.8rem;
-        color: #64748b;
-        margin-top: 0.5rem;
-    }
-
-    /* ── Section headers ── */
     .section-title {
-        font-size: 0.85rem;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 2px;
-        color: #cbd5e1;
-        margin: 2rem 0 0.75rem 0;
-        padding-bottom: 0.5rem;
-        border-bottom: 1px solid rgba(255,255,255,0.06);
+        color: var(--ink);
+        font-size: 0.95rem;
+        font-weight: 650;
+        letter-spacing: -0.01em;
+        margin: 2rem 0 0.7rem 0;
+        padding-bottom: 0.45rem;
+        border-bottom: 1px solid var(--line-soft);
     }
+    .meta-row {
+        display: flex; flex-wrap: wrap; gap: 0.4rem 1.4rem;
+        color: var(--ink-3); font-size: 0.78rem; margin-bottom: 1.1rem;
+    }
+    .meta-row strong { color: var(--ink-2); font-weight: 600; }
 
-    /* ── Metric grid ── */
-    .metric-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-        gap: 0.75rem;
-        margin-bottom: 0.75rem;
+    /* ── Karten ── */
+    .card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-lg);
+        padding: 1.1rem 1.2rem;
+        margin-bottom: 1rem;
     }
-    .metric-card {
-        background: rgba(255,255,255,0.04);
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 12px;
-        padding: 1rem;
-        min-width: 0;
+    .card-title {
+        color: var(--ink); font-size: 1rem; font-weight: 650;
+        letter-spacing: -0.01em; margin-bottom: 0.15rem;
     }
-    .metric-card.gain  { border-color: rgba(74,222,128,0.2);  background: rgba(74,222,128,0.05); }
-    .metric-card.loss  { border-color: rgba(248,113,113,0.2); background: rgba(248,113,113,0.05); }
-    .metric-card.saldo { border-color: rgba(250,204,21,0.2);  background: rgba(250,204,21,0.04);  }
-    .metric-card.info  { border-color: rgba(148,163,184,0.15); }
+    .card-sub { color: var(--ink-3); font-size: 0.76rem; line-height: 1.5; }
 
-    .metric-label {
-        font-size: 0.78rem;
-        color: #94a3b8;
-        margin-bottom: 0.35rem;
-        font-weight: 500;
-    }
-    .metric-value {
-        font-size: clamp(1rem, 3.5vw, 1.35rem);
-        font-weight: 700;
-        word-break: break-word;
-        line-height: 1.2;
-    }
-    .metric-value.green  { color: #4ade80; }
-    .metric-value.red    { color: #f87171; }
-    .metric-value.yellow { color: #fbbf24; }
-    .metric-value.white  { color: #f1f5f9; }
-
-    /* ── Anlage KAP rows ── */
+    /* ── Formularzeilen (Signatur) ── */
     .kap-row {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 0.85rem 1rem;
-        border-radius: 10px;
-        margin-bottom: 0.5rem;
-        background: rgba(255,255,255,0.03);
-        border: 1px solid rgba(255,255,255,0.06);
-        gap: 1rem;
-        flex-wrap: wrap;
+        display: flex; align-items: baseline; gap: 0.7rem;
+        padding: 0.62rem 0.2rem;
+        border-bottom: 1px solid var(--line-soft);
     }
-    .kap-left {
-        display: flex;
-        align-items: center;
-        gap: 0.75rem;
-        flex: 1;
-        min-width: 0;
-    }
+    .kap-row:last-child { border-bottom: none; }
+    .kap-left { display: flex; align-items: baseline; gap: 0.7rem; min-width: 0; }
     .kap-badge {
-        font-size: 0.65rem;
-        font-weight: 700;
-        letter-spacing: 0.5px;
-        background: rgba(96,165,250,0.15);
-        color: #60a5fa;
-        border-radius: 6px;
-        padding: 0.2rem 0.45rem;
-        white-space: nowrap;
-        flex-shrink: 0;
+        font-size: 0.68rem; font-weight: 700;
+        font-variant-numeric: tabular-nums;
+        color: var(--accent);
+        background: var(--accent-dim);
+        border: 1px solid var(--accent-border);
+        border-radius: var(--radius-xs);
+        padding: 0.14rem 0.42rem;
+        white-space: nowrap; flex-shrink: 0;
     }
     .kap-desc {
-        font-size: 0.9rem;
-        color: #cbd5e1;
-        font-weight: 500;
-        word-break: break-word;
+        font-size: 0.86rem; color: var(--ink-2); font-weight: 500;
         min-width: 0;
     }
+    .kap-leader {
+        flex: 1; min-width: 1.2rem;
+        border-bottom: 1px dotted rgba(255,255,255,0.14);
+        transform: translateY(-0.28em);
+    }
     .kap-value {
-        font-size: clamp(0.95rem, 3vw, 1.15rem);
-        font-weight: 700;
-        text-align: right;
-        white-space: nowrap;
-        flex-shrink: 0;
+        font-size: 0.95rem; font-weight: 650;
+        font-variant-numeric: tabular-nums;
+        text-align: right; white-space: nowrap; flex-shrink: 0;
+    }
+    .kap-row.highlight .kap-desc { color: var(--ink); font-weight: 600; }
+    .kap-row.highlight .kap-value { font-size: 1.05rem; font-weight: 700; }
+    .kap-row.highlight .kap-badge {
+        background: var(--accent); color: #0c0e12; border-color: var(--accent);
     }
 
-    /* highlight row for Zeile 19 */
-    .kap-row.highlight {
-        background: rgba(96,165,250,0.08);
-        border-color: rgba(96,165,250,0.25);
+    /* ── Status-Chips ── */
+    .status-chip {
+        display: inline-flex; align-items: center; gap: 0.3rem;
+        border-radius: 999px;
+        padding: 0.24rem 0.6rem;
+        font-size: 0.68rem; font-weight: 700; white-space: nowrap;
+        border: 1px solid var(--line);
+        color: var(--ink-2); background: var(--card-soft);
     }
-    .kap-row.highlight .kap-badge {
-        background: rgba(96,165,250,0.3);
+    .status-chip.ok { color: var(--ok); border-color: rgba(62,207,142,0.3); background: var(--ok-dim); }
+    .status-chip.warning { color: var(--warn); border-color: rgba(232,176,75,0.3); background: var(--warn-dim); }
+    .status-chip.crit { color: var(--crit); border-color: rgba(240,113,108,0.3); background: var(--crit-dim); }
+    .kap-row-status { margin-left: 0.5rem; transform: translateY(-0.1em); }
+
+    /* ── Metric-Grid ── */
+    .metric-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 0.7rem; margin-bottom: 0.8rem;
     }
-    .kap-row.highlight .kap-desc {
-        color: #f1f5f9;
+    .metric-card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        padding: 0.85rem 1rem; min-width: 0;
+    }
+    .metric-label { font-size: 0.74rem; color: var(--ink-3); margin-bottom: 0.3rem; font-weight: 550; }
+    .metric-value {
+        font-size: clamp(0.95rem, 3vw, 1.2rem); font-weight: 650;
+        font-variant-numeric: tabular-nums;
+        word-break: break-word; line-height: 1.25;
+    }
+    .metric-value.green { color: var(--ok); }
+    .metric-value.red { color: var(--crit); }
+    .metric-value.white { color: var(--ink); }
+    .metric-card.saldo { border-color: var(--accent-border); background: var(--accent-dim); }
+    .metric-card.saldo .metric-label { color: var(--accent); }
+
+    /* ── Hinweis-System (drei Klassen, je EIN Stil) ── */
+    .notice {
+        border: 1px solid var(--line);
+        border-left: 3px solid var(--ink-3);
+        border-radius: 0 var(--radius) var(--radius) 0;
+        background: var(--card-soft);
+        padding: 0.8rem 1rem;
+        margin-bottom: 0.7rem;
+        font-size: 0.8rem; color: var(--ink-2); line-height: 1.55;
+    }
+    .notice-title { font-weight: 650; color: var(--ink); margin-bottom: 0.15rem; }
+    .notice.prueffall { border-left-color: var(--warn); }
+    .notice.prueffall .notice-title { color: var(--warn); }
+    .notice.kritisch { border-left-color: var(--crit); background: var(--crit-dim); }
+    .notice.kritisch .notice-title { color: var(--crit); }
+    .notice.transparenz { border-left-color: var(--accent); }
+    .notice.transparenz .notice-title { color: var(--accent); }
+    .notice.fehler { border-left-color: var(--crit); background: var(--crit-dim); }
+    .notice.fehler .notice-title { color: var(--crit); }
+    .notice-target { color: var(--ink-3); font-size: 0.72rem; margin-top: 0.3rem; }
+
+    /* ── Sidebar ── */
+    [data-testid="stSidebar"] {
+        background: var(--bg-raised);
+        border-right: 1px solid var(--line-soft);
+    }
+    [data-testid="stSidebar"][aria-expanded="true"] {
+        min-width: 300px !important; max-width: 300px !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stSidebarContent"] { padding-top: 0.9rem; }
+    .sidebar-brand {
+        color: var(--ink); font-size: 0.95rem; font-weight: 700;
+        letter-spacing: -0.01em; margin-bottom: 0.1rem;
+    }
+    .sidebar-brand-sub { color: var(--ink-3); font-size: 0.72rem; margin-bottom: 0.9rem; }
+    .data-card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        padding: 0.7rem 0.8rem; margin-bottom: 0.6rem;
+        font-size: 0.75rem; color: var(--ink-2); line-height: 1.5;
+    }
+    .data-card-title { color: var(--ink); font-weight: 650; font-size: 0.78rem; margin-bottom: 0.2rem; }
+    .data-card-files { color: var(--ink-3); font-size: 0.7rem; overflow-wrap: anywhere; }
+
+    /* Navigation (st.button-Liste im Container mit key="nav_buttons") */
+    .st-key-nav_buttons [data-testid="stButton"] { margin-bottom: 0.12rem; }
+    .st-key-nav_buttons [data-testid="stButton"] button {
+        border: 1px solid transparent;
+        justify-content: flex-start;
+        min-height: 2.2rem;
+        text-align: left;
+        font-size: 0.85rem;
+        color: var(--ink-2);
+        background: transparent;
+        border-radius: var(--radius-sm);
+        width: 100%;
+    }
+    .st-key-nav_buttons [data-testid="stButton"] button:hover {
+        background: var(--card-soft);
+        border-color: var(--line-soft);
+        color: var(--ink);
+    }
+    .st-key-nav_buttons [data-testid="stButton"] button[kind="primary"] {
+        background: var(--accent-dim);
+        border-color: var(--accent-border);
+        color: var(--ink);
         font-weight: 600;
     }
 
-    /* ── KAP-INV hero card (greenish) ── */
-    .hero-card-inv {
-        background: linear-gradient(135deg, #1a3a2f 0%, #1a2d2a 100%);
-        border: 1px solid rgba(74,222,128,0.25);
-        border-radius: 18px;
-        padding: 1.75rem 1.5rem;
-        margin: 1.5rem 0;
-        text-align: center;
+    /* ── Start-Screen ── */
+    .stApp:has(.start-title) .block-container {
+        max-width: 1080px;
+        padding-top: 7vh;
     }
-    .hero-card-inv .hero-label {
-        color: #4ade80;
+    .stApp:has(.start-title) {
+        background:
+            radial-gradient(circle at 18% 20%, rgba(122,165,248,0.10), transparent 28rem),
+            radial-gradient(circle at 82% 72%, rgba(62,207,142,0.045), transparent 24rem),
+            var(--bg);
     }
+    .start-title {
+        color: var(--ink); font-size: clamp(2rem, 4vw, 3.15rem);
+        font-weight: 750; line-height: 1.05; letter-spacing: -0.045em;
+        margin-bottom: 0.9rem; max-width: 20ch;
+    }
+    .start-sub {
+        color: var(--ink-2); font-size: 0.95rem; line-height: 1.65;
+        margin-bottom: 1.35rem; max-width: 34rem;
+    }
+    .start-trust {
+        display: flex; flex-wrap: wrap; gap: 0.45rem;
+        margin-bottom: 1.7rem;
+    }
+    .start-trust-chip {
+        display: inline-flex; align-items: center;
+        color: var(--ok); background: var(--ok-dim);
+        border: 1px solid rgba(62,207,142,0.25); border-radius: 999px;
+        padding: 0.28rem 0.62rem; font-size: 0.7rem; font-weight: 650;
+    }
+    /* Ablauf-Grafik: dieselbe Formular-Sprache wie die kap-row
+       (Zeilen-Badges, gepunktete Fuehrungslinien, tabellarische Werte). */
+    .start-visual { max-width: 33rem; margin-top: 1.1rem; }
+    .start-visual svg { width: 100%; height: auto; display: block; }
+    .start-visual text { font-family: inherit; }
+    .sv-card { fill: var(--card); stroke: var(--line); }
+    .sv-code { fill: rgba(255,255,255,0.10); }
+    .sv-glyph {
+        fill: var(--accent); font-size: 13px; font-weight: 650;
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+    .sv-flow {
+        stroke: var(--accent-border); stroke-width: 1.6;
+        stroke-dasharray: 5 7; fill: none;
+        animation: sv-flow 2.8s linear infinite;
+    }
+    .sv-arrow { fill: var(--accent-border); }
+    .sv-check {
+        stroke: var(--ok); stroke-width: 3; fill: none;
+        stroke-linecap: round; stroke-linejoin: round;
+    }
+    .sv-badge { fill: var(--accent-dim); stroke: var(--accent-border); }
+    .sv-badge.fill { fill: var(--accent); stroke: var(--accent); }
+    .sv-badge-text { fill: var(--accent); font-size: 9.5px; font-weight: 700; }
+    .sv-badge-text.fill { fill: var(--bg); }
+    .sv-leader {
+        stroke: rgba(255,255,255,0.14); stroke-width: 1.4;
+        stroke-dasharray: 1.5 3.6;
+    }
+    .sv-value {
+        fill: var(--ink); font-size: 10.5px; font-weight: 650;
+        font-variant-numeric: tabular-nums;
+    }
+    .sv-label { fill: var(--ink-2); font-size: 12.5px; font-weight: 600; }
+    .sv-label tspan { fill: var(--accent); font-weight: 700; }
+    @keyframes sv-flow { to { stroke-dashoffset: -24; } }
+    @media (prefers-reduced-motion: reduce) {
+        .sv-flow { animation: none; }
+    }
+    .st-key-start_upload_card {
+        background: rgba(21,25,36,0.92);
+        border: 1px solid rgba(122,165,248,0.18);
+        border-radius: var(--radius-lg); padding: 1.15rem 1.2rem 1rem 1.2rem;
+        box-shadow: 0 24px 70px rgba(0,0,0,0.24);
+    }
+    .start-upload-kicker {
+        color: var(--accent); font-size: 0.68rem; font-weight: 700;
+        letter-spacing: 0.08em; text-transform: uppercase;
+        margin-bottom: 0.3rem;
+    }
+    .start-upload-title {
+        color: var(--ink); font-size: 1.12rem; font-weight: 700;
+        letter-spacing: -0.02em; margin-bottom: 0.25rem;
+    }
+    .start-upload-copy {
+        color: var(--ink-3); font-size: 0.76rem; line-height: 1.5;
+        margin-bottom: 0.8rem;
+    }
+    .stApp:has(.start-title) [data-testid="stFileUploader"] {
+        background: rgba(122,165,248,0.055);
+        border-color: rgba(122,165,248,0.28);
+        transition: border-color 160ms ease, background 160ms ease,
+                    transform 160ms ease;
+    }
+    .stApp:has(.start-title) [data-testid="stFileUploader"]:hover {
+        border-color: rgba(122,165,248,0.55);
+        background: rgba(122,165,248,0.09);
+        transform: translateY(-1px);
+    }
+    .start-foot {
+        color: var(--ink-3); background: var(--card-soft);
+        border: 1px solid var(--line-soft); border-left: 3px solid var(--warn);
+        border-radius: 0 var(--radius) var(--radius) 0; padding: 0.65rem 0.8rem;
+        font-size: 0.7rem; line-height: 1.5; margin-top: 1.35rem;
+        text-align: left;
+    }
+    .start-foot strong { color: var(--ink-2); font-weight: 700; }
 
-    /* ── Anlage SO hero card (amber) ── */
-    .hero-card-so {
-        background: linear-gradient(135deg, #3a2f1a 0%, #2d2a1a 100%);
-        border: 1px solid rgba(251,191,36,0.25);
-        border-radius: 18px;
-        padding: 1.75rem 1.5rem;
-        margin: 1.5rem 0;
-        text-align: center;
+    /* ── Streamlit-Widgets angleichen ── */
+    [data-testid="stFileUploader"] {
+        background: var(--card-soft);
+        border: 1px dashed rgba(255,255,255,0.14);
+        border-radius: var(--radius-lg);
+        padding: 0.4rem;
     }
-    .hero-card-so .hero-label {
-        color: #fbbf24;
+    [data-testid="stFileUploaderDropzoneInstructions"],
+    [data-testid="stFileUploaderDropzoneInstructions"] * { font-size: 0 !important; }
+    [data-testid="stFileUploaderDropzoneInstructions"] svg { height: 2.2rem; width: 2.2rem; }
+    [data-testid="stFileUploaderDropzoneInstructions"]::after {
+        content: "Dateien hierher ziehen";
+        font-size: 0.85rem; color: var(--ink-2);
     }
-
-    /* ── Audit expander ── */
+    [data-testid="stFileUploaderDropzone"] button { font-size: 0 !important; }
+    [data-testid="stFileUploaderDropzone"] button::after {
+        content: "Dateien auswählen"; font-size: 0.85rem;
+    }
     [data-testid="stExpander"] {
-        border: 1px solid rgba(255,255,255,0.07) !important;
-        border-radius: 10px !important;
-        background: rgba(255,255,255,0.02) !important;
+        border: 1px solid var(--line-soft) !important;
+        border-radius: var(--radius) !important;
+        background: var(--card-soft) !important;
     }
-
-    /* ── Download button ── */
+    /* Streamlit-Alerts ins Designsystem einpassen (ein Stil pro Klasse) */
+    [data-testid="stAlert"] {
+        border-radius: 0 var(--radius) var(--radius) 0;
+        border: 1px solid var(--line);
+        font-size: 0.82rem;
+        overflow: hidden;
+    }
+    /* Streamlits Default-Alert-Flaeche neutralisieren; die Farbe kommt
+       ausschliesslich aus den :has()-Regeln unten (ein Stil pro Klasse). */
+    [data-testid="stAlert"] > div,
+    [data-testid="stAlertContainer"] { background: transparent !important; }
+    [data-testid="stAlertContentWarning"] { color: var(--ink-2); }
+    [data-testid="stAlertContentInfo"] { color: var(--ink-2); }
+    [data-testid="stAlertContentSuccess"] { color: var(--ink-2); }
+    [data-testid="stAlertContentError"] { color: var(--ink-2); }
+    div[data-testid="stAlert"]:has([data-testid="stAlertContentWarning"]) {
+        background: var(--warn-dim); border-left: 3px solid var(--warn);
+    }
+    div[data-testid="stAlert"]:has([data-testid="stAlertContentInfo"]) {
+        background: var(--accent-dim); border-left: 3px solid var(--accent);
+    }
+    div[data-testid="stAlert"]:has([data-testid="stAlertContentSuccess"]) {
+        background: var(--ok-dim); border-left: 3px solid var(--ok);
+    }
+    div[data-testid="stAlert"]:has([data-testid="stAlertContentError"]) {
+        background: var(--crit-dim); border-left: 3px solid var(--crit);
+    }
     [data-testid="stDownloadButton"] > button {
         width: 100%;
-        background: rgba(96,165,250,0.1);
-        border: 1px solid rgba(96,165,250,0.3);
-        color: #60a5fa;
-        border-radius: 10px;
-        font-weight: 600;
-        padding: 0.6rem;
-        transition: background 0.2s;
+        background: var(--accent-dim);
+        border: 1px solid var(--accent-border);
+        color: var(--accent);
+        border-radius: var(--radius-sm); font-weight: 600; padding: 0.6rem;
     }
-    [data-testid="stDownloadButton"] > button:hover {
-        background: rgba(96,165,250,0.2);
+    [data-testid="stDownloadButton"] > button:hover { background: rgba(122,165,248,0.22); }
+    /* Sekundaere Buttons (ausserhalb der Navigation) in die Karten-Sprache */
+    [data-testid="stButton"] button[kind="secondary"] {
+        background: var(--card-soft);
+        border: 1px solid var(--line);
+        color: var(--ink-2);
+        border-radius: var(--radius-sm);
+        font-size: 0.83rem; font-weight: 600;
     }
-
-    /* ── Widget labels (checkbox, selectbox) readable ── */
+    [data-testid="stButton"] button[kind="secondary"]:hover {
+        border-color: var(--accent-border);
+        color: var(--ink);
+        background: var(--card);
+    }
     [data-testid="stCheckbox"] label p,
     [data-testid="stSelectbox"] label p,
-    .stSelectbox label, .stCheckbox label {
-        color: #cbd5e1 !important;
+    [data-testid="stMultiSelect"] label p,
+    .stSelectbox label, .stCheckbox label { color: var(--ink-2) !important; }
+    /* Select-/Multiselect-Flaechen in die Karten-Sprache */
+    [data-baseweb="select"] > div {
+        background: var(--card);
+        border-color: var(--line);
+    }
+    [data-testid="stTabs"] [data-baseweb="tab"] { color: var(--ink-2); }
+    [data-testid="stTabs"] [aria-selected="true"] { color: var(--ink); }
+
+    /* ── Tabellen (Markdown) in der Formular-Sprache ── */
+    [data-testid="stMarkdownContainer"] table {
+        border-collapse: collapse;
+        font-size: 0.8rem;
+        margin: 0.3rem 0 0.9rem 0;
+    }
+    [data-testid="stMarkdownContainer"] table th {
+        color: var(--ink-3);
+        font-size: 0.66rem; font-weight: 700;
+        letter-spacing: 0.07em; text-transform: uppercase;
+        text-align: left;
+        border: none; border-bottom: 1px solid var(--line);
+        padding: 0.35rem 0.85rem 0.35rem 0;
+        background: transparent;
+    }
+    [data-testid="stMarkdownContainer"] table td {
+        color: var(--ink-2);
+        font-variant-numeric: tabular-nums;
+        border: none; border-bottom: 1px solid var(--line-soft);
+        padding: 0.42rem 0.85rem 0.42rem 0;
+        background: transparent;
+    }
+    [data-testid="stMarkdownContainer"] table tr:last-child td { border-bottom: none; }
+    [data-testid="stMarkdownContainer"] table tbody tr:hover td { background: var(--card-soft); }
+    [data-testid="stMarkdownContainer"] table td strong,
+    [data-testid="stMarkdownContainer"] table th strong { color: var(--ink); }
+
+    /* ── Dataframes einrahmen ── */
+    [data-testid="stDataFrame"] {
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        overflow: hidden;
     }
 
-    /* hide streamlit branding */
-    #MainMenu, footer { visibility: hidden; }
+    /* ── Markdown-Header in die Typo-Hierarchie einpassen ── */
+    [data-testid="stMarkdownContainer"] h3 {
+        color: var(--ink);
+        font-size: 1rem; font-weight: 650;
+        letter-spacing: -0.01em;
+        margin: 1.2rem 0 0.4rem 0; padding: 0;
+    }
+    [data-testid="stMarkdownContainer"] h4 {
+        color: var(--ink-2);
+        font-size: 0.86rem; font-weight: 650;
+        margin: 0.9rem 0 0.3rem 0; padding: 0;
+    }
+    [data-testid="stTabs"] [data-baseweb="tab-highlight"] {
+        background-color: var(--accent);
+    }
+
+    /* ── Doku-Fliesstext in Expandern ── */
+    [data-testid="stExpander"] [data-testid="stMarkdownContainer"] p,
+    [data-testid="stExpander"] [data-testid="stMarkdownContainer"] li {
+        font-size: 0.82rem; color: var(--ink-2); line-height: 1.6;
+    }
+    [data-testid="stExpander"] [data-testid="stMarkdownContainer"] code {
+        background: var(--card-soft);
+        border: 1px solid var(--line-soft);
+        border-radius: var(--radius-xs);
+        padding: 0.05rem 0.3rem;
+        font-size: 0.74rem;
+    }
+
+    .badge-beta {
+        display: inline-block;
+        border: 1px solid var(--warn);
+        color: var(--warn);
+        border-radius: 6px;
+        font-size: 0.66rem; font-weight: 700; letter-spacing: 0.06em;
+        padding: 0.12rem 0.45rem;
+        text-transform: uppercase;
+    }
+
+    @media (max-width: 900px) {
+        [data-testid="stSidebar"][aria-expanded="true"] {
+            min-width: 252px !important;
+            max-width: 252px !important;
+        }
+        .block-container { padding-left: 1rem; padding-right: 1rem; }
+        [data-testid="stMarkdownContainer"] {
+            max-width: 100%;
+            overflow-x: auto;
+        }
+        [data-testid="stMarkdownContainer"] table {
+            font-size: 0.76rem;
+        }
+        [data-testid="stMarkdownContainer"] table:not(:has(tr > :nth-child(5))) {
+            width: 100%;
+            min-width: 100%;
+        }
+        [data-testid="stMarkdownContainer"] table:has(tr > :nth-child(5)) {
+            min-width: max-content;
+        }
+        [data-testid="stMarkdownContainer"] th { white-space: normal; }
+        [data-testid="stMarkdownContainer"] th,
+        [data-testid="stMarkdownContainer"] td {
+            padding: 0.4rem 0.55rem;
+        }
+    }
+
+    @media (max-width: 640px) {
+        .block-container { padding: 1rem 0.8rem 2rem 0.8rem; }
+        .kap-row { flex-wrap: wrap; }
+        .kap-leader { display: none; }
+        .kap-value { margin-left: auto; }
+        .stApp:has(.start-title) .block-container { padding-top: 2.5vh; }
+        .start-title { font-size: 2.15rem; max-width: none; }
+        .start-sub { font-size: 0.88rem; }
+        .start-visual { max-width: none; margin-bottom: 0.8rem; }
+        .st-key-start_upload_card { padding: 1rem; }
+    }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Format- und Baustein-Helper ──────────────────────────────────────────────
 
 def fmt(value: float, decimals: int = 2) -> str:
     s = f"{value:,.{decimals}f}"
     return s.replace(',', 'X').replace('.', ',').replace('X', '.') + " €"
 
+
 def fmt_de(value: float, decimals: int = 2) -> str:
     s = f"{value:,.{decimals}f}"
     return s.replace(',', 'X').replace('.', ',').replace('X', '.')
+
 
 def color_class(value: float) -> str:
     if value > 0:
@@ -271,57 +606,235 @@ def color_class(value: float) -> str:
         return "red"
     return "white"
 
+
+def esc(value) -> str:
+    return html.escape(str(value))
+
+
+def section_title(text: str):
+    st.markdown(f'<div class="section-title">{esc(text)}</div>',
+                unsafe_allow_html=True)
+
+
+def eyebrow(text: str):
+    st.markdown(f'<div class="eyebrow">{esc(text)}</div>',
+                unsafe_allow_html=True)
+
+
 def metric_card(label: str, value: float, variant: str = "auto") -> str:
     """variant: auto | gain | loss | saldo | info"""
     if variant == "auto":
         variant = "gain" if value > 0 else ("loss" if value < 0 else "info")
-    val_color = color_class(value)
-    return f"""
-    <div class="metric-card {variant}">
-        <div class="metric-label">{label}</div>
-        <div class="metric-value {val_color}">{fmt(value)}</div>
-    </div>"""
+    # Informations-/Kontrollwerte bleiben neutral: eine negative Korrektur ist
+    # kein Fehlerzustand. Gruen/Rot nur fuer echte Gewinn-/Verlustkarten.
+    val_color = "white" if variant in ("info", "saldo") else color_class(value)
+    css_variant = "saldo" if variant == "saldo" else ""
+    return (
+        f'<div class="metric-card {css_variant}">'
+        f'<div class="metric-label">{esc(label)}</div>'
+        f'<div class="metric-value {val_color}">{fmt(value)}</div>'
+        f'</div>'
+    )
+
+
+def metric_grid(*cards) -> str:
+    return '<div class="metric-grid">' + ''.join(c for c in cards if c) + '</div>'
+
 
 def kap_row(zeile: str, label: str, value: float, highlight: bool = False,
-            force_positive: bool = False) -> str:
+            force_positive: bool = False, status: str = "",
+            status_tone: str = "ok") -> str:
+    """Eine Formularzeile: Zeilen-Chip, Label, Fuehrungslinie, Betrag."""
     display_val = abs(value) if force_positive else value
-    val_color = "white" if force_positive else color_class(value)
     hl = "highlight" if highlight else ""
-    return f"""
-    <div class="kap-row {hl}">
-        <div class="kap-left">
-            <span class="kap-badge">{zeile}</span>
-            <span class="kap-desc">{label}</span>
-        </div>
-        <span class="kap-value" style="color: var(--color-{val_color}, #f1f5f9)">{fmt(display_val)}</span>
-    </div>"""
+    status_html = ""
+    if status:
+        safe_tone = status_tone if status_tone in {"ok", "warning", "crit"} else ""
+        status_html = (
+            f'<span class="status-chip {safe_tone} kap-row-status">'
+            f'{esc(status)}</span>'
+        )
+    # Ein zusammenhaengendes HTML-Fragment: eine Leerzeile in rohem HTML laesst
+    # Streamlits Markdown-Renderer die Folge-Tags als Text anzeigen.
+    return (
+        f'<div class="kap-row {hl}">'
+        f'<div class="kap-left">'
+        f'<span class="kap-badge">{esc(zeile)}</span>'
+        f'<span class="kap-desc">{esc(label)}</span>'
+        f'{status_html}'
+        f'</div>'
+        f'<span class="kap-leader"></span>'
+        f'<span class="kap-value" style="color:#eef1f6">{fmt(display_val)}</span>'
+        f'</div>'
+    )
 
-def section_title(text: str):
-    st.markdown(f'<div class="section-title">{text}</div>', unsafe_allow_html=True)
+
+def notice_html(notice: dict, show_target: bool = True) -> str:
+    """Einheitliche Darstellung eines Hinweises aus ui_model.collect_notices."""
+    cls = notice.get('class', 'transparenz')
+    severity = notice.get('severity', 'normal')
+    css = cls if cls in ('prueffall', 'transparenz', 'fehler') else 'transparenz'
+    if cls == 'prueffall' and severity == 'kritisch':
+        css += ' kritisch'
+    target_html = ''
+    if show_target and notice.get('target'):
+        target_label = ui_model.page_label(notice['target'])
+        target_html = (
+            f'<div class="notice-target">Bereich: {esc(target_label)}</div>'
+        )
+    return (
+        f'<div class="notice {css}">'
+        f'<div class="notice-title">{esc(notice.get("title", ""))}</div>'
+        f'{esc(notice.get("body", ""))}'
+        f'{target_html}'
+        f'</div>'
+    )
+
+
+def render_notices(notices, show_target: bool = True):
+    for notice in notices:
+        st.markdown(notice_html(notice, show_target=show_target),
+                    unsafe_allow_html=True)
+
+
+def build_tax_result_summary_html(
+        steuerjahr: int,
+        final: dict,
+        kap_inv_lines=None,
+        kap_inv_enabled: bool = False,
+        kap_status: str = "Berechnet",
+        kap_status_tone: str = "ok",
+        kap_inv_status: str = "",
+        kap_inv_status_tone: str = "ok",
+        review_items=None,
+        so_rows=None) -> str:
+    """Formularzentrierte Eintragungsuebersicht — keine Zeile faellt weg."""
+    kap_inv_lines = list(kap_inv_lines or [])
+    review_items = list(review_items or [])
+    so_rows = list(so_rows or [])
+
+    status_html = (
+        f'<span class="status-chip {kap_status_tone}">KAP · '
+        f'{html.escape(kap_status)}</span>'
+    )
+    if kap_inv_enabled:
+        status_html += (
+            f'<span class="status-chip {kap_inv_status_tone}">KAP-INV · '
+            f'{html.escape(kap_inv_status or "Berechnet")}</span>'
+        )
+
+    rows_html = '<div class="eyebrow" style="margin-top:0.4rem;">Anlage KAP</div>'
+    if abs(final.get('zeile_7', 0)) > 0.01:
+        rows_html += (
+            kap_row("Z. 7", "Kapitalerträge mit inländischem Steuerabzug",
+                    final['zeile_7'], highlight=True)
+            + kap_row("Z. 37", "Kapitalertragsteuer", final['zeile_37'])
+            + kap_row("Z. 38", "Solidaritätszuschlag", final['zeile_38'])
+        )
+    rows_html += (
+        kap_row("Z. 19", "Ausländische Kapitalerträge (Netto)",
+                final['zeile_19'], highlight=True)
+        + kap_row("Z. 20", "Davon: Aktiengewinne", final['zeile_20'])
+        + kap_row("Z. 22", "Verluste ohne Aktien", final['zeile_22'],
+                  force_positive=True)
+        + kap_row("Z. 23", "Aktienverluste", final['zeile_23'],
+                  force_positive=True)
+        + kap_row("Z. 41", "Anrechenbare ausländische Quellensteuer",
+                  final['quellensteuer'])
+    )
+
+    if kap_inv_enabled:
+        rows_html += (
+            '<div class="eyebrow" style="margin-top:1.1rem;">Anlage KAP-INV</div>'
+        )
+        if kap_inv_lines:
+            for line in kap_inv_lines:
+                is_sale = line.get('kind') == 'sale'
+                kind_label = (
+                    "Ausschüttungen" if not is_sale
+                    else "Veräußerungsergebnis vor Abzug von Vorabpauschalen"
+                )
+                rows_html += kap_row(
+                    f"Z. {line['line']}",
+                    f"{kind_label} · {line['fund_type']} (vor TFS)",
+                    line['amount_raw_eur'],
+                    highlight=True,
+                    status="vorläufig" if is_sale else "berechnet",
+                    status_tone="warning" if is_sale else "ok",
+                )
+        else:
+            rows_html += (
+                '<div class="card-sub">Keine KAP-INV-Formularzeile erzeugt. '
+                'Offene Produktzuordnungen stehen bei den Prüffällen.</div>'
+            )
+
+    if so_rows:
+        rows_html += (
+            '<div class="eyebrow" style="margin-top:1.1rem;">Anlage SO (§23 EStG)</div>'
+        )
+        for row in so_rows:
+            rows_html += kap_row(
+                row['line'], row['label'], row['value'],
+                highlight=row.get('highlight', False),
+            )
+
+    review_html = ""
+    if review_items:
+        items = "".join(
+            f"<li>{html.escape(str(item))}</li>" for item in review_items
+        )
+        review_html = (
+            '<div class="notice prueffall" style="margin-top:0.9rem;">'
+            '<div class="notice-title">Noch zu prüfen</div>'
+            f'<ul style="margin:0.3rem 0 0 1.1rem;padding:0;">{items}</ul></div>'
+        )
+
+    return f"""
+    <div class="card">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:0.75rem;flex-wrap:wrap;margin-bottom:0.6rem;">
+            <div>
+                <div class="card-title">Eintragungsübersicht {steuerjahr}</div>
+                <div class="card-sub">Die Formularwerte zum Übertragen; Rechenwege und Nachweise stehen in den Bereichen links.</div>
+            </div>
+            <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">{status_html}</div>
+        </div>
+        {rows_html}
+        {review_html}
+    </div>
+    """
 
 def classify_xmls(xml_files):
     """Parse XMLs to extract accountId and date range, group by account.
-    Returns dict: accountId -> sorted list of {file, from_date, to_date, name, account_name, currency}
-    Latest XML per account = tax year, older = history."""
+    Returns accounts, multi-statement files and invalid XML diagnostics.
+
+    Latest XML per account = tax year, older = history.  Every selected file
+    must be an IBKR Flex export; callers fail closed when a file is invalid or
+    bundles several FlexStatements, because either case would otherwise create
+    a plausible-looking partial tax report.
+    """
     import xml.etree.ElementTree as ET
     accounts = {}
     multi_stmt_files = []
+    invalid_files = []
     for xml_file in xml_files:
         try:
             content = xml_file.getvalue()
             root = ET.fromstring(content)
-            stmt = root.find('.//FlexStatement')
-            acct = root.find('.//AccountInformation')
-            if stmt is None:
-                continue
-            # Only the first FlexStatement is processed downstream — flag
-            # exports that bundle several accounts so the user is warned.
             all_stmts = root.findall('.//FlexStatement')
+            if not all_stmts:
+                invalid_files.append({
+                    'name': xml_file.name,
+                    'reason': 'kein FlexStatement gefunden',
+                })
+                continue
             if len(all_stmts) > 1:
                 multi_stmt_files.append({
                     'name': xml_file.name,
                     'account_ids': [s.get('accountId', '?') for s in all_stmts],
                 })
+                continue
+            stmt = all_stmts[0]
+            acct = stmt.find('.//AccountInformation')
             account_id = stmt.get('accountId', 'unknown')
             entry = {
                 'file': xml_file,
@@ -332,10 +845,10 @@ def classify_xmls(xml_files):
                 'currency': acct.get('currency', 'EUR') if acct is not None else 'EUR',
             }
             accounts.setdefault(account_id, []).append(entry)
-        except Exception:
-            accounts.setdefault('unknown', []).append({
-                'file': xml_file, 'from_date': '', 'to_date': '',
-                'name': xml_file.name, 'account_name': '', 'currency': 'EUR',
+        except Exception as exc:
+            invalid_files.append({
+                'name': xml_file.name,
+                'reason': f'XML nicht lesbar: {exc}',
             })
     # Sort each account's XMLs by to_date (latest = tax year)
     for account_id in accounts:
@@ -353,7 +866,7 @@ def classify_xmls(xml_files):
             if len(years) == 1:
                 for x in xmls:
                     x['is_quarterly'] = True
-    return accounts, multi_stmt_files
+    return accounts, multi_stmt_files, invalid_files
 
 def merge_report_data(reports):
     """Merge multiple report_data dicts (one per account) by summing numeric fields."""
@@ -577,6 +1090,29 @@ def merge_report_data(reports):
                 existing['wht'] = existing.get('wht', 0) + data.get('wht', 0)
     merged['no_invstg_income_by_isin'] = merged_no_invstg_income
 
+    # Auslaendische Personengesellschaften: nur beobachtete Brokerwerte
+    # zusammenfuehren. Sie bleiben aus allen Steuerzeilen ausgeschlossen, bis
+    # die fehlende Jahresallokation (K-1/K-3) vorliegt.
+    merged_partnership_items = {}
+    partnership_numeric_fields = (
+        'observed_trade_pnl_eur', 'observed_distributions_eur',
+        'observed_withholding_tax_eur', 'observed_other_cash_eur',
+        'observed_tageskurs_delta_eur', 'observed_transactions',
+    )
+    for r in reports:
+        for isin, data in (r.get('partnership_tax_items') or {}).items():
+            if isin not in merged_partnership_items:
+                merged_partnership_items[isin] = copy.deepcopy(data)
+                continue
+            existing = merged_partnership_items[isin]
+            for field in partnership_numeric_fields:
+                existing[field] = existing.get(field, 0) + data.get(field, 0)
+            for field in ('required_documents', 'sources'):
+                existing[field] = list(dict.fromkeys(
+                    list(existing.get(field) or []) + list(data.get(field) or [])
+                ))
+    merged['partnership_tax_items'] = merged_partnership_items
+
     # Anlage SO merge
     merged_so = {
         'total_gain': 0, 'total_loss': 0,
@@ -634,6 +1170,7 @@ def merge_report_data(reports):
         'cross_year_put_total': sum(r.get('audit', {}).get('cross_year_put_total', 0) for r in reports),
         'no_invstg_gain': sum(r.get('audit', {}).get('no_invstg_gain', 0) for r in reports),
         'no_invstg_loss': sum(r.get('audit', {}).get('no_invstg_loss', 0) for r in reports),
+        'partnership_tax_items_count': len(merged_partnership_items),
         'zufluss_premium_eur': sum(r.get('audit', {}).get('zufluss_premium_eur', 0) for r in reports),
         'zufluss_count': sum(r.get('audit', {}).get('zufluss_count', 0) for r in reports),
         'zufluss_details': [],
@@ -652,6 +1189,10 @@ def merge_report_data(reports):
         'cfd_financing_cost_eur': sum(r.get('audit', {}).get('cfd_financing_cost_eur', 0) for r in reports),
         'fee_by_activity_code': {},
         'unhandled_activity_codes': [],
+        'fx_rate_parse_failures': {
+            'funds': sum(r.get('audit', {}).get('fx_rate_parse_failures', {}).get('funds', 0) for r in reports),
+            'trades': sum(r.get('audit', {}).get('fx_rate_parse_failures', {}).get('trades', 0) for r in reports),
+        },
     }
     _fees_by_code = {}
     _unhandled_by_code = {}
@@ -719,990 +1260,1388 @@ def merge_report_data(reports):
         merged['trade_details'].extend(r.get('trade_details', []))
     merged['trade_details'].sort(key=lambda r: r.get('dateTime', '') or r.get('reportDate', '') or 'zzzz')
 
+    # Aufschluesselung Topf 2 (Label -> gain/loss): per Kategorie summieren.
+    # Ohne diese Regel fiel das Feld beim Multi-Account-Merge still heraus und
+    # der Expander "Aufschluesselung Topf 2" verschwand komplett.
+    merged_topf2_cats = {}
+    for r in reports:
+        for label, vals in (r.get('topf2_by_category') or {}).items():
+            entry = merged_topf2_cats.setdefault(label, {'gain': 0.0, 'loss': 0.0})
+            entry['gain'] += vals.get('gain', 0.0)
+            entry['loss'] += vals.get('loss', 0.0)
+    merged['topf2_by_category'] = merged_topf2_cats
+
     return merged
 
-# inline color vars for kap_row values
-COLOR_VARS = """
-<style>
-    :root {
-        --color-green: #4ade80;
-        --color-red:   #f87171;
-        --color-white: #f1f5f9;
-    }
+def render_classification_catalog(
+        catalog_rows, key_prefix, show_filters=True, offer_download=False):
+    """Render the shared product-classification transparency view."""
+    catalog_rows = list(catalog_rows)
+    filtered_rows = catalog_rows
 
-    /* Translate Streamlit file uploader to German */
-    [data-testid="stFileUploaderDropzoneInstructions"] {
-        font-size: 0 !important;
-    }
-    [data-testid="stFileUploaderDropzoneInstructions"] svg {
-        height: 2.5rem;
-        width: 2.5rem;
-    }
-    [data-testid="stFileUploaderDropzoneInstructions"]::after {
-        content: "Datei hierher ziehen";
-        font-size: 0.875rem;
-        color: #e2e8f0;
-    }
-    [data-testid="stFileUploaderDropzone"] button {
-        font-size: 0 !important;
-    }
-    [data-testid="stFileUploaderDropzone"] button::after {
-        content: "Datei auswählen";
-        font-size: 0.875rem;
-    }
-</style>"""
-
-
-# ── Page ─────────────────────────────────────────────────────────────────────
-
-st.markdown(COLOR_VARS, unsafe_allow_html=True)
-st.markdown('<p class="page-title">🇩🇪 IBKR Steuerbericht</p>', unsafe_allow_html=True)
-st.markdown('<p class="page-sub">Anlage KAP · Interactive Brokers Flex Query</p>', unsafe_allow_html=True)
-
-st.markdown("""
-<div style="background: rgba(251,191,36,0.06); border: 1px solid rgba(251,191,36,0.2); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 0.5rem; font-size: 0.78rem; color: #94a3b8; line-height: 1.6;">
-    <strong style="color: #fbbf24;">Wichtiger Hinweis:</strong> Dieses Tool dient ausschließlich als Hilfsmittel zur Aufbereitung von IBKR-Daten für die deutsche Steuererklärung. Es ersetzt keine steuerliche Beratung durch einen Steuerberater oder Wirtschaftsprüfer. Die Ergebnisse sind ohne Gewähr; eine Haftung für die Richtigkeit, Vollständigkeit oder Aktualität der berechneten Werte wird nicht übernommen. Insbesondere bei komplexen Sachverhalten (z.B. Verlustvorträge, Teilfreistellungen, gewerblicher Handel) sollte fachkundiger Rat eingeholt werden.<br><br>
-    <strong style="color: #60a5fa;">Datenschutz:</strong> Alle Berechnungen erfolgen ausschließlich lokal. Es werden keine Daten an Server übertragen, gespeichert oder an Dritte weitergegeben.
-</div>
-""", unsafe_allow_html=True)
-
-st.markdown("""
-<div style="background: rgba(59,130,246,0.08); border-left: 3px solid #3b82f6; border-radius: 8px; padding: 0.8rem 1rem; margin-bottom: 0.5rem; font-size: 0.82rem; color: #cbd5e1; line-height: 1.6;">
-    <strong style="color: #60a5fa; font-size: 0.9rem;">1. Flex Query XMLs hochladen (Pflicht)</strong><br>
-    Alle IBKR Flex Query XMLs auf einmal hochladen: Steuerjahr und ggf. Vorjahre, auch von mehreren Konten.
-    Die Konten werden automatisch anhand der Konto-ID erkannt und Vorjahre korrekt zugeordnet.<br>
-    <span style="color: #94a3b8; font-size: 0.78rem;">
-    <strong>Mehrere Konten:</strong> Jedes Konto wird separat berechnet (eigene Trades, FX, Stillhalter). Die Ergebnisse werden addiert.
-    Alle Konten müssen dieselbe Basiswährung (EUR oder USD) haben.<br>
-    <strong>Vorjahres-XMLs:</strong> Nur nötig bei Optionen über den Jahreswechsel
-    (Stillhalter-Matching) oder für eine vollständigere Lot-Historie der FX-FIFO-Näherung.
-    </span><br>
-    <span style="color: #64748b;">IBKR &rarr; Performance &amp; Berichte &rarr; Flex-Abfragen &rarr; XML exportieren (gewünschter Zeitraum)</span>
-</div>
-""", unsafe_allow_html=True)
-
-uploaded_xml_files = st.file_uploader("IBKR Flex Query XMLs hochladen", type="xml",
-                                       accept_multiple_files=True, label_visibility="collapsed")
-
-st.markdown("""
-<div style="background: rgba(16,185,129,0.08); border-left: 3px solid #10b981; border-radius: 8px; padding: 0.8rem 1rem; margin-bottom: 0.5rem; font-size: 0.82rem; color: #cbd5e1; line-height: 1.6;">
-    <strong style="color: #34d399; font-size: 0.9rem;">2. IBKR Standard-Bericht CSV (Plausibilitätscheck)</strong><br>
-    <strong style="color: #6ee7b7;">Automatischer Plausibilitätscheck:</strong>
-    Der IBKR-Bericht enthält aggregierte Summen pro Kategorie (Aktien, Optionen, Futures, Anleihen, Devisen, Dividenden, Zinsen, Quellensteuer).
-    Diese werden automatisch mit unserer Einzelberechnung aus der Flex Query XML verglichen. Cent-genaue Übereinstimmung ist das Ziel.<br><br>
-    <strong style="color: #6ee7b7;">FX-Fallback:</strong>
-    Bei EUR-Basiskonten liefert der CSV-Bericht IBKRs aggregierte FIFO-Rohwerte als
-    Ersatz, falls die Flex Query keine <code>FxTransactions</code>-Sektion enthält.
-    Einzelne Schuldtilgungen sind darin nicht erkennbar; bei negativem Währungssaldo
-    und aktiver Saldo-Korrektur verwendet das Tool deshalb stattdessen die
-    FIFO-Näherung aus den Kontobewegungen.<br><br>
-    <span style="background: rgba(16,185,129,0.12); border-radius: 6px; padding: 0.4rem 0.6rem; display: inline-block; margin-top: 0.2rem; color: #94a3b8;">
-    <strong style="color: #a7f3d0;">So erstellen:</strong>
-    IBKR &rarr; Performance &amp; Berichte &rarr; Kontoauszüge &rarr;
-    <strong>Übersicht: realisierter G&amp;V</strong> &rarr; Zeitraum wählen &rarr; Format: CSV &rarr; Erstellen
-    </span><br>
-    <span style="color: #94a3b8; font-size: 0.78rem;">
-    <strong>Hinweis:</strong> Der CSV-Plausibilitätscheck funktioniert aktuell nur bei einem einzelnen Konto. Bei mehreren Konten wird der CSV-Bericht ignoriert.
-    </span>
-</div>
-""", unsafe_allow_html=True)
-
-ibkr_csv_file = st.file_uploader(
-    "IBKR Standard-Bericht (CSV) für Plausibilitätscheck & FX-Fallback",
-    type="csv",
-    label_visibility="visible")
-
-if not uploaded_xml_files:
-    st.stop()
-
-# ── Classify XMLs by account ────────────────────────────────────────────────
-
-accounts, multi_stmt_files = classify_xmls(uploaded_xml_files)
-if not accounts:
-    st.stop()
-
-if multi_stmt_files:
-    for f in multi_stmt_files:
-        st.warning(
-            f"**{f['name']}** enthält {len(f['account_ids'])} Konten "
-            f"({', '.join(f['account_ids'])}). Es wird nur das erste Konto "
-            f"(**{f['account_ids'][0]}**) verarbeitet; die übrigen werden ignoriert. "
-            f"Bitte pro Konto eine eigene Flex Query erstellen und einzeln hochladen."
+    if show_filters:
+        search = st.text_input(
+            "Ticker, Name oder ISIN suchen",
+            key=f"{key_prefix}_search",
+            placeholder="z. B. GLD, JEPI oder US78463V1070",
+        ).strip().casefold()
+        classifications = sorted({
+            row['classification_label'] for row in catalog_rows
+        })
+        evidence_labels = sorted({
+            row['evidence_label'] for row in catalog_rows
+        })
+        filter_col_1, filter_col_2 = st.columns(2)
+        selected_classifications = filter_col_1.multiselect(
+            "Zuordnung",
+            classifications,
+            key=f"{key_prefix}_classification",
+            placeholder="Alle",
+        )
+        selected_evidence = filter_col_2.multiselect(
+            "Nachweisstatus",
+            evidence_labels,
+            key=f"{key_prefix}_evidence",
+            placeholder="Alle",
         )
 
-# Determine global tax year from latest XML across all accounts
-all_to_dates = [xml['to_date'] for xmls in accounts.values() for xml in xmls]
-global_tax_year = max(all_to_dates)[:4] if all_to_dates else '2025'
+        if search:
+            filtered_rows = [
+                row for row in filtered_rows
+                if search in ' '.join((
+                    row['ticker'], row['name'], row['isin'],
+                    row['classification_label'], row['decision_reason'],
+                )).casefold()
+            ]
+        if selected_classifications:
+            filtered_rows = [
+                row for row in filtered_rows
+                if row['classification_label'] in selected_classifications
+            ]
+        if selected_evidence:
+            filtered_rows = [
+                row for row in filtered_rows
+                if row['evidence_label'] in selected_evidence
+            ]
 
-# Split: accounts with a tax-year XML vs. history-only accounts
-accounts_to_process = {}
-accounts_skipped = []
-for acct_id, xmls in accounts.items():
-    if xmls[-1]['to_date'][:4] == global_tax_year:
-        accounts_to_process[acct_id] = xmls
-    else:
-        acct_label = xmls[-1]['account_name'] or acct_id
-        accounts_skipped.append(f"{acct_label} ({acct_id}, nur bis {xmls[-1]['to_date'][:4]})")
-
-if not accounts_to_process:
-    st.error("Keine XML für das Steuerjahr gefunden.")
-    st.stop()
-
-if len(accounts_to_process) > 1:
-    # Validate: all accounts same base currency
-    currencies = {xmls[-1]['currency'] for xmls in accounts_to_process.values()}
-    if len(currencies) > 1:
-        st.error(f"Unterschiedliche Basiswährungen erkannt: **{', '.join(currencies)}**. "
-                 f"Alle Konten müssen dieselbe Basiswährung haben.")
-        st.stop()
-
-if len(accounts) > 1:
-    acct_info = []
-    for acct_id, xmls in sorted(accounts_to_process.items()):
-        name = xmls[-1]['account_name'] or acct_id
-        years = f"{xmls[0]['from_date'][:4]}–{xmls[-1]['to_date'][:4]}" if len(xmls) > 1 else xmls[0]['to_date'][:4]
-        acct_info.append(f"<strong>{name}</strong> ({acct_id}, {len(xmls)} XML{'s' if len(xmls)>1 else ''}, {years})")
-    account_count = len(accounts_to_process)
-    account_label = "Konten" if account_count > 1 else "Konto"
-    msg = f"<strong style=\"color: #818cf8;\">{account_count} {account_label} für {global_tax_year}</strong>"
-    if accounts_skipped:
-        msg += f"; {len(accounts_skipped)} übersprungen (kein {global_tax_year}-XML)"
-    st.markdown(f"""
-<div style="background: rgba(99,102,241,0.08); border: 1px solid rgba(99,102,241,0.25); border-radius: 10px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    {msg}<br>
-    {'&ensp;·&ensp;'.join(acct_info)}
-</div>
-""", unsafe_allow_html=True)
-
-if accounts_skipped:
-    st.markdown(f"""
-<div style="background: rgba(251,191,36,0.06); border: 1px solid rgba(251,191,36,0.2); border-radius: 10px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-size: 0.78rem; color: #94a3b8;">
-    <strong style="color: #fbbf24;">Übersprungen:</strong> {', '.join(accounts_skipped)}: keine Daten für Steuerjahr {global_tax_year} vorhanden.
-</div>
-""", unsafe_allow_html=True)
-
-csv_enabled = ibkr_csv_file is not None and len(accounts_to_process) == 1
-if ibkr_csv_file is not None and not csv_enabled:
-    st.warning(
-        "Der CSV-Plausibilitätscheck und FX-CSV-Fallback werden bei mehreren "
-        "Konten deaktiviert. Bitte entweder nur ein Konto mit passendem CSV "
-        "prüfen oder pro Konto separat rechnen."
+    status_counts = {}
+    for row in catalog_rows:
+        label = row['evidence_label']
+        status_counts[label] = status_counts.get(label, 0) + 1
+    status_summary = ' · '.join(
+        f"{count}× {label}"
+        for label, count in sorted(status_counts.items())
     )
+    st.caption(
+        f"{len(filtered_rows)} von {len(catalog_rows)} Zuordnungen · "
+        f"{status_summary}"
+    )
+    st.caption(
+        "„Katalogzuordnung · aktiv“ ist eine fest angewandte Zuordnung und "
+        "kein offener Prüffall. „Produktindividuell geprüft“ bedeutet "
+        "zusätzlich, dass für dieses Produkt ein eigener Primärbeleg im "
+        "Katalog verknüpft ist."
+    )
+    if not filtered_rows:
+        st.info("Für die gewählten Filter wurden keine Produkte gefunden.")
+        return
 
-# Das Widget sitzt weiter unten im FX-Block; die Berechnung braucht den Wert
-# aber schon hier. Streamlit aktualisiert st.session_state vor jedem Rerun.
-if 'fx_margin_correction_enabled' not in st.session_state:
-    st.session_state['fx_margin_correction_enabled'] = True
-fx_margin_correction_enabled = st.session_state['fx_margin_correction_enabled']
+    table_rows = [{
+        'Ticker': row['ticker'],
+        'Name': row['name'],
+        'ISIN': row['isin'],
+        'Zuordnung': row['classification_label'],
+        'TFS': row['tfs_label'],
+        'Steuerpfad': row['tax_route'],
+        'Nachweis': row['evidence_label'],
+        'Kurzbegründung': row['decision_reason'],
+    } for row in filtered_rows]
+    st.dataframe(table_rows, width="stretch", hide_index=True)
 
-if 'dba_wht_beta_enabled' not in st.session_state:
-    st.session_state['dba_wht_beta_enabled'] = False
-
-with st.expander("DBA-Prüfung für Fonds-Quellensteuer", expanded=False):
-    st.markdown('<div style="margin-top:2px;margin-bottom:12px"><span style="background:linear-gradient(135deg,#f59e0b,#ef4444);color:#fff;padding:5px 16px;border-radius:6px;font-size:0.85em;font-weight:700;letter-spacing:1px;box-shadow:0 2px 8px rgba(239,68,68,0.3)">NEUE FUNKTION &middot; BETA</span></div>', unsafe_allow_html=True)
-    st.markdown("""
-<div style="background: rgba(96,165,250,0.08); border: 1px solid rgba(96,165,250,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
-    <strong style="color: #60a5fa;">Was ist ein DBA?</strong>
-    Ein Doppelbesteuerungsabkommen regelt zwischen Deutschland und dem Quellenstaat,
-    wie viel Quellensteuer dieser auf Ausschüttungen einbehalten darf. Für Ausschüttungen
-    US-amerikanischer Fonds an deutsche Privatanleger sind das höchstens 15%
-    (Art. 10 Abs. 2 Buchst. b DBA-USA).<br><br>
-    <strong style="color: #60a5fa;">Warum anrechnen?</strong>
-    Nach §32d Abs. 5 EStG wird im Ausland gezahlte Quellensteuer auf die deutsche
-    Abgeltungsteuer angerechnet (Anlage KAP Zeile 41). Anrechenbar ist aber nur die
-    nach dem DBA verbleibende Steuer: Was der Quellenstaat über den DBA-Satz hinaus
-    einbehalten hat, ist dort erstattungsfähig und gehört nicht in Zeile 41.
-    Zusätzlich gilt ein Höchstbetrag von 25% je Kapitalertrag; bei teilfreigestellten
-    Fondserträgen zählt dafür nur der steuerpflichtige Teil
-    (BMF-Schreiben vom 14.05.2025, Rn. 148).<br><br>
-    <strong style="color: #60a5fa;">Was macht die Beta?</strong>
-    Der Standardmodus rechnet pauschal: Rohsteuer × (1 − Teilfreistellung).
-    Die Beta prüft stattdessen jedes Ereignis einzeln: Ausschüttung, Einbehalt und
-    Erstattung werden gematcht; hinterlegte DBA-Sätze und der 25%-Höchstbetrag
-    begrenzen die Anrechnung, Auffälligkeiten erscheinen als Prüffälle.
-    Typischer Effekt: Bei US-Aktienfonds mit 30% Teilfreistellung (z.B. QYLD) steigt
-    die anrechenbare Quellensteuer von 10,5% auf 15% der Ausschüttung.
-</div>
-""", unsafe_allow_html=True)
-    dba_wht_beta_enabled = st.checkbox(
-        "Beta aktivieren: Fonds-Quellensteuer ereignisbezogen nach DBA begrenzen",
-        key="dba_wht_beta_enabled",
-        help=(
-            "Deaktiviert (Standard): bisherige stabile Berechnung Rohsteuer × "
-            "(1 − Teilfreistellung). Aktiviert: Ausschüttungen, Einbehalte und "
-            "Erstattungen werden je Ereignis gematcht und zusätzlich durch "
-            "hinterlegte DBA-Sätze (Rechtsgrundlagen siehe oben) begrenzt."
+    row_by_isin = {row['isin']: row for row in filtered_rows}
+    selected_isin = st.selectbox(
+        "Begründung und Quellen im Detail",
+        options=list(row_by_isin),
+        format_func=lambda isin: (
+            f"{row_by_isin[isin]['ticker']} · "
+            f"{row_by_isin[isin]['name'] or 'Unbekanntes Produkt'} · {isin}"
         ),
+        key=f"{key_prefix}_detail",
     )
-    if dba_wht_beta_enabled:
-        st.warning(
-            "Beta-Modus: Produktrechtsform, US-RIC-Status und Ertragsart sind "
-            "noch nicht für alle Fonds abschließend belegt. Unbekannte oder "
-            "zeitversetzte Vorgänge bleiben Prüffälle. Werte vor Übernahme in "
-            "die Steuererklärung manuell beziehungsweise steuerlich prüfen."
+    selected = row_by_isin[selected_isin]
+    st.write(
+        f"{selected['ticker']} · "
+        f"{selected['name'] or 'Produktname nicht bekannt'} ({selected['isin']})"
+    )
+    st.caption(
+        f"{selected['classification_label']} · TFS {selected['tfs_label']} · "
+        f"{selected['tax_route']} · Stand {selected['as_of']}"
+    )
+    st.markdown("**Begründung**")
+    st.write(selected['decision_reason'])
+    st.markdown("**Rechtsform und Rechtsgrundlage**")
+    st.write(f"{selected['legal_form']} · {selected['legal_basis']}")
+
+    if selected['product_sources']:
+        product_links = ' · '.join(
+            f"[{label}]({url})"
+            for label, url in selected['product_sources']
         )
+        st.markdown(f"**Produktbeleg:** {product_links}")
     else:
         st.caption(
-            "Standardmodus aktiv: keine automatischen DBA-Caps und kein "
-            "ereignisbasiertes Erstattungs-Matching."
+            "Feste, aktiv berechnete Katalogzuordnung – kein Prüffall und keine "
+            "Quarantäne. Für dieses Produkt ist nur kein eigener "
+            "produktindividueller Primärbeleg verknüpft."
+        )
+    if selected['legal_sources']:
+        legal_links = ' · '.join(
+            f"[{label}]({url})" for label, url in selected['legal_sources']
+        )
+        st.markdown(f"**Rechtsquellen:** {legal_links}")
+
+    if offer_download:
+        st.download_button(
+            "Gesamtkatalog als CSV herunterladen",
+            data=classification_catalog_to_csv(catalog_rows).encode('utf-8-sig'),
+            file_name="etf_fonds_klassifikationen.csv",
+            mime="text/csv",
+            key=f"{key_prefix}_download",
         )
 
 
-# Show quarterly merge info
-for acct_id, xmls in accounts_to_process.items():
-    if all(x.get('is_quarterly') for x in xmls) and len(xmls) > 1:
-        periods = [f"{x['from_date'][5:7]}-{x['to_date'][5:7]}" for x in xmls if x['from_date'] and x['to_date']]
-        acct_label = xmls[-1]['account_name'] or acct_id
-        st.markdown(f"""
-<div style="background: rgba(16,185,129,0.08); border: 1px solid rgba(16,185,129,0.25); border-radius: 10px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #34d399;">{len(xmls)} Quartals-XMLs erkannt</strong> ({', '.join(periods)}) für {acct_label}; werden zu einem Jahresreport {global_tax_year} zusammengeführt.
-</div>
-""", unsafe_allow_html=True)
 
-# ── Processing ───────────────────────────────────────────────────────────────
+# ── Upload-Snapshot ──────────────────────────────────────────────────────────
 
-with st.spinner("Berechne Steuerreport…"):
-    reports = []
-    account_names = []
+class _MemUpload:
+    """Minimales File-Objekt ueber gesnapshotteten Bytes (classify_xmls und
+    die Extraktion arbeiten nur mit .name/.getvalue()/.getbuffer())."""
 
-    for acct_id, xmls in sorted(accounts_to_process.items()):
-        main_xml = xmls[-1]  # Latest = tax year
-        history_xmls = xmls[:-1]  # Older = history
-        is_quarterly = all(x.get('is_quarterly') for x in xmls) and len(xmls) > 1
-        acct_label = main_xml['account_name'] or acct_id
+    def __init__(self, name, data):
+        self.name = name
+        self._data = data
 
-        with tempfile.TemporaryDirectory() as tmp:
-            # CSV report is only safe for a single processed account.
-            csv_report_path = None
-            if csv_enabled:
-                csv_report_path = os.path.join(tmp, "ibkr_report.csv")
-                with open(csv_report_path, "wb") as f:
-                    f.write(ibkr_csv_file.getbuffer())
+    def getvalue(self):
+        return self._data
 
-            try:
-                if is_quarterly:
-                    # Quarterly mode: merge all XMLs from same year
-                    xml_paths = []
-                    for i, qxml in enumerate(xmls):
-                        qp = os.path.join(tmp, f"quarter_{i}.xml")
-                        with open(qp, "wb") as f:
-                            f.write(qxml['file'].getbuffer())
-                        xml_paths.append(qp)
-                    extract_ibkr_data.extract_quarterly_xmls(xml_paths, tmp)
-                else:
-                    # Standard mode: single XML or multi-year history
-                    xml_path = os.path.join(tmp, "input.xml")
-                    with open(xml_path, "wb") as f:
-                        f.write(main_xml['file'].getbuffer())
+    def getbuffer(self):
+        return self._data
 
-                    history_paths = []
-                    for i, hxml in enumerate(history_xmls):
-                        hp = os.path.join(tmp, f"history_{i}.xml")
-                        with open(hp, "wb") as f:
-                            f.write(hxml['file'].getbuffer())
-                        history_paths.append(hp)
 
-                    if history_paths:
-                        all_xmls_paths = sorted(history_paths) + [xml_path]
-                        extract_ibkr_data.extract_fx_multi_xml(all_xmls_paths, tmp)
-                    else:
-                        extract_ibkr_data.parse_ibkr_xml(xml_path, tmp)
-                d_acct = calculate_tax_report.calculate_tax(
-                    tmp,
-                    fx_csv_path=csv_report_path,
-                    anlage_so_overrides=st.session_state.get('anlage_so_overrides', []),
-                    fx_margin_correction_enabled=fx_margin_correction_enabled,
-                    dba_wht_beta_enabled=dba_wht_beta_enabled,
+def _upload_widget_keys(scope):
+    """Separate widget identities for start screen and persistent sidebar.
+
+    Streamlit unmounts the start-screen uploaders once XML data exists.  If
+    the sidebar reused those keys, the newly mounted empty widgets could be
+    mistaken for an explicit deletion on the next interaction.
+    """
+    if scope not in {'start', 'sidebar'}:
+        raise ValueError(f"Unbekannter Upload-Bereich: {scope}")
+    epoch = st.session_state.get('upload_epoch', 0)
+    return (
+        f"_ui_{scope}_xml_uploads_{epoch}",
+        f"_ui_{scope}_csv_upload_{epoch}",
+    )
+
+
+def _capture_xml_uploads(widget_key, append_existing=False):
+    """XML-Callback: Start ersetzt, Sidebar ergänzt den XML-Datensatz."""
+    raw_entries = []
+    for up in st.session_state.get(widget_key) or []:
+        data = bytes(up.getvalue())
+        raw_entries.append({
+            'name': up.name,
+            'digest': ui_model.file_digest(data),
+            'kind': 'xml',
+            'data': data,
+        })
+    existing = st.session_state.get('dataset')
+    if append_existing:
+        st.session_state['dataset'] = ui_model.append_xml_uploads(
+            existing, raw_entries,
+        )
+    else:
+        st.session_state['dataset'] = ui_model.update_upload_dataset(
+            existing, xml_entries=raw_entries,
+        )
+
+
+def _capture_csv_upload(widget_key):
+    """CSV-Callback: nur den CSV-Teil aktualisieren, XML unverändert lassen."""
+    csv_entry = None
+    csv_up = st.session_state.get(widget_key)
+    if csv_up is not None:
+        data = bytes(csv_up.getvalue())
+        csv_entry = {
+            'name': csv_up.name,
+            'digest': ui_model.file_digest(data),
+            'kind': 'csv',
+            'data': data,
+        }
+    st.session_state['dataset'] = ui_model.update_upload_dataset(
+        st.session_state.get('dataset'), csv_entry=csv_entry,
+    )
+
+
+def _reset_all_data():
+    """Expliziter Reset: neuer Widget-Key (upload_epoch), Domain-State und
+    Snapshot verwerfen."""
+    st.session_state['upload_epoch'] = st.session_state.get('upload_epoch', 0) + 1
+    for key in ('dataset', 'snapshot', 'export_cache', 'domain', 'nav'):
+        st.session_state.pop(key, None)
+
+
+def _render_uploaders(scope):
+    xml_key, csv_key = _upload_widget_keys(scope)
+    append_existing = scope == 'sidebar'
+    st.file_uploader(
+        ("Weitere Flex Query XMLs hinzufügen" if append_existing
+         else "Flex Query XMLs hochladen"),
+        type="xml",
+        accept_multiple_files=True,
+        key=xml_key,
+        on_change=_capture_xml_uploads,
+        args=(xml_key, append_existing),
+        help=(
+            (("Die ausgewählten XMLs werden zum bestehenden Datensatz "
+              "hinzugefügt. Für einen vollständigen Austausch zuerst "
+              "'Alle Daten entfernen' verwenden. ") if append_existing else "")
+            + "Steuerjahr-XML hochladen; bei jahresübergreifenden Optionen "
+              "zusätzlich die Vorjahres-XMLs. Mehrere Konten werden separat "
+              "berechnet und addiert. Quartals-XMLs desselben Jahres werden "
+              "automatisch zusammengeführt."
+        ),
+    )
+    if scope == 'start':
+        with st.expander("Flex-Query-XML in IBKR erstellen", expanded=False):
+            st.caption(
+                "IBKR → Performance & Berichte → Flex-Abfragen → XML "
+                "exportieren. Bei jahresübergreifenden Optionen zusätzlich "
+                "die Vorjahres-XMLs gemeinsam auswählen."
+            )
+        csv_context = st.expander(
+            "Erweiterte Prüfung mit IBKR-CSV · optional", expanded=False,
+        )
+    else:
+        csv_context = contextlib.nullcontext()
+
+    with csv_context:
+        if scope == 'start':
+            st.caption(
+                "Ergänzt einen Plausibilitätsvergleich und kann als "
+                "FX-Fallback dienen. Für den Steuerbericht ist die CSV nicht "
+                "erforderlich."
+            )
+        st.file_uploader(
+            ("IBKR-Standardbericht (CSV)" if scope == 'start'
+             else "Optional: IBKR-Standardbericht (CSV)"),
+            type="csv",
+            key=csv_key,
+            on_change=_capture_csv_upload,
+            args=(csv_key,),
+            help=(
+                "Plausibilitätscheck gegen IBKRs eigene Kategoriesummen und "
+                "FX-Fallback für EUR-Basiskonten ohne FxTransactions-Sektion. "
+                "Erstellen: IBKR → Performance & Berichte → Kontoauszüge → "
+                "Übersicht: realisierter G&V → CSV. Nur bei einem einzelnen "
+                "Konto aktiv."
+            ),
+        )
+
+
+# ── Domain-State (fachliche Eingaben, per dataset_id genamespaced) ───────────
+
+def _domain(dataset_id):
+    domains = st.session_state.setdefault('domain', {})
+    return domains.setdefault(dataset_id, {
+        'toggles': ui_model.default_toggles(),
+        'etf_overrides': {},
+        'anlage_so_overrides': [],
+    })
+
+
+def _bind_toggle(dom, toggle_key, widget_key, label, help_text=None,
+                 impact_text=None):
+    """Checkbox mit _ui_*-Widget-Key, Domain-State als Quelle der Wahrheit."""
+
+    def _sync():
+        dom['toggles'][toggle_key] = bool(st.session_state[widget_key])
+
+    st.checkbox(
+        label,
+        value=bool(dom['toggles'].get(toggle_key)),
+        key=widget_key,
+        on_change=_sync,
+        help=help_text,
+    )
+    if impact_text:
+        st.caption(f"**Auswirkung:** {impact_text}")
+
+
+# ── Start-Zustand ────────────────────────────────────────────────────────────
+
+_dataset = st.session_state.get('dataset') or {}
+_dataset_files = _dataset.get('files') or []
+
+if not _dataset_files:
+    intro_col, upload_col = st.columns([0.94, 1.06], gap="large")
+    with intro_col:
+        st.markdown(
+            '<div class="start-title">IBKR-Steuerbericht. Vom Flex Query '
+            'zur Anlage KAP.</div>'
+            '<div class="start-sub">Flex Query hochladen, automatisch prüfen '
+            'lassen und die berechneten KAP-, KAP-INV- und SO-Zeilen '
+            'übernehmen. Die Verarbeitung erfolgt vollständig lokal auf dem '
+            'eigenen Rechner.</div>'
+            '<div class="start-trust">'
+            '<span class="start-trust-chip">✓ 100 % lokal</span>'
+            '<span class="start-trust-chip">✓ Keine Datenübertragung</span>'
+            '<span class="start-trust-chip">✓ Open Source</span>'
+            '</div>'
+            '<div class="start-visual">'
+            '<svg viewBox="0 0 520 186" role="img" '
+            'aria-label="Ablauf: Flex Query laden, automatisch prüfen, '
+            'Formularzeilen übernehmen">'
+            # Station 1: Flex-Query-Dokument
+            '<rect class="sv-card" x="18" y="24" width="78" height="100" rx="10"/>'
+            '<text class="sv-glyph" x="57" y="56" text-anchor="middle">&lt;XML/&gt;</text>'
+            '<rect class="sv-code" x="32" y="72" width="48" height="4" rx="2"/>'
+            '<rect class="sv-code" x="32" y="84" width="34" height="4" rx="2"/>'
+            '<rect class="sv-code" x="32" y="96" width="42" height="4" rx="2"/>'
+            # Flusslinie 1
+            '<line class="sv-flow" x1="102" y1="74" x2="186" y2="74"/>'
+            '<path class="sv-arrow" d="M196 74 l-8 -4.5 v9 z"/>'
+            # Station 2: Pruefung
+            '<circle class="sv-card" cx="240" cy="74" r="32"/>'
+            '<path class="sv-check" d="M227 75 l9 9 l18 -20"/>'
+            # Flusslinie 2
+            '<line class="sv-flow" x1="278" y1="74" x2="342" y2="74"/>'
+            '<path class="sv-arrow" d="M352 74 l-8 -4.5 v9 z"/>'
+            # Station 3: Mini-Formular mit Zeilen-Badges und Fuehrungslinien
+            '<rect class="sv-card" x="358" y="18" width="148" height="112" rx="10"/>'
+            '<rect class="sv-badge fill" x="370" y="32" width="26" height="16" rx="5"/>'
+            '<text class="sv-badge-text fill" x="383" y="44" text-anchor="middle">19</text>'
+            '<line class="sv-leader" x1="402" y1="40" x2="450" y2="40"/>'
+            '<text class="sv-value" x="494" y="44" text-anchor="end">1.234,56</text>'
+            '<rect class="sv-badge" x="370" y="62" width="26" height="16" rx="5"/>'
+            '<text class="sv-badge-text" x="383" y="74" text-anchor="middle">20</text>'
+            '<line class="sv-leader" x1="402" y1="70" x2="458" y2="70"/>'
+            '<text class="sv-value" x="494" y="74" text-anchor="end">876,00</text>'
+            '<rect class="sv-badge" x="370" y="92" width="26" height="16" rx="5"/>'
+            '<text class="sv-badge-text" x="383" y="104" text-anchor="middle">41</text>'
+            '<line class="sv-leader" x1="402" y1="100" x2="458" y2="100"/>'
+            '<text class="sv-value" x="494" y="104" text-anchor="end">312,40</text>'
+            # Beschriftungen
+            '<text class="sv-label" x="57" y="162" text-anchor="middle">'
+            '<tspan>1</tspan> · Flex Query</text>'
+            '<text class="sv-label" x="240" y="162" text-anchor="middle">'
+            '<tspan>2</tspan> · Automatische Prüfung</text>'
+            '<text class="sv-label" x="432" y="162" text-anchor="middle">'
+            '<tspan>3</tspan> · Anlage KAP</text>'
+            '</svg>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+    with upload_col:
+        with st.container(key="start_upload_card"):
+            st.markdown(
+                '<div class="start-upload-kicker">Schritt 1</div>'
+                '<div class="start-upload-title">Flex Query hochladen</div>'
+                '<div class="start-upload-copy">Erforderlich für die '
+                'Berechnung. Mehrere XMLs können gemeinsam ausgewählt oder '
+                'hierher gezogen werden.</div>',
+                unsafe_allow_html=True,
+            )
+            _render_uploaders('start')
+    st.markdown(
+        '<div class="start-foot"><strong>Keine Steuerberatung · '
+        'Haftungsbeschränkung:</strong> '
+        'Nutzung und Prüfung der Ergebnisse erfolgen eigenverantwortlich. '
+        'Soweit gesetzlich zulässig, wird für Schäden aus der Nutzung sowie '
+        'für fehlerhafte oder unvollständige Berechnungen keine Haftung '
+        'übernommen.</div>',
+        unsafe_allow_html=True,
+    )
+    st.stop()
+
+_dataset_id = _dataset.get('dataset_id', '')
+_dom = _domain(_dataset_id)
+
+# ── Sidebar-Skelett ──────────────────────────────────────────────────────────
+# Reihenfolge: Marke, Datengrundlage, Navigation, Berechnungsoptionen.
+# Nav und Optionen brauchen das View-Model und werden nachtraeglich in ihre
+# Container gefuellt (Streamlit erlaubt Out-of-order-Rendering).
+
+with st.sidebar:
+    st.markdown('<div class="sidebar-brand">IBKR Steuerbericht</div>',
+                unsafe_allow_html=True)
+    st.markdown(
+        '<div class="sidebar-brand-sub">Anlage KAP · Flex Query · lokal</div>',
+        unsafe_allow_html=True,
+    )
+    _data_card_slot = st.container()
+    with st.expander("Daten ändern", expanded=False):
+        _render_uploaders('sidebar')
+        st.button(
+            "Alle Daten entfernen",
+            key="_ui_reset_all",
+            on_click=_reset_all_data,
+            width="stretch",
+        )
+    _nav_slot = st.container()
+    st.markdown('<div class="eyebrow" style="margin-top:1.1rem;">Berechnung</div>',
+                unsafe_allow_html=True)
+    _toggle_slot = st.container()
+
+# ── Compute-Snapshot ─────────────────────────────────────────────────────────
+
+_csv_entry = _dataset.get('csv')
+_requested_key = ui_model.build_input_key(
+    _dataset_id,
+    _csv_entry['digest'] if _csv_entry else None,
+    _dom['toggles'].get('fx_margin', True),
+    _dom['toggles'].get('dba_beta', False),
+    _dom.get('anlage_so_overrides', []),
+)
+
+
+class UploadValidationError(Exception):
+    pass
+
+
+def _run_compute(dataset, csv_entry, dom, requested_key, generation):
+    """Extraktion + calculate_tax pro Konto. Laeuft mit umgeleitetem
+    stdout/stderr (Core-prints enthalten Kontonummern und Betraege) unter dem
+    prozessweiten Lock aus ui_model; gespeichert wird nur eine
+    Allowlist-Zusammenfassung."""
+    started = time.time()
+    logbuf = io.StringIO()
+    mem_files = [_MemUpload(f['name'], f['data']) for f in dataset['files']]
+
+    with ui_model.REDIRECT_LOCK:
+        with contextlib.redirect_stdout(logbuf), \
+                contextlib.redirect_stderr(logbuf):
+            accounts, multi_stmt_files, invalid_files = classify_xmls(mem_files)
+            if invalid_files:
+                details = "; ".join(
+                    f"{item['name']}: {item['reason']}"
+                    for item in invalid_files
                 )
-                # Validate base currency consistency
-                if reports and d_acct.get('base_currency') != reports[0].get('base_currency'):
-                    st.error(f"Konto **{acct_label}** hat Basiswährung "
-                             f"**{d_acct.get('base_currency')}**, erwartet "
-                             f"**{reports[0].get('base_currency')}**.")
-                    st.stop()
+                raise UploadValidationError(
+                    "Ungültige Upload-Datei(en). Jede ausgewählte XML muss "
+                    f"ein IBKR-Flex-Query-Export sein: {details}."
+                )
+            if multi_stmt_files:
+                details = "; ".join(
+                    f"{item['name']} ({', '.join(item['account_ids'])})"
+                    for item in multi_stmt_files
+                )
+                raise UploadValidationError(
+                    "Mehrere Konten innerhalb derselben XML werden nicht "
+                    f"teilweise verarbeitet: {details}. Bitte pro Konto eine "
+                    "eigene Flex Query exportieren und alle Dateien gemeinsam "
+                    "hochladen."
+                )
+            if not accounts:
+                raise UploadValidationError(
+                    "Keine der Dateien enthält ein lesbares FlexStatement."
+                )
 
-                reports.append(d_acct)
-                account_names.append(acct_label)
-            except Exception as e:
-                st.error(f"Fehler beim Verarbeiten von Konto **{acct_label}**: {e}")
-                st.exception(e)
-                st.stop()
+            overlaps = ui_model.find_period_overlaps(accounts)
+            if overlaps:
+                lines = "; ".join(
+                    f"Konto {o['account_id']} ({o['year']}): "
+                    f"{o['files'][0]} und {o['files'][1]} überschneiden sich "
+                    f"({o['periods'][0]} / {o['periods'][1]})"
+                    for o in overlaps
+                )
+                raise UploadValidationError(
+                    "Überlappende Berichtszeiträume desselben Kontos im "
+                    f"selben Jahr: {lines}. Der Quartalsmodus akzeptiert nur "
+                    "disjunkte Zeiträume, sonst würden Ergebnisse doppelt "
+                    "gezählt. Bitte die Exporte korrigieren."
+                )
 
-    # Merge all accounts
-    d = merge_report_data(reports)
-    n_accounts = len(reports)
-    # Snapshot der Konto-Pools fuer den Standard/Beta-Vergleich: die Beta ist
-    # nichtlinear (Refund-Offset pro ISIN), darf also nur kontoweise gerechnet
-    # und dann summiert werden - nie auf dem gemergten Event-Pool.
-    per_account_wht_pools = [
-        copy.deepcopy(r.get('kap_inv', {}).get('etf_by_isin', {}) or {})
-        for r in reports
-    ]
+            all_to_dates = [x['to_date'] for xs in accounts.values() for x in xs]
+            global_tax_year = max(all_to_dates)[:4] if all_to_dates else '2025'
 
-# Derived values
+            accounts_to_process = {}
+            accounts_skipped = []
+            for acct_id, xmls in accounts.items():
+                if xmls[-1]['to_date'][:4] == global_tax_year:
+                    accounts_to_process[acct_id] = xmls
+                else:
+                    label = xmls[-1]['account_name'] or acct_id
+                    accounts_skipped.append(
+                        f"{label} ({acct_id}, nur bis {xmls[-1]['to_date'][:4]})"
+                    )
+            if not accounts_to_process:
+                raise UploadValidationError(
+                    "Keine XML für das Steuerjahr gefunden."
+                )
+
+            if len(accounts_to_process) > 1:
+                currencies = {
+                    xs[-1]['currency'] for xs in accounts_to_process.values()
+                }
+                if len(currencies) > 1:
+                    raise UploadValidationError(
+                        "Unterschiedliche Basiswährungen erkannt: "
+                        f"{', '.join(sorted(currencies))}. Alle Konten müssen "
+                        "dieselbe Basiswährung haben."
+                    )
+
+            csv_enabled = (
+                csv_entry is not None and len(accounts_to_process) == 1
+            )
+
+            reports = []
+            account_names = []
+            quarterly_infos = []
+            for acct_id, xmls in sorted(accounts_to_process.items()):
+                main_xml = xmls[-1]
+                history_xmls = xmls[:-1]
+                is_quarterly = (
+                    all(x.get('is_quarterly') for x in xmls) and len(xmls) > 1
+                )
+                acct_label = main_xml['account_name'] or acct_id
+                if is_quarterly:
+                    periods = [
+                        f"{x['from_date'][5:7]}-{x['to_date'][5:7]}"
+                        for x in xmls if x['from_date'] and x['to_date']
+                    ]
+                    quarterly_infos.append({
+                        'account': acct_label,
+                        'count': len(xmls),
+                        'periods': periods,
+                    })
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    csv_report_path = None
+                    if csv_enabled:
+                        csv_report_path = os.path.join(tmp, "ibkr_report.csv")
+                        with open(csv_report_path, "wb") as fh:
+                            fh.write(csv_entry['data'])
+
+                    if is_quarterly:
+                        xml_paths = []
+                        for i, qxml in enumerate(xmls):
+                            qp = os.path.join(tmp, f"quarter_{i}.xml")
+                            with open(qp, "wb") as fh:
+                                fh.write(qxml['file'].getbuffer())
+                            xml_paths.append(qp)
+                        extract_ibkr_data.extract_quarterly_xmls(xml_paths, tmp)
+                    else:
+                        xml_path = os.path.join(tmp, "input.xml")
+                        with open(xml_path, "wb") as fh:
+                            fh.write(main_xml['file'].getbuffer())
+                        history_paths = []
+                        for i, hxml in enumerate(history_xmls):
+                            hp = os.path.join(tmp, f"history_{i}.xml")
+                            with open(hp, "wb") as fh:
+                                fh.write(hxml['file'].getbuffer())
+                            history_paths.append(hp)
+                        if history_paths:
+                            extract_ibkr_data.extract_fx_multi_xml(
+                                sorted(history_paths) + [xml_path], tmp
+                            )
+                        else:
+                            extract_ibkr_data.parse_ibkr_xml(xml_path, tmp)
+
+                    d_acct = calculate_tax_report.calculate_tax(
+                        tmp,
+                        fx_csv_path=csv_report_path,
+                        anlage_so_overrides=dom.get('anlage_so_overrides', []),
+                        fx_margin_correction_enabled=dom['toggles'].get(
+                            'fx_margin', True),
+                        dba_wht_beta_enabled=dom['toggles'].get(
+                            'dba_beta', False),
+                    )
+                    if reports and d_acct.get('base_currency') != \
+                            reports[0].get('base_currency'):
+                        raise UploadValidationError(
+                            f"Konto {acct_label} hat Basiswährung "
+                            f"{d_acct.get('base_currency')}, erwartet "
+                            f"{reports[0].get('base_currency')}."
+                        )
+                    reports.append(d_acct)
+                    account_names.append(acct_label)
+
+            per_account_wht_pools = [
+                copy.deepcopy(r.get('kap_inv', {}).get('etf_by_isin', {}) or {})
+                for r in reports
+            ]
+            merged = merge_report_data(reports)
+            if len(reports) == 1:
+                # merge_report_data gibt bei Einzelkonto das Original zurueck —
+                # die Snapshot-Grenze kapselt defensiv per Deep-Copy, damit
+                # kein UI-Pfad den eingefrorenen Report mutieren kann.
+                merged = copy.deepcopy(merged)
+
+    return {
+        'input_key': requested_key,
+        'schema_version': ui_model.SCHEMA_VERSION,
+        'generation': generation,
+        'status': 'ok',
+        'computed_at': _dt.now().strftime('%d.%m.%Y %H:%M'),
+        'duration_s': round(time.time() - started, 2),
+        'suppressed_log_lines': logbuf.getvalue().count('\n'),
+        'payload': {
+            'reports': reports,
+            'account_names': account_names,
+            'merged': merged,
+            'per_account_wht_pools': per_account_wht_pools,
+            'accounts_skipped': accounts_skipped,
+            'multi_stmt_files': multi_stmt_files,
+            'quarterly_infos': quarterly_infos,
+            'csv_enabled': csv_enabled,
+            'csv_present': csv_entry is not None,
+            'n_accounts': len(reports),
+        },
+    }
+
+
+_snapshot = st.session_state.get('snapshot')
+_cache_hit = ui_model.snapshot_is_current(_snapshot, _requested_key)
+if not _cache_hit:
+    _generation = st.session_state.get('compute_generation', 0) + 1
+    st.session_state['compute_generation'] = _generation
+    try:
+        with st.spinner("Berechne Steuerbericht…"):
+            _computed = _run_compute(
+                _dataset, _csv_entry, _dom, _requested_key, _generation,
+            )
+    except UploadValidationError as exc:
+        st.markdown(notice_html({
+            'class': 'fehler', 'severity': 'kritisch',
+            'title': 'Berechnung nicht möglich', 'body': str(exc),
+            'target': None,
+        }), unsafe_allow_html=True)
+        st.stop()
+    except Exception as exc:  # noqa: BLE001 — Fehler sichtbar machen
+        st.markdown(notice_html({
+            'class': 'fehler', 'severity': 'kritisch',
+            'title': 'Fehler bei der Verarbeitung', 'body': str(exc),
+            'target': None,
+        }), unsafe_allow_html=True)
+        st.exception(exc)
+        st.stop()
+
+    # Atomarer Commit: ein alter Lauf darf keinen inzwischen neu
+    # angeforderten Key ueberschreiben (fastReruns).
+    _current_generation = st.session_state.get('compute_generation')
+    if ui_model.should_commit_snapshot(
+            _requested_key, _current_generation,
+            _computed['input_key'], _computed['generation']):
+        st.session_state['snapshot'] = _computed
+        _snapshot = _computed
+    else:
+        st.stop()
+
+_payload = _snapshot['payload']
+d = _payload['merged']
+reports = _payload['reports']
+account_names = _payload['account_names']
+n_accounts = _payload['n_accounts']
+per_account_wht_pools = _payload['per_account_wht_pools']
 steuerjahr = d.get('tax_year', 2025)
-topf_1        = d.get('topf_1_aktien_netto', d.get('stocks_net_eur', 0))
-topf_2        = d.get('topf_2_sonstiges_netto',
-                      d.get('dividends_eur', 0) + d.get('interest_eur', 0) +
-                      d.get('options_gain_eur', 0) + d.get('options_loss_eur', 0))
-zeile_19      = d.get('zeile_19_netto_eur', topf_1 + topf_2)
-zeile_20      = d.get('zeile_20_stock_gains_eur', d.get('stocks_gain_eur', 0))
-zeile_22      = d.get('zeile_22_other_losses_eur', abs(d.get('options_loss_eur', 0)))
-zeile_23      = d.get('zeile_23_stock_losses_eur', abs(d.get('stocks_loss_eur', 0)))
-zeile_7       = d.get('zeile_7_kapitalertraege_mit_inlaendischem_steuerabzug_eur', 0)
-zeile_37      = d.get('zeile_37_kapitalertragsteuer_eur', 0)
-zeile_38      = d.get('zeile_38_solidaritaetszuschlag_eur', 0)
-quellensteuer = calculate_tax_report.get_kap_line_41_for_reporting(d)
+created_at = _snapshot['computed_at']
 
-# Zuflussprinzip data
-audit = d.get('audit', {})
+# ── View-Model ───────────────────────────────────────────────────────────────
+
+_availability = ui_model.toggle_availability(d)
+_eff_toggles = ui_model.effective_toggles(_dom['toggles'], _availability)
+
+
+def build_plausibility(d, toggles):
+    """Plausibilitaetscheck gegen IBKRs eigene CSV-Kategoriesummen (rein)."""
+    csv_cats = d.get('csv_category_totals', {})
+    if not csv_cats:
+        return None
+    audit = d.get('audit', {}) or {}
+    kap_inv_data = d.get('kap_inv', {}) or {}
+    anlage_so = d.get('anlage_so', {}) or {}
+    has_etf = bool(kap_inv_data.get('etf_by_isin'))
+    has_so = bool(anlage_so.get('by_isin'))
+    invstg_on = toggles.get('invstg', False)
+
+    cross_put = audit.get('cross_year_put_total', 0)
+    no_invstg_gain = audit.get('no_invstg_gain', 0)
+    no_invstg_loss = audit.get('no_invstg_loss', 0)
+    stillhalter_addback = (audit.get('stk_correction_cy', 0)
+                           + audit.get('etf_correction_cy', 0))
+    our_stk_gain = (d.get('stocks_gain_eur', 0) + stillhalter_addback
+                    + cross_put + no_invstg_gain)
+    our_stk_loss = d.get('stocks_loss_eur', 0) + no_invstg_loss
+    if has_etf and invstg_on:
+        our_stk_gain += kap_inv_data.get('etf_gain_raw_eur', 0)
+        our_stk_loss += kap_inv_data.get('etf_loss_raw_eur', 0)
+    if has_so:
+        our_stk_gain += anlage_so.get('total_gain', 0)
+        our_stk_loss += anlage_so.get('total_loss', 0)
+
+    ibkr_topf2_cats = ["Aktien- und Indexoptionen", "Futures",
+                       "Optionen auf Futures (Future-Style)",
+                       "Optionen auf Futures", "Anleihen", "Treasury Bills"]
+    zufluss_adj = (audit.get('zufluss_premium_eur', 0)
+                   - audit.get('prior_zufluss_correction_eur', 0))
+    our_topf2_gain = (d.get('options_gain_eur', 0)
+                      - audit.get('stillhalter_premium_eur', 0)
+                      - d.get('fx_total_gain', 0) - no_invstg_gain
+                      - zufluss_adj)
+    our_topf2_loss = (d.get('options_loss_eur', 0)
+                      - d.get('fx_total_loss', 0) - no_invstg_loss)
+    ibkr_topf2_gain = sum(
+        csv_cats.get(c, {}).get('gain', 0) for c in ibkr_topf2_cats)
+    ibkr_topf2_loss = sum(
+        csv_cats.get(c, {}).get('loss', 0) for c in ibkr_topf2_cats)
+    ibkr_stk = csv_cats.get('Aktien', {})
+    ibkr_fx = csv_cats.get('Devisen', {})
+    fx_total_gain = d.get('fx_total_gain', 0)
+    fx_total_loss = d.get('fx_total_loss', 0)
+
+    our_div = d.get('dividends_eur', 0)
+    our_wht = d.get('withholding_tax_eur', 0)
+    if has_etf and invstg_on:
+        our_div += kap_inv_data.get('etf_dividends_raw_eur', 0)
+        our_wht += kap_inv_data.get('etf_wht_eur', 0)
+
+    rows = [
+        ("Aktien (Topf 1) Netto", ibkr_stk.get('net', 0),
+         our_stk_gain + our_stk_loss),
+        ("Sonstiges (Topf 2) Netto", ibkr_topf2_gain + ibkr_topf2_loss,
+         our_topf2_gain + our_topf2_loss),
+        ("FX (Devisen) Netto", ibkr_fx.get('net', 0),
+         fx_total_gain + fx_total_loss),
+    ]
+    csv_income = d.get('csv_income_totals', {})
+    if 'dividends_eur' in csv_income:
+        rows.append(("Dividenden", csv_income['dividends_eur'], our_div))
+    if 'interest_eur' in csv_income:
+        rows.append(("Zinsen", csv_income['interest_eur'],
+                     d.get('interest_eur', 0) + d.get('debit_interest_eur', 0)))
+    if 'withholding_tax_eur' in csv_income:
+        rows.append((
+            "Quellensteuer",
+            calculate_tax_report.get_withholding_tax_for_reporting(
+                csv_income['withholding_tax_eur']),
+            our_wht,
+        ))
+
+    fx_meta = d.get('fx_option_a_meta', {}) or {}
+    fx_corr_active = d.get('fx_margin_correction_enabled', True)
+    fx_margin_diff = (fx_meta.get('corrected_total', 0.0)
+                      - fx_meta.get('raw_total', 0.0))
+    fx_margin_explains = fx_corr_active and abs(fx_margin_diff) > 0.01
+
+    result_rows = []
+    all_match = True
+    zinsen_fx_diff = False
+    fx_saldo_diff = False
+    for label, ibkr_val, our_val in rows:
+        diff = our_val - ibkr_val
+        match = abs(diff) < 1.0
+        is_fx_saldo = (label == "FX (Devisen) Netto" and fx_margin_explains
+                       and abs(diff - fx_margin_diff) < 1.0)
+        if not match:
+            if label == "Zinsen":
+                zinsen_fx_diff = True
+            elif is_fx_saldo:
+                fx_saldo_diff = True
+            else:
+                all_match = False
+        result_rows.append({
+            'label': label, 'ibkr': ibkr_val, 'ours': our_val, 'diff': diff,
+            'match': match, 'is_fx_saldo': is_fx_saldo,
+        })
+    return {
+        'rows': result_rows,
+        'all_match': all_match,
+        'zinsen_fx_diff': zinsen_fx_diff,
+        'fx_saldo_diff': fx_saldo_diff,
+        'zufluss_adj': zufluss_adj,
+        'fx_margin_diff': fx_margin_diff,
+        'fx_margin_relevant': fx_margin_explains,
+    }
+
+
+plaus = build_plausibility(d, _eff_toggles)
+
+_vm_context = {
+    'input_key': _requested_key,
+    'multi_stmt_files': _payload['multi_stmt_files'],
+    'accounts_skipped': _payload['accounts_skipped'],
+    'dropped_duplicates': _dataset.get('dropped_duplicates', []),
+    'csv_disabled_multi_account': (
+        _payload['csv_present'] and not _payload['csv_enabled']
+    ),
+    'plausibility_mismatch': bool(plaus) and not plaus['all_match'],
+}
+vm = ui_model.build_view_model(
+    d, per_account_wht_pools,
+    {
+        'toggles': _dom['toggles'],
+        'etf_overrides': _dom['etf_overrides'],
+        'dba_beta_enabled': _dom['toggles'].get('dba_beta', False),
+    },
+    _vm_context,
+)
+final = vm['final']
+per_account_finals = ui_model.build_per_account_finals(
+    reports,
+    per_account_wht_pools,
+    {
+        'toggles': _dom['toggles'],
+        'etf_overrides': _dom['etf_overrides'],
+        'dba_beta_enabled': _dom['toggles'].get('dba_beta', False),
+    },
+) if n_accounts > 1 else []
+toggles = vm['toggles']
+audit = d.get('audit', {}) or {}
+
+# ── Sidebar fuellen: Datengrundlage, Navigation, Berechnungsoptionen ─────────
+
+with _data_card_slot:
+    file_names = ", ".join(esc(f['name']) for f in _dataset_files)
+    acct_line = esc(", ".join(account_names)) if account_names else "-"
+    st.markdown(
+        f'<div class="data-card">'
+        f'<div class="data-card-title">Steuerjahr {esc(steuerjahr)} · '
+        f'{esc(d.get("base_currency", "EUR"))}-Konto'
+        f'{"" if n_accounts == 1 else f" · {n_accounts} Konten"}</div>'
+        f'{acct_line}'
+        f'<div class="data-card-files">{file_names}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    for info in _payload['quarterly_infos']:
+        st.markdown(
+            f'<div class="data-card">'
+            f'<div class="data-card-title">{info["count"]} Quartals-XMLs '
+            f'zusammengeführt</div>'
+            f'{esc(info["account"])} · {esc(", ".join(info["periods"]))}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+_nav_current = ui_model.normalize_nav(
+    st.session_state.get('nav', 'overview'), vm['visible_pages'],
+)
+st.session_state['nav'] = _nav_current
+
+
+def _select_nav(page_id):
+    st.session_state['nav'] = page_id
+
+
+_nav_icons = {
+    'overview': ':material/grid_view:',
+    'kap': ':material/description:',
+    'kap_inv': ':material/account_balance:',
+    'anlage_so': ':material/paid:',
+    'prueffaelle': ':material/rule:',
+    'rechenwege': ':material/calculate:',
+    'export': ':material/download:',
+}
+
+with _nav_slot:
+    st.markdown('<div class="eyebrow" style="margin-top:0.9rem;">Bericht</div>',
+                unsafe_allow_html=True)
+    with st.container(key="nav_buttons"):
+        for _page_id in vm['visible_pages']:
+            _label = ui_model.page_label(_page_id)
+            if _page_id == 'prueffaelle':
+                _n = vm['notice_counts']['prueffaelle']
+                if _n:
+                    _label = f"{_label} · {_n}"
+            st.button(
+                _label,
+                key=f"_ui_nav_{_page_id}",
+                icon=_nav_icons.get(_page_id),
+                type="primary" if _page_id == _nav_current else "tertiary",
+                width="stretch",
+                on_click=_select_nav,
+                args=(_page_id,),
+            )
+
+with _toggle_slot:
+    _avail = vm['toggle_availability']
+    st.caption(
+        "Diese Schalter ändern die Berechnung. Die konkrete Wirkung steht "
+        "jeweils direkt darunter."
+    )
+    if _avail.get('zufluss'):
+        _bind_toggle(
+            _dom, 'zufluss', f"_ui_tg_zufluss_{_dataset_id[:12]}",
+            "Zuflussprinzip (BMF Rn. 25, 33)",
+            "Verschiebt Assignment-Prämien aus Vorjahren aus dem aktuellen "
+            "Steuerjahr heraus; sie gehören in die Erklärung des "
+            "Zuflussjahres. Offene Positionen und Vorjahres-Korrekturen sind "
+            "bereits automatisch berechnet.",
+            "ordnet Optionsprämien dem richtigen Zuflussjahr zu und "
+            "verhindert eine doppelte Erfassung; KAP-Zeilen können sich "
+            "dadurch ändern.",
+        )
+    if _avail.get('invstg'):
+        _bind_toggle(
+            _dom, 'invstg', f"_ui_tg_invstg_{_dataset_id[:12]}",
+            "InvStG-Klassifizierung (KAP-INV)",
+            "ETFs als Investmentfonds nach InvStG: separate Meldung auf "
+            "Anlage KAP-INV mit Teilfreistellung je Fondsart. Deaktivieren "
+            "behandelt alle ETFs wie normale Aktien auf Anlage KAP.",
+            "meldet Fondswerte auf Anlage KAP-INV und berücksichtigt die "
+            "hinterlegte Teilfreistellung; ohne die Methode laufen die "
+            "Werte über Anlage KAP.",
+        )
+    if _avail.get('tageskurs'):
+        _fx_corr_total = d.get('fx_correction_total', 0)
+        _bind_toggle(
+            _dom, 'tageskurs', f"_ui_tg_tageskurs_{_dataset_id[:12]}",
+            "Tageskurs-Methode "
+            f"({'+' if _fx_corr_total >= 0 else ''}{fmt_de(_fx_corr_total)} EUR)",
+            "Rechnet Erlöse und Anschaffungskosten jeweils zum FX-Kurs ihres "
+            "eigenen Datums um (§20 Abs. 4 S. 1 EStG) statt den Netto-PnL "
+            "zum Schlusskurs. Benötigt CLOSED_LOT-Daten der Flex Query.",
+            "ersetzt für betroffene Geschäfte die IBKR-Schlusskursumrechnung; "
+            f"erkannte Gesamtdifferenz in diesem Bericht: "
+            f"{'+' if _fx_corr_total >= 0 else ''}"
+            f"{fmt_de(_fx_corr_total)} EUR. Die betroffenen Steuerzeilen "
+            "werden neu berechnet.",
+        )
+    if _avail.get('fx_margin'):
+        _bind_toggle(
+            _dom, 'fx_margin', f"_ui_tg_fx_margin_{_dataset_id[:12]}",
+            "FX-Saldo-Korrektur",
+            "Negative Fremdwährungssalden werden als Margin-Schuld behandelt: "
+            "die Tilgung einer Schuld veräußert kein Fremdwährungsguthaben "
+            "(BMF Rn. 131). Deaktivieren übernimmt die IBKR-Rohwerte. "
+            "Ändert die Berechnung und löst einen Neulauf aus.",
+            "entfernt Tilgungen von Fremdwährungsschulden aus dem "
+            "steuerpflichtigen FX-Ergebnis; insbesondere Zeile 19 kann sich "
+            "ändern.",
+        )
+    with st.expander("DBA-Prüfung Fonds-Quellensteuer", expanded=False):
+        st.markdown('<span class="badge-beta">Beta</span>',
+                    unsafe_allow_html=True)
+        st.caption(
+            "Standard: Rohsteuer × (1 − Teilfreistellung). Die Beta prüft "
+            "jedes Ereignis einzeln: Ausschüttung, Einbehalt und Erstattung "
+            "werden gematcht, hinterlegte DBA-Höchstsätze (z. B. 15 % nach "
+            "Art. 10 Abs. 2 DBA-USA) und der deutsche 25%-Höchstbetrag "
+            "(BMF Rn. 148) begrenzen Zeile 41; Auffälligkeiten werden "
+            "Prüffälle."
+        )
+        _bind_toggle(
+            _dom, 'dba_beta', f"_ui_tg_dba_beta_{_dataset_id[:12]}",
+            "Beta aktivieren",
+            "Ändert die Berechnung und löst einen Neulauf aus. Werte vor "
+            "Übernahme in die Steuererklärung manuell prüfen.",
+            "kann Zeile 41 und die zugehörigen Prüffälle verändern; andere "
+            "Formularzeilen bleiben unverändert.",
+        )
+        if _dom['toggles'].get('dba_beta'):
+            st.caption(
+                "Beta aktiv: unbekannte oder zeitversetzte Vorgänge bleiben "
+                "Prüffälle im Bereich Anlage KAP-INV."
+            )
+
+
+# ── Gemeinsame Ableitungen fuer die Renderer (nur Lesezugriff auf vm/d) ──────
+
+kap_inv = vm['kap_inv']
+etf_by_isin = vm['etf_by_isin']
+has_etf_data = vm['has_etf_data']
+kap_inv_form = vm['kap_inv_form']
+no_invstg_summary = vm['no_invstg_summary']
+anlage_so = vm['anlage_so']
+has_so_data = vm['has_so_data']
+
+invstg_aktiv = toggles['invstg']
+tageskurs_aktiv = toggles['tageskurs']
+zuflussprinzip_aktiv = toggles['zufluss']
+de_kest_variante_b = toggles['variante_b']
+dba_wht_beta_enabled = vm['dba_beta_enabled']
+
 cross_year_premium = audit.get('cross_year_premium_eur', 0)
 cross_year_by_year = audit.get('cross_year_by_year', {})
-cross_year_details = [det for det in audit.get('stillhalter_details', []) if det.get('is_cross_year')]
+cross_year_details = [
+    det for det in audit.get('stillhalter_details', [])
+    if det.get('is_cross_year')
+]
 zufluss_details = audit.get('zufluss_details', [])
 zufluss_premium = audit.get('zufluss_premium_eur', 0)
 prior_zufluss_details = audit.get('prior_zufluss_details', [])
 prior_zufluss_correction = audit.get('prior_zufluss_correction_eur', 0)
-has_cross_year = len(cross_year_details) > 0 or len(zufluss_details) > 0 or len(prior_zufluss_details) > 0
-
-# ── Flex Query Hinweis ────────────────────────────────────────────────────────
-
-if not d.get('has_trade_price', False):
-    st.markdown("""
-<div style="background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #fbbf24;">Hinweis:</strong> Die Flex Query enthält kein <code>tradePrice</code>-Feld. Stillhalterprämien werden mit dem Tagesschlusskurs (<code>closePrice</code>) statt dem tatsächlichen Ausführungspreis berechnet.
-    Für genauere Ergebnisse: In IBKR unter <em>Reports → Flex Queries</em> eine erweiterte Query erstellen und bei <em>Trade Confirmation</em> alle Felder aktivieren (insbesondere <em>Execution</em>-Details).
-</div>
-""", unsafe_allow_html=True)
-
-# ── Stillhalter Warnung ──────────────────────────────────────────────────────
-
-unmatched = d.get('audit', {}).get('stillhalter_unmatched', [])
-if unmatched:
-    details = ", ".join(f"{u['symbol']} ({u['expiry']})" for u in unmatched)
-    st.markdown(f"""
-<div style="background: rgba(251,146,60,0.08); border: 1px solid rgba(251,146,60,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #fb923c;">Stillhalter-Warnung:</strong> Für {len(unmatched)} Assignment(s) wurde der ursprüngliche Optionsverkauf nicht gefunden: <strong>{details}</strong>.
-    Die Option wurde vermutlich in einem Vorjahr verkauft (Prämie kassiert) und erst im Steuerjahr assigned. Ohne den Original-Trade kann die Prämie nicht berechnet und verbleibt in Topf 1 (Aktien) statt Topf 2 (Sonstiges).
-    <br><em>Lösung:</em> Das Vorjahres-XML, in dem die Option verkauft wurde, oben als "Vorjahres-XML" hochladen.
-</div>
-""", unsafe_allow_html=True)
-
-occ_rename_matches = d.get('audit', {}).get('occ_rename_matches', [])
-if occ_rename_matches:
-    split_count = sum(m.get('match_type') == 'split' for m in occ_rename_matches)
-    adjustment_count = sum(
-        m.get('match_type') == 'contract_adjustment'
-        for m in occ_rename_matches
-    )
-    rename_count = len(occ_rename_matches) - split_count - adjustment_count
-    occ_rows = []
-    for m in occ_rename_matches:
-        if m.get('match_type') == 'split':
-            qty_text = (
-                f"{m.get('quantity', 0):g} alter &rarr; "
-                f"{m.get('close_quantity', 0):g} neue Kontrakte"
-            )
-        else:
-            qty_text = f"{m.get('quantity', 0):g} Kontrakt(e)"
-        occ_rows.append(
-            f"<strong>{m['sell_symbol']}</strong> (verkauft {m['sell_date']}) &rarr; "
-            f"<strong>{m['close_symbol']}</strong> "
-            f"(geschlossen {m['close_date']}, {qty_text})"
-        )
-    occ_lines = "<br>".join(occ_rows)
-    action_parts = []
-    if split_count:
-        action_parts.append(f"{split_count} Split-Zuordnung(en)")
-    if adjustment_count:
-        action_parts.append(f"{adjustment_count} Kontraktanpassung(en)")
-    if rename_count:
-        action_parts.append(f"{rename_count} Serien-Umbenennung(en)")
-    action_summary = " und ".join(action_parts)
-    st.markdown(f"""
-<div style="background: rgba(56,189,248,0.08); border: 1px solid rgba(56,189,248,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
-    <strong style="color: #38bdf8;">Kapitalmaßnahme erkannt:</strong>
-    {action_summary}. Die veränderte Optionsserie wurde anhand der stabilen IBKR-Kontraktidentität und ihrer FIFO-Kostenbasis zugeordnet.
-    Die Schließung wurde automatisch dem ursprünglichen Verkauf zugeordnet, damit die Stillhalterprämie nur einmal versteuert wird:<br>{occ_lines}<br>
-    <span style="color: #64748b; font-size: 0.75rem;">Bitte prüfen: Falls es sich wider Erwarten um zwei verschiedene Kontrakte handelt, die Positionen in den Trade-Details kontrollieren.</span>
-</div>
-""", unsafe_allow_html=True)
-
-underlying_symbol_aliases = d.get('audit', {}).get('underlying_symbol_aliases', {})
-if underlying_symbol_aliases:
-    alias_rows = "<br>".join(
-        f"<strong>{', '.join(sorted(members))}</strong> = <strong>{canon}</strong>"
-        for canon, members in sorted(underlying_symbol_aliases.items())
-    )
-    st.markdown(f"""
-<div style="background: rgba(56,189,248,0.08); border: 1px solid rgba(56,189,248,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
-    <strong style="color: #38bdf8;">Symbol-Alias erkannt:</strong>
-    IBKR führt dieselbe Aktie unter verschiedenen Symbolen (Handelsplatz-Suffix oder Ticker-Umbenennung). Die Zuordnung von Optionsprämien zu Aktien-Trades läuft über die stabile IBKR-Kontraktidentität (conid/ISIN):<br>{alias_rows}<br>
-    <span style="color: #64748b; font-size: 0.75rem;">Betrifft die Stillhalter-Korrekturen der Aktien-Kostenbasis; die Trade-Details zeigen die korrigierten Werte.</span>
-</div>
-""", unsafe_allow_html=True)
-
-zufluss_unmatched = d.get('audit', {}).get('zufluss_unmatched', [])
-if zufluss_unmatched:
-    z_details = ", ".join(f"{u['symbol']}" for u in zufluss_unmatched)
-    st.markdown(f"""
-<div style="background: rgba(251,146,60,0.08); border: 1px solid rgba(251,146,60,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #fb923c;">Zufluss-Warnung:</strong> {len(zufluss_unmatched)} Glattstellung(en) ohne Eröffnungs-SELL: <strong>{z_details}</strong>.
-    Die Option wurde in einem Vorjahr verkauft (Prämie kassiert) und im Steuerjahr geschlossen. Ohne das Vorjahres-XML wird die Prämie doppelt versteuert (einmal im Verkaufsjahr, einmal hier im Schließungsjahr).
-    <br><em>Lösung:</em> Das Vorjahres-XML hochladen, damit die Zufluss-Korrektur greifen kann.
-</div>
-""", unsafe_allow_html=True)
-
-unrouted_categories = d.get('audit', {}).get('unrouted_asset_categories', [])
-if unrouted_categories:
-    unrouted_total = sum(e.get('pnl_eur', 0) for e in unrouted_categories)
-    unrouted_rows = []
-    for e in unrouted_categories:
-        category = html.escape(str(e.get('category', '?')))
-        syms = ', '.join(
-            html.escape(str(symbol)) for symbol in e.get('symbols', [])[:6]
-        )
-        if len(e.get('symbols', [])) > 6:
-            syms += f" und {len(e['symbols']) - 6} weitere"
-        unrouted_rows.append(
-            f"<strong>{category}</strong>: {e.get('count', 0)} Position(en), "
-            f"{e.get('pnl_eur', 0):,.2f} EUR{' (' + syms + ')' if syms else ''}"
-        )
-    unrouted_lines = "<br>".join(unrouted_rows)
-    st.markdown(f"""
-<div style="background: rgba(251,146,60,0.08); border: 1px solid rgba(251,146,60,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
-    <strong style="color: #fb923c;">Nicht zugeordnete Instrumente:</strong>
-    Für {len(unrouted_categories)} Instrumentenkategorie(n) mit einem Saldo von {unrouted_total:,.2f} EUR kennt das Tool keine Steuertopf-Zuordnung:<br>{unrouted_lines}<br>
-    Diese Ergebnisse sind in den Zeilen der Anlage KAP <strong>nicht enthalten</strong> und müssen manuell nachgetragen werden.
-    <br><span style="color: #64748b; font-size: 0.75rem;">Die betroffenen Trades stehen im Excel-Export im Block "Nicht zugeordnet". Die Kategorie kann als Issue gemeldet werden, damit sie fest eingebaut wird.</span>
-</div>
-""", unsafe_allow_html=True)
-
-unhandled_codes = d.get('audit', {}).get('unhandled_activity_codes', [])
-if unhandled_codes:
-    unhandled_total = sum(e.get('amount_eur', 0) for e in unhandled_codes)
-    code_rows = []
-    for e in unhandled_codes:
-        code = html.escape(str(e.get('code', '?')))
-        desc = html.escape('; '.join(
-            str(description) for description in e.get('descriptions', [])
-        )[:120])
-        code_rows.append(
-            f"<strong>{code}</strong>: {e.get('count', 0)} Buchung(en), "
-            f"{e.get('amount_eur', 0):,.2f} EUR{' (' + desc + ')' if desc else ''}"
-        )
-    code_lines = "<br>".join(code_rows)
-    st.markdown(f"""
-<div style="background: rgba(251,146,60,0.08); border: 1px solid rgba(251,146,60,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
-    <strong style="color: #fb923c;">Nicht automatisch zugeordnete Cash-Buchungen:</strong>
-    IBKR hat Buchungsarten geliefert, für die das Tool keine sichere automatische Behandlung kennt, Saldo {unhandled_total:,.2f} EUR:<br>{code_lines}<br>
-    Diese Beträge sind in <strong>keiner</strong> Zeile der Anlage KAP enthalten.
-    <br><span style="color: #64748b; font-size: 0.75rem;">TTAX und andere Prüffälle bitte anhand der IBKR-Abrechnung manuell zuordnen; neue Buchungscodes bitte als Issue melden.</span>
-</div>
-""", unsafe_allow_html=True)
-
-# ── Zuflussprinzip Toggle ────────────────────────────────────────────────────
-
-zuflussprinzip_aktiv = False
-if has_cross_year:
-    zufluss_parts = []
-    if cross_year_details:
-        zufluss_parts.append(f"{len(cross_year_details)} Assignment-Prämienanteil(e) aus Vorjahren ({fmt_de(cross_year_premium)} EUR)")
-    if zufluss_details:
-        zufluss_parts.append(f"{len(zufluss_details)} offene Stillhalter-Position(en) mit Zufluss im Steuerjahr ({fmt_de(zufluss_premium)} EUR, bereits in Berechnung enthalten)")
-    if prior_zufluss_details:
-        zufluss_parts.append(f"{len(prior_zufluss_details)} Vorjahres-Prämie(n) aus Glattstellungen korrigiert (-{fmt_de(prior_zufluss_correction)} EUR, bereits in Berechnung enthalten)")
-    st.markdown(f"""
-<div style="background: rgba(168,85,247,0.08); border: 1px solid rgba(168,85,247,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #a855f7;">Zuflussprinzip (BMF Rn. 25, 33):</strong> {"<br>".join(zufluss_parts)}
-</div>
-""", unsafe_allow_html=True)
-    if cross_year_details:
-        zuflussprinzip_aktiv = st.checkbox(
-            "Zuflussprinzip anwenden (BMF Rn. 25, 33)",
-            value=True,
-            help="Verschiebt Assignment-Prämien aus Vorjahren aus dem aktuellen Steuerjahr heraus. "
-                 "Diese Prämien gehören in die Steuererklärung des jeweiligen Vorjahres. "
-                 "Offene Stillhalter-Positionen und Vorjahres-Korrekturen sind bereits automatisch berechnet.")
-
-# Adjusted values for Zuflussprinzip
-# Note: zufluss_premium and prior_zufluss_correction are already applied in calculate_tax_report.py
-# The toggle only adjusts assignment cross-year premiums (existing behavior)
-adj_cross = cross_year_premium if zuflussprinzip_aktiv else 0
-adj_topf_2 = topf_2 - adj_cross
-adj_zeile_19 = zeile_19 - adj_cross
-
-# ── InvStG Toggle (vor Hero, damit Adjustments in Zeile 19 einfließen) ───────
-
-kap_inv = d.get('kap_inv', {})
-etf_by_isin = kap_inv.get('etf_by_isin', {})
-has_etf_data = len(etf_by_isin) > 0
-
-invstg_aktiv = False
-if has_etf_data:
-    _cls_labels = {
-        'aktienfonds': 'Aktienfonds (30% TFS)',
-        'mischfonds': 'Mischfonds (15% TFS)',
-        'immobilienfonds': 'Immobilienfonds (60% TFS)',
-        'auslands_immobilienfonds': 'Auslands-Immobilienfonds (80% TFS)',
-    }
-    _cls_counts = {}
-    for v in etf_by_isin.values():
-        label = _cls_labels.get(v.get('classification'), 'sonstige Fonds (0% TFS)')
-        _cls_counts[label] = _cls_counts.get(label, 0) + 1
-    cls_summary = ", ".join(f"{n} {label}" for label, n in sorted(_cls_counts.items()))
-    etf_tickers = ", ".join(sorted(v.get('ticker', '?') for v in etf_by_isin.values()))
-
-    st.markdown(f"""
-<div style="background: rgba(74,222,128,0.08); border: 1px solid rgba(74,222,128,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #4ade80;">InvStG-Klassifizierung (§2 InvStG):</strong> {len(etf_by_isin)} ETFs in der XML erkannt, die nach dem Investmentsteuergesetz als Investmentfonds gelten und auf <strong>Anlage KAP-INV</strong> gemeldet werden (nicht auf Anlage KAP).
-    Davon {cls_summary}.<br>
-    <span style="color: #64748b; font-size: 0.75rem;">Betroffene ETFs: {etf_tickers}</span>
-</div>
-""", unsafe_allow_html=True)
-    invstg_aktiv = st.checkbox(
-        "InvStG-Klassifizierung anwenden (Anlage KAP-INV)",
-        value=True,
-        help="ETFs werden als Investmentfonds nach InvStG behandelt: separate Meldung auf Anlage KAP-INV, "
-             "Teilfreistellung je Fondsart (Aktienfonds 30%, Mischfonds 15%, Immobilienfonds 60%, "
-             "Auslands-Immobilienfonds 80%, sonstige 0%). "
-             "Deaktivieren = alle ETFs wie normale Aktien auf Anlage KAP behandeln.")
-
-    if not invstg_aktiv:
-        etf_raw_net = kap_inv.get('etf_gain_raw_eur', 0) + kap_inv.get('etf_loss_raw_eur', 0)
-        topf_1 += etf_raw_net
-        zeile_19 += etf_raw_net
-        adj_zeile_19 += etf_raw_net
-        zeile_20 += max(kap_inv.get('etf_gain_raw_eur', 0), 0)
-        zeile_23 += abs(min(kap_inv.get('etf_loss_raw_eur', 0), 0))
-        adj_topf_2 += kap_inv.get('etf_dividends_raw_eur', 0)
-        adj_zeile_19 += kap_inv.get('etf_dividends_raw_eur', 0)
-        zeile_19 += kap_inv.get('etf_dividends_raw_eur', 0)
-        # Core Z. 41 already contains the capped InvStG amount. With InvStG
-        # disabled, replace that amount by the raw fund tax exactly once.
-        quellensteuer = calculate_tax_report.get_kap_line_41_for_reporting(
-            d, invstg_enabled=False
-        )
-
-# ── Tageskurs-Korrektur (§20 Abs. 4 S. 1 EStG) ──────────────────────────────
 
 fx_corr_total = d.get('fx_correction_total', 0)
-fx_corr_by_topf = d.get('fx_correction_by_topf', {})
-tk_gain_adj = d.get('fx_corr_gain_adj', {})
-tk_loss_adj = d.get('fx_corr_loss_adj', {})
-tageskurs_aktiv = False
-tageskurs_kapinv_corr_raw = 0
-tageskurs_kapinv_corr = 0
+tk_gain_adj = d.get('fx_corr_gain_adj', {}) or {}
+tk_loss_adj = d.get('fx_corr_loss_adj', {}) or {}
+tageskurs_kapinv_corr = final.get('tageskurs_kapinv_corr', 0)
+tageskurs_kapinv_corr_raw = final.get('tageskurs_kapinv_corr_raw', 0)
+adj_cross = final.get('adj_cross', 0)
 
-if abs(fx_corr_total) > 0.01:
-    st.markdown(f"""
-<div style="background: rgba(251,146,60,0.08); border: 1px solid rgba(251,146,60,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
-    <strong style="color: #fb923c;">Tageskurs-Methode (§20 Abs. 4 S. 1 EStG):</strong>
-    <em>"Bei nicht in Euro getätigten Geschäften sind die Einnahmen im Zeitpunkt der Veräußerung und die Anschaffungskosten im Zeitpunkt der Anschaffung in Euro umzurechnen."</em><br>
-    IBKR rechnet den gesamten Netto-Gewinn zum Schlusskurs um. Das Gesetz verlangt: Erlös zum Verkaufskurs, Kosten zum Kaufkurs.
-    Abweichung für {steuerjahr}: <strong style="color: #fb923c;">{"+" if fx_corr_total >= 0 else ""}{fmt_de(fx_corr_total)} EUR</strong> (CLOSED_LOT Analyse, ohne Futures*).<br>
-    <span style="color: #64748b; font-size: 0.72rem;">*Futures ausgeschlossen: Die Kostenbasis bei Futures ist der volle Kontraktwert (z.B. $200.000 bei ZT), nicht die tatsächlich gezahlte Margin. Eine FX-Korrektur auf den Notional würde massive Phantom-Gewinne/-Verluste erzeugen, die keinem realen Cashflow entsprechen.</span>
-</div>
-""", unsafe_allow_html=True)
-    tageskurs_aktiv = st.checkbox(
-        "Tageskurs-Methode anwenden (§20 Abs. 4 S. 1 EStG)",
-        value=True,
-        help="Rechnet Veräußerungserlöse und Anschaffungskosten jeweils zum FX-Kurs ihres eigenen Datums um, "
-             "statt den gesamten Netto-PnL zum Schlusskurs. Gesetzlich korrekt, aber Abweichung zur IBKR-Methode. "
-             "Nur verfügbar mit Extended Flex Query (CLOSED_LOT Daten).")
-
-    if tageskurs_aktiv:
-        corr_topf1 = fx_corr_by_topf.get('Topf1', 0)
-        corr_topf2 = fx_corr_by_topf.get('Topf2', 0)
-        tageskurs_kapinv_corr_raw = fx_corr_by_topf.get('KAP-INV', 0)
-        tageskurs_kapinv_corr = calculate_tax_report.get_kap_inv_tageskurs_delta_for_reporting(d)
-        topf_1 += corr_topf1
-        adj_topf_2 += corr_topf2
-        if invstg_aktiv:
-            adj_zeile_19 += corr_topf1 + corr_topf2
-            zeile_19 += corr_topf1 + corr_topf2
-        else:
-            topf_1 += tageskurs_kapinv_corr_raw
-            adj_zeile_19 += fx_corr_total
-            zeile_19 += fx_corr_total
-        # Zeilen 20/22/23 per-Lot gain/loss adjustments
-        zeile_20 += tk_gain_adj.get('Topf1', 0)
-        zeile_23 -= tk_loss_adj.get('Topf1', 0)
-        zeile_22 -= tk_loss_adj.get('Topf2', 0)
-        if not invstg_aktiv:
-            zeile_20 += tk_gain_adj.get('KAP-INV', 0)
-            zeile_23 -= tk_loss_adj.get('KAP-INV', 0)
-    else:
-        tageskurs_kapinv_corr_raw = 0
-        tageskurs_kapinv_corr = 0
-
-# ── DE-Dividenden Variante B (für Software ohne Steuerbescheinigung-Flow) ───
-# Manche Steuerprogramme (WISO, Buhl, taxfix) schalten Z7/Z37/Z38 nur frei,
-# wenn eine deutsche Steuerbescheinigung nach §45a EStG vorliegt. IBKR liefert
-# diese nicht, obwohl die deutsche Verwahrstelle KESt+Soli auf DE-ISINs einbehält.
-# Variante B verschiebt die Werte technisch nach Z19/Z41. Sie ist kein amtlich
-# belegter Ersatz fuer die Steuerbescheinigung und muss fachlich abgestimmt werden.
-de_kest_variante_b = False
-if abs(zeile_7) > 0.01:
-    st.markdown(f"""
-<div style="background: rgba(56,189,248,0.08); border: 1px solid rgba(56,189,248,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
-    <strong style="color: #38bdf8;">Deutsche Dividenden erkannt:</strong>
-    {fmt_de(zeile_7)} EUR Bruttodividende + {fmt_de(zeile_37 + zeile_38)} EUR DE-KESt/Soli auf DE-ISINs (z.B. SAP, Allianz, Rheinmetall).
-    Die deutsche Verwahrstelle (Clearstream) hat 26,375&nbsp;% an der Quelle einbehalten; das ist <em>inländischer Steuerabzug</em> nach §43 EStG, auch wenn IBKR keine Steuerbescheinigung ausstellt.<br><br>
-    <strong style="color: #38bdf8;">Variante A (Default, tax-legally präzise):</strong> Eintragung in Z. 7 (brutto) + Z. 37 (KESt) + Z. 38 (Soli).<br>
-    <strong style="color: #38bdf8;">Variante B (technische Ersatzdarstellung):</strong>
-    Manche Steuerprogramme schalten Z. 7/37/38 nur frei, wenn eine Steuerbescheinigung
-    nach §45a EStG vorliegt. Die Variante verschiebt dann die Bruttodividende nach Z. 19
-    und DE-KESt+Soli nach Z. 41. Diese Darstellung ist kein amtlich belegter Ersatz für
-    die Steuerbescheinigung; bitte vor der Abgabe mit Finanzamt oder Steuerberatung abstimmen.
-</div>
-""", unsafe_allow_html=True)
-    de_kest_variante_b = st.checkbox(
-        "Variante B: DE-KESt nach Zeile 19/41 verschieben",
-        value=False,
-        help="Aktivieren, falls das Steuerprogramm Zeile 7/37/38 mangels "
-             "Steuerbescheinigung nicht freischaltet. Die Bruttodividende wird dann zu "
-             "Zeile 19, DE-KESt+Soli zu Zeile 41 addiert. Das ist eine technische "
-             "Ersatzdarstellung, kein amtlich belegter Ersatz für die Bescheinigung; "
-             "bitte vor der Abgabe fachlich abstimmen.")
-
-# ── Konsolidierte Toggle-bereinigte Werte (Single Source of Truth) ──────────
-# Wird von GUI-Metrics, KAP-INV-Hero und Text-Report gemeinsam genutzt.
-# ETF-Felder werden bei Bedarf nach der Override-UI aktualisiert.
-_etf_reintegrate = has_etf_data and not invstg_aktiv
-final = {
-    'stocks_gain': (
-        d.get('stocks_gain_eur', 0)
-        + (tk_gain_adj.get('Topf1', 0) if tageskurs_aktiv else 0)
-        + (tk_gain_adj.get('KAP-INV', 0) if (tageskurs_aktiv and _etf_reintegrate) else 0)
-        + (max(kap_inv.get('etf_gain_raw_eur', 0), 0) if _etf_reintegrate else 0)
-    ),
-    'stocks_loss': (
-        d.get('stocks_loss_eur', 0)
-        + (tk_loss_adj.get('Topf1', 0) if tageskurs_aktiv else 0)
-        + (tk_loss_adj.get('KAP-INV', 0) if (tageskurs_aktiv and _etf_reintegrate) else 0)
-        + (min(kap_inv.get('etf_loss_raw_eur', 0), 0) if _etf_reintegrate else 0)
-    ),
-    'dividends': (
-        d.get('dividends_eur', 0)
-        + (kap_inv.get('etf_dividends_raw_eur', 0) if _etf_reintegrate else 0)
-    ),
-    'interest': d.get('interest_eur', 0),
-    'options_gain': (
-        d.get('options_gain_eur', 0)
-        - (cross_year_premium if zuflussprinzip_aktiv else 0)
-        + (tk_gain_adj.get('Topf2', 0) if tageskurs_aktiv else 0)
-    ),
-    'options_loss': (
-        d.get('options_loss_eur', 0)
-        + (tk_loss_adj.get('Topf2', 0) if tageskurs_aktiv else 0)
-    ),
-    'topf_1': topf_1,
-    'topf_2': adj_topf_2,
-    'zeile_7': zeile_7,
-    'zeile_19': adj_zeile_19,
-    'zeile_20': zeile_20,
-    'zeile_22': zeile_22,
-    'zeile_23': zeile_23,
-    'zeile_37': zeile_37,
-    'zeile_38': zeile_38,
-    'quellensteuer': quellensteuer,
-    'etf_net_taxable': (kap_inv.get('etf_net_taxable_eur', 0) + tageskurs_kapinv_corr) if (has_etf_data and invstg_aktiv) else 0,
-    'etf_wht':         calculate_tax_report.get_kap_inv_wht_for_reporting(kap_inv)      if (has_etf_data and invstg_aktiv) else 0,
-}
-
-if de_kest_variante_b and abs(final['zeile_7']) > 0.01:
-    # Variante B: DE-Dividenden werden fiktiv wie ausländische Erträge behandelt.
-    # Damit `zeile_19 = topf_1 + topf_2` invariant bleibt (Hero-Formel,
-    # Excel-Reconciliation, Multi-Account-Tabelle), wandert die Bruttodividende
-    # auch in dividends/topf_2 — die DE-KESt+Soli analog in quellensteuer (Z41).
-    final['dividends']     += final['zeile_7']
-    final['topf_2']        += final['zeile_7']
-    final['zeile_19']      += final['zeile_7']
-    final['quellensteuer'] += final['zeile_37'] + final['zeile_38']
-    final['zeile_7']  = 0
-    final['zeile_37'] = 0
-    final['zeile_38'] = 0
-
-created_at = _dt.now().strftime('%d.%m.%Y %H:%M')
-no_invstg_summary = calculate_tax_report.get_no_invstg_summary(
-    d, include_tageskurs=tageskurs_aktiv
-)
-
-# ── Basiswährung ────────────────────────────────────────────────────────────
-
-base_curr = d.get('base_currency', 'USD')
-base_icon = "🇪🇺" if base_curr == "EUR" else "🇺🇸"
-st.markdown(f"""
-<div style="background: rgba(99,102,241,0.08); border: 1px solid rgba(99,102,241,0.25); border-radius: 10px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    {base_icon} <strong style="color: #818cf8;">Basiswährung: {base_curr}</strong>: {"Beträge in StmtFunds sind bereits in EUR (BaseCurrency-Ansicht)." if base_curr == "EUR" else "USD-Beträge werden über tägliche Wechselkurse in EUR umgerechnet."}
-</div>
-""", unsafe_allow_html=True)
-
-if n_accounts > 1:
-    st.markdown(f"""
-<div style="background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.25); border-radius: 10px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #fbbf24;">{n_accounts} Konten zusammengeführt</strong>: Jedes Konto wurde separat berechnet, die Ergebnisse wurden addiert.
-</div>
-""", unsafe_allow_html=True)
-
-classification_review_items = d.get('classification_review_items', []) or []
-if classification_review_items:
-    review_names = ", ".join(
-        f"{item.get('ticker', item.get('isin', '?'))} ({item.get('isin', '?')})"
-        for item in classification_review_items
-    )
-    st.warning(
-        f"Steuerliche Produktklassifikation offen: {review_names}. Die Berechnung "
-        "behält bis zur Klärung den bisherigen KAP-/KAP-INV-Pfad bei; die Werte "
-        "sind für diese Produkte nicht zur ungeprüften Übernahme freigegeben."
-    )
-    with st.expander("Details zu offenen ETF-/ETP-Klassifikationen", expanded=False):
-        review_table = "| Produkt | ISIN | Bisheriger Rechenpfad | Prüfgrund |\n"
-        review_table += "|---------|------|-----------------------|-----------|\n"
-        for item in classification_review_items:
-            review_table += (
-                f"| {item.get('ticker', '')} | {item.get('isin', '')} | "
-                f"{item.get('routing_classification', '')} | "
-                f"{item.get('review_reason', '')} |\n"
-            )
-        st.markdown(review_table)
-
-# ── FxTransactions-Warnung ───────────────────────────────────────────────────
-
-xml_has_fx = d.get('xml_has_fx_data', True)
-fx_source = d.get('fx_source', 'none')
-
-if not xml_has_fx and fx_source != 'csv':
-    st.markdown("""
-<div style="background: rgba(251,146,60,0.1); border: 1px solid rgba(251,146,60,0.35); border-radius: 10px; padding: 0.85rem 1rem; margin-bottom: 1rem; font-size: 0.82rem; color: #cbd5e1; line-height: 1.6;">
-    <strong style="color: #fb923c; font-size: 0.9rem;">Flex Query unvollständig: Keine FX-Transaktionsdaten</strong><br>
-    Die Flex Query XML enthält keine <code>FxTransactions</code>-Sektion. Ohne diese Daten können Fremdwährungs-Gewinne/-Verluste
-    nur approximiert werden (FIFO-Schätzung mit eingeschränkter Genauigkeit).<br><br>
-    <strong style="color: #fdba74;">Lösung bei EUR-Basiskonten:</strong> Oben zusätzlich den
-    <strong>IBKR Standard-Bericht (CSV)</strong> hochladen: Er enthält IBKRs aggregierte
-    FIFO-Rohwerte. Einzelne Schuldtilgungen lassen sich daraus nicht erkennen; bei negativem
-    Währungssaldo und aktiver Saldo-Korrektur bleibt daher die FIFO-Näherung maßgeblich.
-    Bei USD-Basiskonten ist dieser CSV-Fallback nicht verfügbar.<br>
-    <span style="color: #94a3b8; font-size: 0.78rem;">
-    Alternativ: In IBKR unter <em>Reports → Flex Queries → Configure</em> die Sektion
-    <em>FX Transactions</em> aktivieren und die XML neu exportieren.
-    </span>
-</div>
-""", unsafe_allow_html=True)
-elif not xml_has_fx and fx_source == 'csv':
-    st.markdown("""
-<div style="background: rgba(16,185,129,0.08); border: 1px solid rgba(16,185,129,0.25); border-radius: 10px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #34d399;">FX-Daten aus CSV übernommen.</strong>
-    Die Flex Query enthält keine FxTransactions; der IBKR Standard-Bericht liefert
-    IBKRs aggregierte FIFO-Rohwerte. Eine buchungsweise Schuldtilgungsprüfung ist damit
-    nicht möglich.
-</div>
-""", unsafe_allow_html=True)
-
-# ── Hero ─────────────────────────────────────────────────────────────────────
-
-hero_color = "#4ade80" if final['zeile_19'] >= 0 else "#f87171"
-invstg_label = ""
-st.markdown(f"""
-<div class="hero-card">
-    <div class="hero-label">Zeile 19 · Ausländische Kapitalerträge (Netto){"  · Zuflussprinzip" if zuflussprinzip_aktiv else ""}{invstg_label}</div>
-    <div class="hero-value" style="color:{hero_color}">{fmt(final['zeile_19'])}</div>
-    <div class="hero-formula">Topf 1 ({fmt(final['topf_1'])}) + Topf 2 ({fmt(final['topf_2'])})</div>
-</div>
-""", unsafe_allow_html=True)
-
-# ── Topf 1: Aktien ───────────────────────────────────────────────────────────
-
-topf_1_label = "Topf 1 · Aktien ohne ETF-Fonds (separate Verrechnung §20 Abs. 6 S. 4 EStG)" if (has_etf_data and invstg_aktiv) else "Topf 1 · Aktien (separate Verrechnung §20 Abs. 6 S. 4 EStG)"
-section_title(topf_1_label)
-
-st.markdown(
-    '<div class="metric-grid">'
-    + metric_card("Aktiengewinne", final['stocks_gain'], "gain")
-    + metric_card("Aktienverluste", final['stocks_loss'], "loss")
-    + metric_card("Saldo Aktien", final['topf_1'], "saldo")
-    + '</div>',
-    unsafe_allow_html=True
-)
-
-# ── Cross-Year Put-Korrektur ─────────────────────────────────────────────────
-
-cross_put_corrections = d.get('audit', {}).get('cross_year_put_corrections', [])
-cross_put_total = d.get('audit', {}).get('cross_year_put_total', 0)
-if cross_put_corrections:
-    has_invstg_basis_extra = any(
-        c.get('invstg_basis_extra_per_share_raw', 0) > 0
-        for c in cross_put_corrections
-    )
-    cross_put_explanation = (
-        f"Die Kostenbasis-Korrektur ({fmt_de(cross_put_total)} EUR) stellt den "
-        "Einstandskurs auf den Put-Ausübungspreis. Sie umfasst die bereits im "
-        "Assignment-Jahr versteuerte Prämie und eine zusätzliche, für KAP-INV "
-        "nicht übernommene zusätzliche ausländische Basisreduktion "
-        "(z. B. ROC)."
-        if has_invstg_basis_extra else
-        f"Die Prämie ({fmt_de(cross_put_total)} EUR) wurde bereits im "
-        "Assignment-Jahr versteuert und wird hier vom Aktien-PnL abgezogen "
-        "(Einstandskurs = Strike, nicht Strike minus Prämie)."
-    )
-    st.markdown(f"""
-<div style="background: rgba(168,85,247,0.08); border: 1px solid rgba(168,85,247,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #a855f7;">Put-Assignment Korrektur (BMF Rn. 33):</strong>
-    {len(cross_put_corrections)} Aktienverkäufe stammen aus Put-Assignments früherer Jahre.
-    {cross_put_explanation}
-</div>
-""", unsafe_allow_html=True)
-    with st.expander(f"Details: {len(cross_put_corrections)} Cross-Year Put-Korrekturen"):
-        put_table = "| Symbol | Shares | Strike | Korrektur | Aus Jahr |\n|--------|--------|--------|-----------|----------|\n"
-        for c in cross_put_corrections:
-            put_table += f"| {c['symbol']} | {c['shares']} | {c['strike']} | {fmt_de(c['correction_eur'])} EUR | {c['assignment_year']} |\n"
-        put_table += f"| **Gesamt** | | | **{fmt_de(cross_put_total)} EUR** | |\n"
-        st.markdown(put_table)
-
-# ── Topf 2: Sonstiges ────────────────────────────────────────────────────────
-
-section_title("Topf 2 · Sonstiges (inkl. Termingeschäfte, Dividenden, Zinsen)")
-
-st.markdown(
-    '<div class="metric-grid">'
-    + metric_card("Dividenden", final['dividends'])
-    + metric_card("Zinsen (netto)", final['interest'])
-    + (metric_card("Sollzinsen (n. abzf.)", d.get('debit_interest_eur', 0), "info") if abs(d.get('debit_interest_eur', 0)) > 0.01 else '')
-    + (metric_card("Gebühren (nachrichtl.)", d.get('other_fees_eur', 0), "info") if abs(d.get('other_fees_eur', 0)) > 0.01 else '')
-    + metric_card("Sonstige Gewinne", final['options_gain'], "gain")
-    + metric_card("Sonstige Verluste", final['options_loss'], "loss")
-    + metric_card("Saldo Sonstiges", final['topf_2'], "saldo")
-    + '</div>',
-    unsafe_allow_html=True
-)
-
-topf2_cats = d.get('topf2_by_category', {})
-if topf2_cats:
-    with st.expander("Aufschlüsselung Topf 2"):
-        # Toggle-bereinigt aus final: ETF-Reintegration (InvStG aus) und DE-Dividenden
-        # (Variante B) sind dort bereits eingerechnet. Damit stimmt der Saldo der
-        # Aufschlüsselung mit der Topf-2-Metric-Card und dem Hero überein.
-        div_eur = final['dividends']
-        int_eur = final['interest']
-        cat_table = "| Gattung | Gewinne | Verluste | Netto |\n|---------|--------:|---------:|------:|\n"
-        if div_eur >= 0:
-            cat_table += f"| Dividenden | {fmt_de(div_eur)} EUR | 0,00 EUR | {fmt_de(div_eur)} EUR |\n"
-        else:
-            cat_table += f"| Dividenden | 0,00 EUR | {fmt_de(div_eur)} EUR | {fmt_de(div_eur)} EUR |\n"
-        if int_eur >= 0:
-            cat_table += f"| Zinsen | {fmt_de(int_eur)} EUR | 0,00 EUR | {fmt_de(int_eur)} EUR |\n"
-        else:
-            cat_table += f"| Zinsen | 0,00 EUR | {fmt_de(int_eur)} EUR | {fmt_de(int_eur)} EUR |\n"
-        for cat, vals in sorted(topf2_cats.items()):
-            net = vals['gain'] + vals['loss']
-            cat_table += f"| {cat} | {fmt_de(vals['gain'])} EUR | {fmt_de(vals['loss'])} EUR | {fmt_de(net)} EUR |\n"
-        if zuflussprinzip_aktiv and abs(adj_cross) > 0.01:
-            cat_table += f"| Zufluss-Korrektur | 0,00 EUR | {fmt_de(-adj_cross)} EUR | {fmt_de(-adj_cross)} EUR |\n"
-        tk_corr_topf2 = (tk_gain_adj.get('Topf2', 0) + tk_loss_adj.get('Topf2', 0)) if tageskurs_aktiv else 0
-        if tageskurs_aktiv and abs(tk_corr_topf2) > 0.01:
-            if tk_corr_topf2 >= 0:
-                cat_table += f"| Tageskurs-Korrektur | {fmt_de(tk_corr_topf2)} EUR | 0,00 EUR | {fmt_de(tk_corr_topf2)} EUR |\n"
-            else:
-                cat_table += f"| Tageskurs-Korrektur | 0,00 EUR | {fmt_de(tk_corr_topf2)} EUR | {fmt_de(tk_corr_topf2)} EUR |\n"
-        total_gain = sum(v['gain'] for v in topf2_cats.values()) + max(div_eur, 0) + max(int_eur, 0) + (tk_gain_adj.get('Topf2', 0) if tageskurs_aktiv else 0)
-        total_loss = sum(v['loss'] for v in topf2_cats.values()) + min(div_eur, 0) + min(int_eur, 0) + (tk_loss_adj.get('Topf2', 0) if tageskurs_aktiv else 0) + (-adj_cross if zuflussprinzip_aktiv else 0)
-        cat_table += f"| **Saldo Topf 2** | **{fmt_de(total_gain)} EUR** | **{fmt_de(total_loss)} EUR** | **{fmt_de(total_gain + total_loss)} EUR** |\n"
-        st.markdown(cat_table)
-
-# ── Fremdwährungs-Gewinne/Verluste ──────────────────────────────────────────
-
-fx_results = d.get('fx_results', {})
+fx_results = d.get('fx_results', {}) or {}
 fx_total_gain = d.get('fx_total_gain', 0)
 fx_total_loss = d.get('fx_total_loss', 0)
-fx_mtm = d.get('fx_mtm', {})
-
+fx_mtm = d.get('fx_mtm', {}) or {}
 fx_source = d.get('fx_source', 'none')
 
-if fx_results:
-    if fx_source == 'csv':
-        section_title("Fremdwährungs-Gewinne/Verluste (IBKR-Bericht)")
-    elif fx_source == 'xml':
-        section_title("Fremdwährungs-Gewinne/Verluste (XML FxTransactions)")
-    else:
-        section_title("Fremdwährungs-Gewinne/Verluste (FIFO-Approximation)")
+so_taxable = anlage_so.get('taxable_gain', 0) + anlage_so.get('taxable_loss', 0)
+so_free = anlage_so.get('tax_free_gain', 0) + anlage_so.get('tax_free_loss', 0)
+so_total = anlage_so.get('total_gain', 0) + anlage_so.get('total_loss', 0)
 
-    st.checkbox(
-        "FX-Saldo-Korrektur anwenden (§20 Abs. 2 S. 1 Nr. 7 EStG)",
-        key="fx_margin_correction_enabled",
-        help=(
-            "Empfohlen, aber konservativ. Behandelt negative Fremdwährungssalden als "
-            "Margin-Schuld: Wer eine Fremdwährungs-Schuld tilgt oder aus ihr heraus zahlt, "
-            "veräußert kein Guthaben. BMF Rn. 131 erwähnt nur das verzinsliche "
-            "Fremdwährungs**guthaben** bzw. die Kapital**forderung**; eine Verbindlichkeit "
-            "ist beides nicht.\n\n"
-            "Erkannt wird das am Vorzeichen der IBKR-Buchung: Ein Zufluss mit realisiertem "
-            "Ergebnis schließt eine Short-Position, tilgt also Schuld. Ein Abfluss schließt "
-            "Guthaben und bleibt steuerbar.\n\n"
-            "Die Richtung der Wirkung hängt vom Konto ab; es fallen sowohl Verluste als auch "
-            "Gewinne aus solchen Buchungen weg. Teile der Literatur (z.B. Krumm in K/S/M zu "
-            "§20 EStG) vertreten eine symmetrische Sicht; der BFH hat das nicht final "
-            "entschieden.\n\n"
-            "Deaktivieren = IBKR-/Rohwerte übernehmen (höheres Diskussionsrisiko mit dem "
-            "Finanzamt). Negative Salden werden auch bei deaktivierter Korrektur angezeigt."
+topf2_cats = d.get('topf2_by_category', {}) or {}
+topf2_breakdown = None
+if topf2_cats:
+    topf2_breakdown = calculate_tax_report.build_topf2_breakdown(
+        topf2_cats,
+        final['dividends'],
+        final['interest'],
+        tageskurs_gain_adjustment=(
+            tk_gain_adj.get('Topf2', 0) if tageskurs_aktiv else 0
         ),
+        tageskurs_loss_adjustment=(
+            tk_loss_adj.get('Topf2', 0) if tageskurs_aktiv else 0
+        ),
+        zufluss_adjustment=(-adj_cross if zuflussprinzip_aktiv else 0),
+    )
+
+prueffall_notices = [
+    n for n in vm['notices'] if n['class'] == 'prueffall'
+]
+kritisch_notices = [
+    n for n in prueffall_notices if n['severity'] == 'kritisch'
+]
+transparenz_notices = [
+    n for n in vm['notices'] if n['class'] == 'transparenz'
+]
+
+
+def _inline_marker(page_id):
+    """Schmaler Hinweis in Fachbereichen statt voller Warnboxen."""
+    related = [n for n in prueffall_notices if n.get('target') == page_id]
+    if related:
+        if len(related) == 1:
+            st.caption(
+                "1 Prüffall betrifft diesen Bereich; Details im Bereich "
+                "Prüffälle."
+            )
+        else:
+            st.caption(
+                f"{len(related)} Prüffälle betreffen diesen Bereich; "
+                "Details im Bereich Prüffälle."
+            )
+
+
+# ── Renderer: Übersicht ──────────────────────────────────────────────────────
+
+def render_overview():
+    st.markdown('<p class="page-title">Steuerbericht ' + esc(steuerjahr) +
+                '</p>', unsafe_allow_html=True)
+    base_curr = d.get('base_currency', 'EUR')
+    curr_hint = (
+        "StmtFunds-Beträge bereits in EUR" if base_curr == "EUR"
+        else "USD-Beträge über Tageskurse in EUR umgerechnet"
+    )
+    accounts_label = (
+        esc(", ".join(account_names)) if n_accounts == 1
+        else f"{n_accounts} Konten, separat berechnet und addiert"
+    )
+    st.markdown(
+        f'<div class="meta-row">'
+        f'<span>Konto: <strong>{accounts_label}</strong></span>'
+        f'<span>Basiswährung: <strong>{esc(base_curr)}</strong> · {esc(curr_hint)}</span>'
+        f'<span>Stand: <strong>{esc(created_at)}</strong></span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    kap_inv_lines_for_summary = (
+        kap_inv_form.get('lines', []) if (has_etf_data and invstg_aktiv) else []
+    )
+    summary_so_rows = []
+    if has_so_data:
+        summary_so_rows.append({
+            'line': 'SO',
+            'label': 'Steuerpflichtiger Gewinn/Verlust (bis 1 Jahr)',
+            'value': so_taxable,
+            'highlight': True,
+        })
+        if abs(so_free) > 0.01:
+            summary_so_rows.append({
+                'line': 'SO',
+                'label': 'Steuerfrei (über 1 Jahr Haltedauer)',
+                'value': so_free,
+            })
+
+    n_prueffaelle = vm['notice_counts']['prueffaelle']
+    if n_prueffaelle == 1:
+        review_items = [
+            "1 offener Prüffall – bitte vor der Abgabe im Bereich Prüffälle "
+            "ansehen."
+        ]
+    elif n_prueffaelle > 1:
+        review_items = [
+            f"{n_prueffaelle} offene Prüffälle – bitte vor der Abgabe im "
+            "Bereich Prüffälle ansehen."
+        ]
+    else:
+        review_items = []
+    kap_inv_has_review = any(
+        n.get('target') == 'kap_inv' for n in prueffall_notices
     )
 
     st.markdown(
-        '<div class="metric-grid">'
-        + metric_card("FX Gewinne", fx_total_gain, "gain")
-        + metric_card("FX Verluste", fx_total_loss, "loss")
-        + metric_card("FX Netto", fx_total_gain + fx_total_loss, "saldo")
-        + '</div>',
-        unsafe_allow_html=True
+        build_tax_result_summary_html(
+            steuerjahr,
+            final,
+            kap_inv_lines=kap_inv_lines_for_summary,
+            kap_inv_enabled=has_etf_data and invstg_aktiv,
+            kap_status=(
+                "Prüffälle vorhanden" if n_prueffaelle else "Berechnet"
+            ),
+            kap_status_tone="warning" if n_prueffaelle else "ok",
+            kap_inv_status=(
+                "Vorläufig / prüfen" if kap_inv_has_review else "Berechnet"
+            ),
+            kap_inv_status_tone="warning" if kap_inv_has_review else "ok",
+            review_items=review_items,
+            so_rows=summary_so_rows,
+        ),
+        unsafe_allow_html=True,
     )
 
-    # Issue #59: Saldo-Korrektur (Margin-Schulden).
+    if de_kest_variante_b and abs(final.get('zeile_7', 0)) < 0.01:
+        z7_raw = d.get(
+            'zeile_7_kapitalertraege_mit_inlaendischem_steuerabzug_eur', 0)
+        z_kest = (d.get('zeile_37_kapitalertragsteuer_eur', 0)
+                  + d.get('zeile_38_solidaritaetszuschlag_eur', 0))
+        st.caption(
+            f"Variante B aktiv: {fmt_de(z7_raw)} EUR Bruttodividende auf "
+            f"DE-ISINs zu Zeile 19 addiert, {fmt_de(z_kest)} EUR DE-KESt+Soli "
+            "zu Zeile 41. Umschalten im Bereich Anlage KAP."
+        )
+
+    # Status-Streifen
+    chips = []
+    if plaus:
+        if plaus['all_match']:
+            chips.append('<span class="status-chip ok">Plausibilitätscheck ok</span>')
+        else:
+            chips.append('<span class="status-chip warning">Plausibilitätscheck abweichend</span>')
+    if n_prueffaelle:
+        chips.append(
+            f'<span class="status-chip warning">{n_prueffaelle} Prüffälle</span>'
+        )
+    else:
+        chips.append('<span class="status-chip ok">Keine Prüffälle</span>')
+    if has_etf_data and invstg_aktiv:
+        chips.append('<span class="status-chip">KAP-INV vorhanden</span>')
+    if has_so_data:
+        chips.append('<span class="status-chip">Anlage SO vorhanden</span>')
+    if zuflussprinzip_aktiv and cross_year_details:
+        chips.append('<span class="status-chip">Zuflussprinzip aktiv</span>')
+    if tageskurs_aktiv:
+        chips.append('<span class="status-chip">Tageskurs-Methode aktiv</span>')
+    st.markdown(
+        '<div style="display:flex;gap:0.4rem;flex-wrap:wrap;margin:0.2rem 0 1rem 0;">'
+        + ''.join(chips) + '</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Sekundärkarten
+    secondary = [
+        metric_card("Topf 1 · Aktien", final['topf_1'], "saldo"),
+        metric_card("Topf 2 · Sonstiges", final['topf_2'], "saldo"),
+    ]
+    if has_etf_data and invstg_aktiv:
+        secondary.append(metric_card(
+            "KAP-INV steuerpflichtig (Kontrollwert)",
+            final['etf_net_taxable'], "info",
+        ))
+    st.markdown(metric_grid(*secondary), unsafe_allow_html=True)
+    st.caption(
+        "Zeile 19 = Topf 1 + Topf 2. Herleitung und Zwischenwerte stehen im "
+        "Bereich Anlage KAP."
+    )
+
+
+# ── Renderer: Anlage KAP ─────────────────────────────────────────────────────
+
+def render_kap():
+    st.markdown('<p class="page-title">Anlage KAP</p>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="meta-row"><span>Zeile 19 ergibt sich aus '
+        f'Topf 1 (<strong>{fmt(final["topf_1"])}</strong>) und '
+        f'Topf 2 (<strong>{fmt(final["topf_2"])}</strong>).</span></div>',
+        unsafe_allow_html=True,
+    )
+    _inline_marker('kap')
+
+    topf_1_label = (
+        "Topf 1 · Aktien ohne ETF-Fonds (§20 Abs. 6 S. 4 EStG)"
+        if (has_etf_data and invstg_aktiv)
+        else "Topf 1 · Aktien (§20 Abs. 6 S. 4 EStG)"
+    )
+    section_title(topf_1_label)
+    st.markdown(metric_grid(
+        metric_card("Aktiengewinne", final['stocks_gain'], "gain"),
+        metric_card("Aktienverluste", final['stocks_loss'], "loss"),
+        metric_card("Saldo Aktien", final['topf_1'], "saldo"),
+    ), unsafe_allow_html=True)
+
+    cross_put_corrections = audit.get('cross_year_put_corrections', [])
+    cross_put_total = audit.get('cross_year_put_total', 0)
+    if cross_put_corrections:
+        has_invstg_basis_extra = any(
+            c.get('invstg_basis_extra_per_share_raw', 0) > 0
+            for c in cross_put_corrections
+        )
+        cross_put_explanation = (
+            f"Die Kostenbasis-Korrektur ({fmt_de(cross_put_total)} EUR) "
+            "stellt den Einstandskurs auf den Put-Ausübungspreis. Sie "
+            "umfasst die bereits im Assignment-Jahr versteuerte Prämie und "
+            "eine zusätzliche, für KAP-INV nicht übernommene ausländische "
+            "Basisreduktion (z. B. ROC)."
+            if has_invstg_basis_extra else
+            f"Die Prämie ({fmt_de(cross_put_total)} EUR) wurde bereits im "
+            "Assignment-Jahr versteuert und wird hier vom Aktien-PnL "
+            "abgezogen (Einstandskurs = Strike, nicht Strike minus "
+            "Prämie)."
+        )
+        st.markdown(notice_html({
+            'class': 'transparenz', 'severity': 'normal',
+            'title': 'Put-Assignment-Korrektur (BMF Rn. 33)',
+            'body': (
+                f"{len(cross_put_corrections)} Aktienverkäufe stammen aus "
+                f"Put-Assignments früherer Jahre. {cross_put_explanation}"
+            ),
+            'target': None,
+        }, show_target=False), unsafe_allow_html=True)
+        with st.expander(
+                f"Details: {len(cross_put_corrections)} Cross-Year "
+                "Put-Korrekturen"):
+            put_table = ("| Symbol | Shares | Strike | Korrektur | Aus Jahr |\n"
+                         "|--------|--------|--------|-----------|----------|\n")
+            for c in cross_put_corrections:
+                put_table += (
+                    f"| {c['symbol']} | {c['shares']} | {c['strike']} | "
+                    f"{fmt_de(c['correction_eur'])} EUR | "
+                    f"{c['assignment_year']} |\n"
+                )
+            put_table += (
+                f"| **Gesamt** | | | **{fmt_de(cross_put_total)} EUR** | |\n"
+            )
+            st.markdown(put_table)
+
+    section_title("Topf 2 · Sonstiges (Termingeschäfte, Dividenden, Zinsen)")
+    st.markdown(metric_grid(
+        metric_card("Dividenden", final['dividends']),
+        metric_card("Zinsen (netto)", final['interest']),
+        (metric_card("Sollzinsen (n. abzf.)", d.get('debit_interest_eur', 0),
+                     "info")
+         if abs(d.get('debit_interest_eur', 0)) > 0.01 else ''),
+        (metric_card("Gebühren (nachrichtl.)", d.get('other_fees_eur', 0),
+                     "info")
+         if abs(d.get('other_fees_eur', 0)) > 0.01 else ''),
+        metric_card("Sonstige Gewinne", final['options_gain'], "gain"),
+        metric_card("Sonstige Verluste", final['options_loss'], "loss"),
+        metric_card("Saldo Sonstiges", final['topf_2'], "saldo"),
+    ), unsafe_allow_html=True)
+
+    if topf2_breakdown:
+        section_title("Aufschlüsselung Topf 2")
+        cat_table = ("| Gattung | Gewinne | Verluste | Netto |\n"
+                     "|---------|--------:|---------:|------:|\n")
+        for row in topf2_breakdown['rows']:
+            cat_table += (
+                f"| {row['label']} | {fmt_de(row['gain'])} EUR | "
+                f"{fmt_de(row['loss'])} EUR | {fmt_de(row['net'])} EUR |\n"
+            )
+        cat_table += (
+            f"| **Saldo Topf 2** | **{fmt_de(topf2_breakdown['total_gain'])} EUR** | "
+            f"**{fmt_de(topf2_breakdown['total_loss'])} EUR** | "
+            f"**{fmt_de(topf2_breakdown['net'])} EUR** |\n"
+        )
+        st.markdown(cat_table)
+        if any(row['is_adjustment'] for row in topf2_breakdown['rows']):
+            st.caption(
+                "Anpassungszeilen verändern Gewinn- und Verlustspalten "
+                "mit Vorzeichen; beide Spalten sind bis zur Summenzeile "
+                "addierbar."
+            )
+        if abs(topf2_breakdown['net'] - final['topf_2']) > 0.01:
+            st.error(
+                "Interner Abstimmungsfehler: Die Topf-2-Detailzeilen "
+                "stimmen nicht mit dem ausgewiesenen Saldo überein."
+            )
+
+    _render_kap_fx_section()
+    _render_kap_sonderprodukte()
+    _render_kap_variante_b()
+    _render_kap_multi_account()
+
+
+def _render_kap_fx_section():
+    if not fx_results:
+        return
+    src_label = {
+        'csv': 'IBKR-Bericht', 'xml': 'XML FxTransactions',
+    }.get(fx_source, 'FIFO-Approximation')
+    section_title(f"Fremdwährungs-Gewinne/Verluste ({src_label})")
+    st.markdown(metric_grid(
+        metric_card("FX Gewinne", fx_total_gain, "gain"),
+        metric_card("FX Verluste", fx_total_loss, "loss"),
+        metric_card("FX Netto", fx_total_gain + fx_total_loss, "saldo"),
+    ), unsafe_allow_html=True)
+
     fx_has_neg = d.get('fx_has_negative_balance', False)
     fx_opt_a_meta = d.get('fx_option_a_meta', {}) or {}
     correction_enabled = d.get(
         'fx_margin_correction_enabled',
-        fx_opt_a_meta.get('correction_enabled', True)
+        fx_opt_a_meta.get('correction_enabled', True),
     )
     has_raw_data = any('raw_net' in data for data in fx_results.values())
-    has_corrected_data = any('corrected_net' in data for data in fx_results.values())
+    has_corrected_data = any(
+        'corrected_net' in data for data in fx_results.values())
     active_total = fx_total_gain + fx_total_loss
-    raw_total = fx_opt_a_meta.get(
-        'raw_total',
-        sum(data.get('raw_net', data.get('net', 0.0)) for data in fx_results.values())
-    )
-    corrected_total = fx_opt_a_meta.get(
-        'corrected_total',
-        sum(data.get('corrected_net', data.get('net', 0.0)) for data in fx_results.values())
-    )
+    raw_total = fx_opt_a_meta.get('raw_total', sum(
+        data.get('raw_net', data.get('net', 0.0))
+        for data in fx_results.values()))
+    corrected_total = fx_opt_a_meta.get('corrected_total', sum(
+        data.get('corrected_net', data.get('net', 0.0))
+        for data in fx_results.values()))
     diff_corr_raw = corrected_total - raw_total
-    total_neg_days = max((data.get('days_negative', 0) for data in fx_results.values()), default=0)
+    total_neg_days = max(
+        (data.get('days_negative', 0) for data in fx_results.values()),
+        default=0)
     debt_repayments = fx_opt_a_meta.get('debt_repayments', 0)
     debt_repayment_pnl = fx_opt_a_meta.get('debt_repayment_pnl', 0.0)
-    # Brutto-Wirkung getrennt: Heben sich herausgerechnete Gewinne und Verluste auf,
-    # ist die Nettodifferenz null, Zeile 22 ändert sich aber trotzdem.
-    corrected_gain_total = sum(data.get('corrected_gain', data.get('gain', 0.0))
-                               for data in fx_results.values())
-    raw_gain_total = sum(data.get('raw_gain', data.get('gain', 0.0))
-                         for data in fx_results.values())
-    corrected_loss_total = sum(data.get('corrected_loss', data.get('loss', 0.0))
-                               for data in fx_results.values())
-    raw_loss_total = sum(data.get('raw_loss', data.get('loss', 0.0))
-                         for data in fx_results.values())
+    corrected_gain_total = sum(
+        data.get('corrected_gain', data.get('gain', 0.0))
+        for data in fx_results.values())
+    raw_gain_total = sum(
+        data.get('raw_gain', data.get('gain', 0.0))
+        for data in fx_results.values())
+    corrected_loss_total = sum(
+        data.get('corrected_loss', data.get('loss', 0.0))
+        for data in fx_results.values())
+    raw_loss_total = sum(
+        data.get('raw_loss', data.get('loss', 0.0))
+        for data in fx_results.values())
     diff_gain = corrected_gain_total - raw_gain_total
     diff_loss = corrected_loss_total - raw_loss_total
 
     if (has_raw_data or has_corrected_data) and (
             fx_has_neg or debt_repayments or abs(diff_corr_raw) > 0.01
             or abs(diff_gain) > 0.01 or abs(diff_loss) > 0.01):
-
-        accent = "#fb923c" if (abs(diff_corr_raw) > 50.0 or total_neg_days > 30) else "#6ee7b7"
-        raw_label = "IBKR-Rohwert vor Saldo-Prüfung" if fx_source == 'xml' else "Rohwert vor Saldo-Prüfung"
-        comparison_label = "gegenüber IBKR" if fx_source == 'xml' else "gegenüber dem Rohwert"
+        comparison_label = ("gegenüber IBKR" if fx_source == 'xml'
+                            else "gegenüber dem Rohwert")
+        raw_label = ("IBKR-Rohwert vor Saldo-Prüfung" if fx_source == 'xml'
+                     else "Rohwert vor Saldo-Prüfung")
         unchanged_label = "IBKR-Wert" if fx_source == 'xml' else "Rohwert"
-
-        # Welche Währungen waren im Minus?
-        neg_currs = [c for c, dt in fx_results.items() if dt.get('days_negative', 0) > 0]
+        neg_currs = [c for c, dt in fx_results.items()
+                     if dt.get('days_negative', 0) > 0]
         if len(neg_currs) == 1:
             curr_label = f"{neg_currs[0]}-Konto"
         elif neg_currs:
@@ -1713,370 +2652,479 @@ if fx_results:
         if abs(diff_corr_raw) > 0.005:
             effect_word = "erhöht" if diff_corr_raw > 0 else "reduziert"
             if correction_enabled:
-                correction_html = (
-                    f'Die Saldo-Prüfung {effect_word} den Topf-2-FX-Wert {comparison_label} um '
-                    f'<strong>{fmt_de(abs(diff_corr_raw))} EUR</strong>.'
+                correction_text = (
+                    f"Die Saldo-Prüfung {effect_word} den Topf-2-FX-Wert "
+                    f"{comparison_label} um {fmt_de(abs(diff_corr_raw))} EUR."
                 )
             else:
-                correction_html = (
-                    f'Bei aktivierter Saldo-Prüfung läge der Topf-2-FX-Wert {comparison_label} um '
-                    f'<strong>{fmt_de(abs(diff_corr_raw))} EUR</strong> '
-                    f'{"höher" if diff_corr_raw > 0 else "niedriger"}.'
+                correction_text = (
+                    f"Bei aktivierter Saldo-Prüfung läge der Topf-2-FX-Wert "
+                    f"{comparison_label} um {fmt_de(abs(diff_corr_raw))} EUR "
+                    f"{'höher' if diff_corr_raw > 0 else 'niedriger'}."
                 )
         elif abs(diff_gain) > 0.005 or abs(diff_loss) > 0.005:
-            # Gewinne und Verluste heben sich im Saldo auf, die Brutto-Zeilen ändern
-            # sich aber: Zeile 19 bleibt gleich, Zeile 22 nicht.
-            correction_html = (
-                f'Der Netto-FX-Wert bleibt gleich, die Bruttowerte nicht: '
-                f'<strong>{fmt_de(abs(diff_gain))} EUR</strong> Gewinne und '
-                f'<strong>{fmt_de(abs(diff_loss))} EUR</strong> Verluste fallen weg. '
-                f'Das wirkt auf Zeile 22, nicht auf Zeile 19.'
+            correction_text = (
+                f"Der Netto-FX-Wert bleibt gleich, die Bruttowerte nicht: "
+                f"{fmt_de(abs(diff_gain))} EUR Gewinne und "
+                f"{fmt_de(abs(diff_loss))} EUR Verluste fallen weg. Das "
+                "wirkt auf Zeile 22, nicht auf Zeile 19."
             )
         else:
-            correction_html = f'Die Saldo-Prüfung ändert den {unchanged_label} rechnerisch nicht.'
+            correction_text = (
+                f"Die Saldo-Prüfung ändert den {unchanged_label} rechnerisch "
+                "nicht."
+            )
 
-        details_parts = []
+        detail_parts = []
         if debt_repayments:
             if correction_enabled:
-                details_parts.append(
-                    f"<strong>{debt_repayments}</strong> Buchungen haben eine Fremdwährungs-Schuld getilgt "
-                    f"statt Guthaben zu veräußern; ihr IBKR-Ergebnis von "
-                    f"<strong>{fmt_de(debt_repayment_pnl)} EUR</strong> bleibt außen vor"
+                detail_parts.append(
+                    f"{debt_repayments} Buchungen haben eine "
+                    f"Fremdwährungs-Schuld getilgt statt Guthaben zu "
+                    f"veräußern; ihr IBKR-Ergebnis von "
+                    f"{fmt_de(debt_repayment_pnl)} EUR bleibt außen vor."
                 )
             else:
-                details_parts.append(
-                    f"<strong>{debt_repayments}</strong> Buchungen haben eine Fremdwährungs-Schuld getilgt; "
-                    f"bei aktivierter Korrektur bliebe ihr IBKR-Ergebnis von "
-                    f"<strong>{fmt_de(debt_repayment_pnl)} EUR</strong> außen vor"
+                detail_parts.append(
+                    f"{debt_repayments} Buchungen haben eine "
+                    f"Fremdwährungs-Schuld getilgt; bei aktivierter Korrektur "
+                    f"bliebe ihr IBKR-Ergebnis von "
+                    f"{fmt_de(debt_repayment_pnl)} EUR außen vor."
                 )
-            details_parts.append(
-                "Abflüsse werden dagegen ungekürzt übernommen: IBKR weist bei nur teilweise "
-                "gedeckten Buchungen bereits allein das Ergebnis des gedeckten Teils aus"
+            detail_parts.append(
+                "Abflüsse werden ungekürzt übernommen: IBKR weist bei nur "
+                "teilweise gedeckten Buchungen bereits allein das Ergebnis "
+                "des gedeckten Teils aus."
             )
 
-        details_html = ''
-        if details_parts:
-            details_html = (
-                '<div style="margin-top: 0.7rem; font-size: 0.85rem; color: #94a3b8; line-height: 1.6;">'
-                + '<br>'.join('• ' + p for p in details_parts)
-                + '</div>'
-            )
-
-        st.markdown(
-            f'<div style="background: rgba(251, 146, 60, 0.06); border-left: 3px solid {accent}; '
-            f'padding: 0.95rem 1.15rem; margin: 0.6rem 0; border-radius: 0 8px 8px 0;">'
-            f'<div style="color: {accent}; font-weight: 600; margin-bottom: 0.45rem; font-size: 0.98rem;">'
-            f'{"FX-Saldo-Korrektur" if correction_enabled else "FX-Saldo-Korrektur deaktiviert"}: '
-            + (f'{curr_label} war zeitweise im Minus' if total_neg_days
-               else 'Fremdwährungs-Schuld im Steuerjahr getilgt')
-            + f'</div>'
-            f'<div style="font-size: 0.92rem; color: #cbd5e1; line-height: 1.6;">'
-            + (
-                f'An <strong>{total_neg_days} Tagen</strong> im Steuerjahr war der '
-                f'Fremdwährungssaldo negativ. '
+        situation = (
+            f"An {total_neg_days} Tagen im Steuerjahr war der "
+            "Fremdwährungssaldo negativ. "
+            if total_neg_days else
+            f"IBKR weist {debt_repayments} Buchungen aus, die eine "
+            "Fremdwährungs-Schuld geschlossen haben. "
+        )
+        stance = (
+            "Deshalb rechnet das Tool Tilgungen einer Fremdwährungs-Schuld "
+            "heraus." if correction_enabled else
+            "Die Korrektur ist deaktiviert; Topf 2 übernimmt den Rohwert."
+        )
+        compare_line = (
+            f"{raw_label}: {fmt_de(raw_total)} EUR."
+            if correction_enabled else
+            f"Wert mit Saldo-Prüfung: {fmt_de(corrected_total)} EUR."
+        )
+        body = (
+            f"{situation}Das ist steuerlich Margin-Schuld, kein "
+            "Fremdwährungsguthaben (§20 Abs. 2 S. 1 Nr. 7 i.V.m. Abs. 4 S. 1 "
+            f"EStG, BMF Rn. 131). {stance} In Topf 2 übernommen: "
+            f"{fmt_de(active_total)} EUR. {compare_line} {correction_text} "
+            + " ".join(detail_parts)
+        )
+        st.markdown(notice_html({
+            'class': 'transparenz', 'severity': 'normal',
+            'title': (
+                f"FX-Saldo-Korrektur: {curr_label} war zeitweise im Minus"
                 if total_neg_days else
-                f'IBKR weist <strong>{debt_repayments}</strong> Buchungen aus, die eine '
-                f'Fremdwährungs-Schuld geschlossen haben. '
-            )
-            + f'Das ist steuerlich Margin-Schuld, nicht Fremdwährungsguthaben. '
-            f'Steuerbar sind Währungsgewinne/-verluste aus verzinslichem Fremdwährungsguthaben '
-            f'(§20 Abs. 2 S. 1 Nr. 7 i.V.m. Abs. 4 S. 1 EStG, BMF 14.05.2025 Rn. 131). '
-            + (
-                'Deshalb rechnet das Tool Tilgungen einer Fremdwährungs-Schuld heraus.'
-                if correction_enabled
-                else 'Die Korrektur ist aktuell deaktiviert; Topf 2 übernimmt den Rohwert.'
-            )
-            + f'</div>'
-            + f'<div style="margin-top: 0.75rem; padding-top: 0.7rem; border-top: 1px solid rgba(255,255,255,0.08); '
-            f'font-size: 0.92rem; line-height: 1.6;">'
-            f'<div>In Topf 2 übernommener FX-Wert: '
-            f'<strong style="color: #34d399;">{fmt_de(active_total)} EUR</strong> '
-            f'<span style="color: #94a3b8;">'
-            f'{"nach Saldo-Prüfung" if correction_enabled else "ohne Saldo-Prüfung (Opt-out aktiv)"}'
-            f'</span></div>'
-            + (
-                f'<div style="color: #94a3b8;">{raw_label}: {fmt_de(raw_total)} EUR</div>'
-                if correction_enabled
-                else f'<div style="color: #94a3b8;">Wert mit Saldo-Prüfung: {fmt_de(corrected_total)} EUR</div>'
-            )
-            + f'<div style="color: #94a3b8;">{correction_html}</div>'
-            f'</div>'
-            f'{details_html}'
-            f'</div>',
-            unsafe_allow_html=True
-        )
+                "FX-Saldo-Korrektur: Fremdwährungs-Schuld getilgt"
+            ) + ("" if correction_enabled else " (deaktiviert)"),
+            'body': body, 'target': None,
+        }, show_target=False), unsafe_allow_html=True)
 
-    # Prüffall: IBKR weist die Zeile als Eröffnung aus, bucht aber ein Ergebnis.
-    _fx_open_anomalies = fx_opt_a_meta.get('open_rows_with_pnl', []) or []
-    if _fx_open_anomalies:
+    fx_open_anomalies = fx_opt_a_meta.get('open_rows_with_pnl', []) or []
+    if fx_open_anomalies:
         st.warning(
-            f"{len(_fx_open_anomalies)} Devisen-Buchungen tragen ein realisiertes Ergebnis, "
-            f"obwohl IBKR sie als Eröffnung ausweist. Das widerspricht der üblichen "
-            f"IBKR-Konvention (Ergebnis nur auf Schließungen). Sie wurden als steuerbar "
-            f"behandelt; bitte prüfen."
+            f"{len(fx_open_anomalies)} Devisen-Buchungen tragen ein "
+            "realisiertes Ergebnis, obwohl IBKR sie als Eröffnung ausweist. "
+            "Sie wurden als steuerbar behandelt; bitte prüfen."
         )
-        with st.expander(f"Betroffene Buchungen ({len(_fx_open_anomalies)})"):
-            _anom_table = ("| Datum | Währung | Code | Menge | Ergebnis EUR | Beschreibung |\n"
-                           "|-------|---------|------|------:|-------------:|--------------|\n")
-            for _a in _fx_open_anomalies[:50]:
-                _anom_table += (
-                    f"| {html.escape(str(_a.get('date', '')))} "
-                    f"| {html.escape(str(_a.get('currency', '')))} "
-                    f"| {html.escape(str(_a.get('code', '')))} "
-                    f"| {fmt_de(_a.get('quantity', 0))} "
-                    f"| {fmt_de(_a.get('realized_pnl', 0))} "
-                    f"| {html.escape(str(_a.get('description', ''))[:60])} |\n"
+        with st.expander(f"Betroffene Buchungen ({len(fx_open_anomalies)})"):
+            anom_table = (
+                "| Datum | Währung | Code | Menge | Ergebnis EUR | Beschreibung |\n"
+                "|-------|---------|------|------:|-------------:|--------------|\n")
+            for a in fx_open_anomalies[:50]:
+                anom_table += (
+                    f"| {esc(a.get('date', ''))} "
+                    f"| {esc(a.get('currency', ''))} "
+                    f"| {esc(a.get('code', ''))} "
+                    f"| {fmt_de(a.get('quantity', 0))} "
+                    f"| {fmt_de(a.get('realized_pnl', 0))} "
+                    f"| {esc(str(a.get('description', ''))[:60])} |\n"
                 )
-            st.markdown(_anom_table)
+            st.markdown(anom_table)
 
     with st.expander("Details pro Währung"):
         has_raw_col = any('raw_net' in data for data in fx_results.values())
         if has_raw_col:
-            raw_col = "IBKR-Roh" if fx_source == 'xml' else "Roh"
-            fx_table = (f"| Währung | Verwendet | Korrigiert | {raw_col} | Korr.-Raw | Neg.-Tage | MTM |\n"
-                        "|---------|----------:|-----------:|---------:|----------:|----------:|----:|\n")
+            raw_col = "IBKR vor Prüfung" if fx_source == 'xml' else "Vor Prüfung"
+            fx_table = (
+                f"| Währung | Steuerlich verwendet | Nach Saldo-Prüfung | "
+                f"{raw_col} | Korrektur | Minustage | IBKR-MTM |\n"
+                "|---------|----------:|-----------:|---------:|----------:|"
+                "----------:|----:|\n")
             for curr, data in sorted(fx_results.items()):
                 mtm_val = fx_mtm.get(curr)
                 mtm_str = f"{fmt_de(mtm_val)}" if mtm_val is not None else "-"
                 used_net = data.get('net', 0)
                 corr_net = data.get('corrected_net', used_net)
                 raw_net = data.get('raw_net', corr_net)
-                diff = corr_net - raw_net
-                neg_d = data.get('days_negative', 0)
-                fx_table += (f"| {curr} | {fmt_de(used_net)} | {fmt_de(corr_net)} | {fmt_de(raw_net)} | "
-                             f"{fmt_de(diff)} | {neg_d} | {mtm_str} |\n")
+                fx_table += (
+                    f"| {curr} | {fmt_de(used_net)} | {fmt_de(corr_net)} | "
+                    f"{fmt_de(raw_net)} | {fmt_de(corr_net - raw_net)} | "
+                    f"{data.get('days_negative', 0)} | {mtm_str} |\n")
         else:
-            fx_table = "| Währung | Gewinn | Verlust | Netto | MTM (Vergleich) |\n|---------|--------|---------|-------|----------------|\n"
+            fx_table = (
+                "| Währung | Gewinn | Verlust | Netto | MTM (Vergleich) |\n"
+                "|---------|--------|---------|-------|----------------|\n")
             for curr, data in sorted(fx_results.items()):
                 mtm_val = fx_mtm.get(curr)
-                mtm_str = f"{fmt_de(mtm_val)} EUR" if mtm_val is not None else "-"
-                fx_table += f"| {curr} | {fmt_de(data['gain'])} | {fmt_de(data['loss'])} | {fmt_de(data['net'])} | {mtm_str} |\n"
+                mtm_str = (f"{fmt_de(mtm_val)} EUR"
+                           if mtm_val is not None else "-")
+                fx_table += (
+                    f"| {curr} | {fmt_de(data['gain'])} | "
+                    f"{fmt_de(data['loss'])} | {fmt_de(data['net'])} | "
+                    f"{mtm_str} |\n")
         st.markdown(fx_table)
+        st.caption(
+            "Alle Werte in EUR. 'Steuerlich verwendet' folgt dem gewählten "
+            "Saldo-Modus; 'Korrektur' ist die Differenz zum IBKR-Rohwert. "
+            "Minustage zeigen Tage mit Fremdwährungsschuld. IBKR-MTM dient "
+            "nur als Plausibilitätsreferenz."
+        )
         fx_tgl = d.get('fx_translation', 0)
         if fx_tgl != 0:
-            st.markdown(f"**IBKR Referenz (fxTranslationGainLoss):** {fmt_de(fx_tgl)} EUR")
-
+            st.markdown(
+                f"**IBKR Referenz (fxTranslationGainLoss):** "
+                f"{fmt_de(fx_tgl)} EUR")
         if fx_source in ('csv', 'xml'):
-            _src_name = "IBKR Standard-Bericht" if fx_source == 'csv' else "XML FxTransactions"
-            _filtered = (fx_source == 'xml'
-                         and correction_enabled
-                         and fx_opt_a_meta.get('debt_repayments', 0))
-            _value_kind = (
-                "Buchungsgenaue IBKR-FIFO-Werte"
-                if fx_source == 'xml'
-                else "Aggregierte IBKR-FIFO-Rohwerte"
-            )
+            src_name = ("IBKR Standard-Bericht" if fx_source == 'csv'
+                        else "XML FxTransactions")
+            filtered = (fx_source == 'xml' and correction_enabled
+                        and fx_opt_a_meta.get('debt_repayments', 0))
+            value_kind = ("Buchungsgenaue IBKR-FIFO-Werte"
+                          if fx_source == 'xml'
+                          else "Aggregierte IBKR-FIFO-Rohwerte")
             st.success(
-                f"{_value_kind} aus {_src_name} (alle Währungen)."
-                + (" Buchungen, die eine Fremdwährungs-Schuld tilgen, sind herausgerechnet "
-                   "(siehe Hinweis oben)." if _filtered else "")
+                f"{value_kind} aus {src_name} (alle Währungen)."
+                + (" Buchungen, die eine Fremdwährungs-Schuld tilgen, sind "
+                   "herausgerechnet (siehe Hinweis oben)." if filtered else "")
                 + (" Einzelne Schuldtilgungen sind im CSV nicht erkennbar."
                    if fx_source == 'csv' else "")
             )
         else:
             no_xml_fx = not d.get('xml_has_fx_data', True)
             fx_prior = d.get('fx_has_prior_data', False)
-            extra = (" Die Flex Query enthält keine FxTransactions. "
-                     "Kursgenauigkeit der Approximation ist eingeschränkt.") if no_xml_fx else ""
-            if fx_prior:
-                st.warning(
-                    f"FIFO-Approximation aus Flex Query (Tagesraten-Substitution).{extra} "
-                    "Der IBKR Standard-Bericht (CSV) kann als aggregierter Rohwert "
-                    "hochgeladen werden; eine buchungsweise Schuldtilgungsprüfung ist "
-                    "damit nicht möglich."
-                )
+            extra = (" Die Flex Query enthält keine FxTransactions; "
+                     "Kursgenauigkeit der Approximation ist eingeschränkt."
+                     if no_xml_fx else "")
+            prefix = ("FIFO-Approximation aus Flex Query "
+                      "(Tagesraten-Substitution)." if fx_prior
+                      else "**Nur Steuerjahr geladen.** FIFO-Approximation.")
+            st.warning(
+                f"{prefix}{extra} Der IBKR-Standardbericht (CSV) kann über "
+                "\"Daten ändern\" als aggregierter Rohwert hochgeladen werden "
+                "(nur bei einem einzelnen Konto); eine buchungsweise "
+                "Schuldtilgungsprüfung ist damit nicht möglich."
+            )
+        st.info(
+            "**Rechtsgrundlage:** BMF-Schreiben Rn. 131, verzinsliches "
+            "Fremdwährungsguthaben, §20 Abs. 2 S. 1 Nr. 7 i.V.m. Abs. 4 S. 1 "
+            "EStG (Anlage KAP, Topf 2). FIFO-Methode (§20 Abs. 4 S. 7). "
+            "Erfasst wird die Veräußerung von Guthaben; die Tilgung einer "
+            "Fremdwährungs-Schuld zählt nicht. In Topf 2 enthalten."
+        )
+
+
+def _render_kap_sonderprodukte():
+    if not no_invstg_summary:
+        return
+    section_title("Topf 2 · Sonderprodukte außerhalb InvStG")
+    st.caption(
+        "Einzelnachweis für Schuldverschreibungen/ETNs und sonstige ETPs "
+        "außerhalb des InvStG. Die Beträge sind bereits in Topf 2 enthalten; "
+        "negative QSt-Werte kennzeichnen Erstattungen."
+    )
+    with st.expander("Sonderprodukte nach ISIN", expanded=False):
+        special_table = (
+            "| Ticker | ISIN | Realisiertes G/V | Tageskurs | "
+            "Ausschüttungen | QSt | Summe Topf 2 |\n"
+            "|--------|------|----------------:|----------:|---------------:|"
+            "----:|-------------:|\n")
+        for isin, info in sorted(no_invstg_summary.items(),
+                                 key=lambda x: x[1].get('ticker', '')):
+            realized = info.get('gain', 0) + info.get('loss', 0)
+            special_table += (
+                f"| {info.get('ticker', isin)} | {isin} | "
+                f"{fmt_de(realized)} | {fmt_de(info.get('tageskurs', 0))} | "
+                f"{fmt_de(info.get('div', 0))} | "
+                f"{fmt_de(info.get('wht_reported', 0))} | "
+                f"{fmt_de(info.get('total', 0))} |\n")
+        st.markdown(special_table)
+
+
+def _render_kap_variante_b():
+    z7_raw = d.get(
+        'zeile_7_kapitalertraege_mit_inlaendischem_steuerabzug_eur', 0)
+    if abs(z7_raw) <= 0.01:
+        return
+    z37_raw = d.get('zeile_37_kapitalertragsteuer_eur', 0)
+    z38_raw = d.get('zeile_38_solidaritaetszuschlag_eur', 0)
+    section_title("Deutsche Dividenden (Zeilen 7/37/38)")
+    st.markdown(notice_html({
+        'class': 'transparenz', 'severity': 'normal',
+        'title': 'Deutsche Dividenden erkannt',
+        'body': (
+            f"{fmt_de(z7_raw)} EUR Bruttodividende und "
+            f"{fmt_de(z37_raw + z38_raw)} EUR DE-KESt/Soli auf DE-ISINs. Die "
+            "deutsche Verwahrstelle hat 26,375 % an der Quelle einbehalten "
+            "(§43 EStG), auch wenn IBKR keine Steuerbescheinigung ausstellt. "
+            "Variante A (Default, präzise): Eintragung in Z. 7/37/38. "
+            "Variante B (technische Ersatzdarstellung): Bruttodividende nach "
+            "Z. 19, KESt+Soli nach Z. 41, falls das Steuerprogramm Z. 7/37/38 "
+            "ohne Bescheinigung nach §45a EStG sperrt. Variante B ist kein "
+            "amtlich belegter Ersatz; vor Abgabe fachlich abstimmen."
+        ),
+        'target': None,
+    }, show_target=False), unsafe_allow_html=True)
+    _bind_toggle(
+        _dom, 'variante_b', f"_ui_tg_variante_b_{_dataset_id[:12]}",
+        "Variante B: DE-KESt nach Zeile 19/41 verschieben",
+        "Nur aktivieren, falls das Steuerprogramm Zeile 7/37/38 mangels "
+        "Steuerbescheinigung nicht freischaltet.",
+    )
+
+
+def _render_kap_multi_account():
+    if n_accounts <= 1:
+        return
+    section_title(f"Aufschlüsselung nach Konten ({n_accounts})")
+    with st.expander("Konten im Detail", expanded=False):
+        acct_table = (
+            "| Konto | Topf 1 | Topf 2 | Z. 7 | Z. 19 | Z. 37 | Z. 38 | "
+            "Z. 41 |\n"
+            "|-------|-------:|-------:|-----:|------:|------:|------:|"
+            "------:|\n")
+        for idx, (name, acct_final) in enumerate(
+                zip(account_names, per_account_finals)):
+            acct_table += (
+                f"| Konto {idx + 1} ({name}) | "
+                f"{fmt_de(acct_final['topf_1'])} | "
+                f"{fmt_de(acct_final['topf_2'])} | "
+                f"{fmt_de(acct_final['zeile_7'])} | "
+                f"{fmt_de(acct_final['zeile_19'])} | "
+                f"{fmt_de(acct_final['zeile_37'])} | "
+                f"{fmt_de(acct_final['zeile_38'])} | "
+                f"{fmt_de(acct_final['quellensteuer'])} |\n")
+        acct_table += (
+            f"| **Gesamt** | **{fmt_de(final['topf_1'])}** | "
+            f"**{fmt_de(final['topf_2'])}** | **{fmt_de(final['zeile_7'])}** | "
+            f"**{fmt_de(final['zeile_19'])}** | **{fmt_de(final['zeile_37'])}** | "
+            f"**{fmt_de(final['zeile_38'])}** | "
+            f"**{fmt_de(final['quellensteuer'])}** |\n")
+        st.markdown(acct_table)
+        st.caption(
+            "Jedes Konto wurde vollständig separat berechnet (Trades, "
+            "Dividenden, FX, Stillhalter); die Einzelergebnisse wurden "
+            "anschließend addiert. Konto- und Gesamtzeile enthalten dieselben "
+            "aktiven Methoden (Zufluss, InvStG, Tageskurs und gegebenenfalls "
+            "Variante B). Abweichungen von einem Cent können ausschließlich "
+            "durch die Darstellung gerundeter Einzelwerte entstehen."
+        )
+
+
+# ── Renderer: Anlage KAP-INV ─────────────────────────────────────────────────
+
+_ETF_CLS_OPTIONS = {
+    "Sonstiger Fonds (0% TFS)": 0.0,
+    "Aktienfonds (30% TFS)": 0.30,
+    "Mischfonds (15% TFS)": 0.15,
+    "Immobilienfonds (60% TFS)": 0.60,
+    "Auslands-Immobilienfonds (80% TFS)": 0.80,
+}
+
+
+def _render_etf_confirmation_widgets():
+    """Manuelle Fondsart-Bestaetigung fuer unbekannte ETFs.
+
+    Quelle der Wahrheit ist _dom['etf_overrides'] (dataset-genamespaced);
+    die Widgets tragen _ui_*-Keys und synchronisieren per Callback. Damit
+    ueberleben Bestaetigungen jeden Bereichswechsel (Streamlit loescht den
+    State nicht gerenderter Widgets).
+    """
+    raw_kap_inv = d.get('kap_inv', {}) or {}
+    etf_unknown = raw_kap_inv.get('etf_unknown_isins', []) or []
+    if not etf_unknown:
+        return
+    st.markdown(notice_html({
+        'class': 'prueffall', 'severity': 'normal',
+        'title': 'Fondsart bestätigen',
+        'body': (
+            f"{len(etf_unknown)} Fondsprodukt(e) sind unbekannt oder wegen "
+            "offener Rechtsform-/InvStG-Fragen nicht automatisch "
+            "klassifiziert. Ohne Bestätigung entsteht keine "
+            "KAP-INV-Formularzeile. Fondsart wählen und ausdrücklich "
+            "bestätigen: Aktienfonds (mind. 51% Aktienquote, 30% TFS), "
+            "Mischfonds (mind. 25%, 15% TFS), Immobilienfonds (60% TFS), "
+            "Auslands-Immobilienfonds (80% TFS)."
+        ),
+        'target': None,
+    }, show_target=False), unsafe_allow_html=True)
+
+    tfs_to_label = {v: k for k, v in _ETF_CLS_OPTIONS.items()}
+    option_labels = list(_ETF_CLS_OPTIONS.keys())
+    for isin in etf_unknown:
+        info = etf_by_isin.get(isin, {})
+        ticker = info.get('ticker', isin[:12])
+        name = info.get('name', '')
+        label = f"{ticker} ({isin})" + (f": {name}" if name else "")
+        if info.get('review_reason'):
+            st.caption(f"Prüfgrund: {info['review_reason']}")
+
+        sel_key = f"_ui_etf_cls_{_dataset_id[:12]}_{isin}"
+        conf_key = f"_ui_etf_conf_{_dataset_id[:12]}_{isin}"
+        stored_tfs = _dom['etf_overrides'].get(isin)
+        default_label = tfs_to_label.get(stored_tfs, option_labels[0])
+
+        def _sync(isin=isin, sel_key=sel_key, conf_key=conf_key):
+            tfs = _ETF_CLS_OPTIONS[st.session_state[sel_key]]
+            if st.session_state[conf_key]:
+                _dom['etf_overrides'][isin] = tfs
             else:
-                st.warning(
-                    f"**Nur Steuerjahr geladen.** FIFO-Approximation.{extra} "
-                    "Der IBKR Standard-Bericht (CSV) kann als aggregierter Rohwert "
-                    "hochgeladen werden; eine buchungsweise Schuldtilgungsprüfung ist "
-                    "damit nicht möglich."
-                )
-        st.info("**Rechtsgrundlage:** BMF-Schreiben Rn. 131 - verzinsliches Fremdwährungsguthaben, "
-                "§20 Abs. 2 S. 1 Nr. 7 i.V.m. Abs. 4 S. 1 EStG (Anlage KAP, Topf 2). "
-                "FIFO-Methode (§20 Abs. 4 S. 7). Erfasst wird die Veräußerung von Guthaben; "
-                "die Tilgung einer Fremdwährungs-Schuld zählt nicht. In Topf 2 enthalten.")
+                _dom['etf_overrides'].pop(isin, None)
 
-# ── Anlage KAP-INV · Investmentfonds (Detail-Anzeige) ─────────────────────────
+        st.selectbox(
+            label, option_labels,
+            index=option_labels.index(default_label),
+            key=sel_key, on_change=_sync,
+        )
+        st.checkbox(
+            "Fondsart für die Formularzuordnung bestätigen",
+            value=isin in _dom['etf_overrides'],
+            key=conf_key, on_change=_sync,
+        )
 
-if has_etf_data and invstg_aktiv:
+
+def render_kap_inv():
+    st.markdown('<p class="page-title">Anlage KAP-INV</p>',
+                unsafe_allow_html=True)
+    if not (has_etf_data and invstg_aktiv):
+        st.info(
+            "Für die aktuelle Berechnung wurden keine Formularzeilen auf "
+            "Anlage KAP-INV erzeugt. Produktzuordnungen und mögliche "
+            "Prüffälle stehen in den Bereichen Rechenwege und Prüffälle."
+        )
+        return
+    _inline_marker('kap_inv')
+
     etf_gain_raw = kap_inv.get('etf_gain_raw_eur', 0)
     etf_loss_raw = kap_inv.get('etf_loss_raw_eur', 0)
-    etf_gain_taxable = kap_inv.get('etf_gain_taxable_eur', 0)
-    etf_loss_taxable = kap_inv.get('etf_loss_taxable_eur', 0)
-    etf_div_raw = kap_inv.get('etf_dividends_raw_eur', 0)
-    etf_div_taxable = kap_inv.get('etf_dividends_taxable_eur', 0)
+    etf_gain_taxable = sum(
+        info.get('gain_taxable', info.get('gain', 0))
+        for info in etf_by_isin.values()
+    )
+    etf_loss_taxable = sum(
+        info.get('loss_taxable', info.get('loss', 0))
+        for info in etf_by_isin.values()
+    )
     etf_wht_raw = kap_inv.get('etf_wht_eur', 0)
-    etf_wht = calculate_tax_report.get_kap_inv_wht_for_reporting(kap_inv)
-    etf_net_taxable = kap_inv.get('etf_net_taxable_eur', 0) + tageskurs_kapinv_corr
-    etf_unknown = kap_inv.get('etf_unknown_isins', [])
-    etf_stillhalter = kap_inv.get('etf_stillhalter_premium_eur', 0)
-    kapinv_fx_by_isin = d.get('fx_correction_kap_inv_by_isin', {}) or {}
-    unconfirmed_unknown_isins = list(etf_unknown)
+    etf_wht = final['etf_wht']
 
-if has_etf_data and invstg_aktiv:
-    section_title("Anlage KAP-INV · Investmentfonds (InvStG)")
+    _render_etf_confirmation_widgets()
 
-    # Manual classification for unknown ETFs — BEFORE cards so values are correct
-    if etf_unknown:
-        st.markdown(f"""
-<div style="background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #fbbf24;">ETF-Klassifizierung prüfen:</strong> {len(etf_unknown)} ETF(s) sind unbekannt oder wegen offener Rechtsform-/InvStG-Fragen nicht automatisch klassifiziert.
-    Standardmäßig als sonstiger Fonds (0% TFS) behandelt. Bitte unten die tatsächliche Fondsart wählen:
-    Aktienfonds (mind. 51% Aktienquote, 30% TFS), Mischfonds (mind. 25% Aktienquote, 15% TFS),
-    Immobilienfonds (60% TFS), Auslands-Immobilienfonds (80% TFS).
-</div>
-""", unsafe_allow_html=True)
-        cls_options = {
-            "Sonstiger Fonds (0% TFS)": 0.0,
-            "Aktienfonds (30% TFS)": 0.30,
-            "Mischfonds (15% TFS)": 0.15,
-            "Immobilienfonds (60% TFS)": 0.60,
-            "Auslands-Immobilienfonds (80% TFS)": 0.80,
-        }
-        for isin in etf_unknown:
-            info = etf_by_isin.get(isin, {})
-            ticker = info.get('ticker', isin[:12])
-            name = info.get('name', '')
-            label = f"{ticker} ({isin})" + (f": {name}" if name else "")
-            if info.get('review_reason'):
-                st.caption(f"Prüfgrund: {info['review_reason']}")
-            choice = st.selectbox(label, list(cls_options.keys()), key=f"etf_cls_{isin}")
-            classification_confirmed = st.checkbox(
-                "Fondsart für die Formularzuordnung bestätigen",
-                value=False,
-                key=f"etf_cls_confirm_{isin}",
-            )
-            if classification_confirmed and isin in unconfirmed_unknown_isins:
-                unconfirmed_unknown_isins.remove(isin)
-            new_tfs = cls_options[choice]
-            old_tfs = info.get('tfs_rate', 0.0)
-            if new_tfs != old_tfs:
-                raw_gain = info.get('gain', 0)
-                raw_loss = info.get('loss', 0)
-                raw_div = info.get('div', 0)
-                old_gain_tax = info.get('gain_taxable', raw_gain)
-                old_loss_tax = info.get('loss_taxable', raw_loss)
-                old_div_tax = info.get('div_taxable', raw_div)
-                new_gain_tax = raw_gain * (1 - new_tfs)
-                new_loss_tax = raw_loss * (1 - new_tfs)
-                new_div_tax = raw_div * (1 - new_tfs)
-                raw_tk_delta = kapinv_fx_by_isin.get(isin, {}).get('raw_delta', 0) if tageskurs_aktiv else 0
-                old_tk_tax = raw_tk_delta * (1 - old_tfs)
-                new_tk_tax = raw_tk_delta * (1 - new_tfs)
-                etf_gain_taxable += (new_gain_tax - old_gain_tax)
-                etf_loss_taxable += (new_loss_tax - old_loss_tax)
-                etf_div_taxable += (new_div_tax - old_div_tax)
-                etf_net_taxable += (
-                    (new_gain_tax - old_gain_tax)
-                    + (new_loss_tax - old_loss_tax)
-                    + (new_div_tax - old_div_tax)
-                    + (new_tk_tax - old_tk_tax)
-                )
-                tageskurs_kapinv_corr += (new_tk_tax - old_tk_tax)
-                info['tfs_rate'] = new_tfs
-                info['gain_taxable'] = new_gain_tax
-                info['loss_taxable'] = new_loss_tax
-                info['div_taxable'] = new_div_tax
-                cls_map = {
-                    0.30: 'aktienfonds',
-                    0.15: 'mischfonds',
-                    0.60: 'immobilienfonds',
-                    0.80: 'auslands_immobilienfonds',
-                    0.0: 'sonstiger_fonds',
-                }
-                info['classification'] = cls_map.get(new_tfs, 'sonstiger_fonds')
-        previous_etf_wht = etf_wht
-        wht_recalculation = calculate_tax_report.calculate_kap_inv_wht_for_mode(
-            etf_by_isin,
-            dba_wht_beta_enabled=dba_wht_beta_enabled,
+    kap_inv_lines = kap_inv_form.get('lines', [])
+    kap_inv_distribution_control = sum(
+        line.get('taxable_control_eur', 0)
+        for line in kap_inv_lines if line.get('kind') == 'distribution'
+    )
+    kap_inv_sale_control = sum(
+        line.get('taxable_control_eur', 0)
+        for line in kap_inv_lines if line.get('kind') == 'sale'
+    )
+    st.caption(
+        f"{len(kap_inv_lines)} KAP-INV-Formularzeilen werden aus den "
+        "Fondsbuchungen abgeleitet; die Eintragungswerte stehen in der "
+        "Übersicht. Ausländische Steuer steht ausschließlich in Anlage KAP "
+        "Zeile 41."
+    )
+
+    general_warnings = [
+        warning for warning in kap_inv_form.get('warnings', [])
+        # Vorabpauschale und gezahlte Ausschuettungen haben direkt bei den
+        # Formularwerten bzw. Prueffaellen eigene Hinweise.
+        if ('Vorabpauschale' not in str(warning)
+            and 'Gezahlte Dividenden' not in str(warning))
+    ]
+
+    section_title("Formularwerte")
+    if kap_inv_lines:
+        form_table = (
+            "| KAP-INV | Fondsart | Eintragungswert vor TFS | "
+            "Steuerpflichtiger Kontrollwert* |\n"
+            "|---------|----------|-----------------------:|"
+            "-------------------------------:|\n")
+        for line in kap_inv_lines:
+            form_table += (
+                f"| Zeile {line['line']} | {line['fund_type']} | "
+                f"{fmt_de(line['amount_raw_eur'])} | "
+                f"{fmt_de(line['taxable_control_eur'])} |\n")
+        st.markdown(form_table)
+        st.caption(
+            "* Kontrollrechnung nach Teilfreistellung, kein Eintragungswert. "
+            "Veräußerungszeilen sind bis zur Berücksichtigung bereits "
+            "angesetzter Vorabpauschalen noch nicht final."
         )
-        etf_wht = wht_recalculation['creditable_tax_eur']
-        kap_inv['etf_wht_anrechenbar_eur'] = etf_wht
-        kap_inv['wht_events'] = wht_recalculation['events']
-        kap_inv['wht_review_items'] = wht_recalculation['review_items']
-        final['quellensteuer'] += etf_wht - previous_etf_wht
 
-    kap_inv_form = calculate_tax_report.build_kap_inv_form(
-        etf_by_isin,
-        kapinv_fx_by_isin,
-        unconfirmed_unknown_isins,
-        include_tageskurs=tageskurs_aktiv,
+    has_kap_inv_review = bool(
+        general_warnings
+        or kap_inv_form.get('blocked_details')
+        or kap_inv_form.get('negative_distribution_details')
     )
-    kap_inv_form['kap_line_41_creditable_tax_eur'] = etf_wht
-
-    # ETF-Overrides in final-Dict spiegeln
-    final['etf_net_taxable'] = etf_net_taxable
-    final['etf_wht'] = etf_wht
-    final['kap_inv_form'] = kap_inv_form
-
-    kap_inv_raw_total = sum(
-        line.get('amount_raw_eur', 0) for line in kap_inv_form.get('lines', [])
-    )
-    inv_hero_color = "#4ade80" if kap_inv_raw_total >= 0 else "#f87171"
-    st.markdown(f"""
-<div class="hero-card-inv">
-    <div class="hero-label">KAP-INV · Formularwerte vor Teilfreistellung</div>
-    <div class="hero-value" style="color:{inv_hero_color}">{fmt(kap_inv_raw_total)}</div>
-    <div class="hero-formula">Ausschüttungen und Veräußerungsergebnisse nach Fondsart; ausländische Steuer steht ausschließlich in Anlage KAP Zeile 41.</div>
-</div>
-""", unsafe_allow_html=True)
-
-    if kap_inv_form.get('warnings'):
-        for warning in kap_inv_form['warnings']:
-            st.warning(warning)
+    if has_kap_inv_review:
+        section_title("Noch zu prüfen")
+    for warning in general_warnings:
+        st.warning(warning)
 
     if kap_inv_form.get('blocked_details'):
-        blocked_table = "| Nicht zugeordnet | ISIN | Prüfgrund | Ausschüttung roh | G/V roh |\n"
-        blocked_table += "|-----------------|------|-----------|------------------:|---------:|\n"
+        blocked_table = (
+            "| Nicht zugeordnet | ISIN | Prüfgrund | Ausschüttung roh | "
+            "G/V roh |\n"
+            "|-----------------|------|-----------|------------------:|"
+            "---------:|\n")
         for item in kap_inv_form['blocked_details']:
             blocked_table += (
                 f"| {item.get('ticker', '')} | {item['isin']} | "
                 f"{item.get('review_reason', 'Fondsart nicht bestätigt')} | "
                 f"{fmt_de(item.get('distribution_raw_eur', 0))} | "
-                f"{fmt_de(item.get('sale_raw_eur', 0))} |\n"
-            )
+                f"{fmt_de(item.get('sale_raw_eur', 0))} |\n")
         st.markdown(blocked_table)
 
     if kap_inv_form.get('negative_distribution_details'):
-        paid_table = "| Prüffall: gezahlte Ausschüttungen | ISIN | Gezahlt | Erhalten |\n"
-        paid_table += "|----------------------------------|------|--------:|--------:|\n"
+        paid_table = (
+            "| Prüffall: gezahlte Ausschüttungen | ISIN | Gezahlt | "
+            "Erhalten |\n"
+            "|----------------------------------|------|--------:|--------:|\n")
         for item in kap_inv_form['negative_distribution_details']:
             paid_table += (
-                f"| {item.get('ticker', '')} ({item.get('fund_type', '')}) | {item['isin']} | "
+                f"| {item.get('ticker', '')} ({item.get('fund_type', '')}) | "
+                f"{item['isin']} | "
                 f"{fmt_de(item.get('paid_distribution_eur', 0))} | "
-                f"{fmt_de(item.get('received_distribution_eur', 0))} |\n"
-            )
+                f"{fmt_de(item.get('received_distribution_eur', 0))} |\n")
         st.markdown(paid_table)
         st.caption(
-            "Gezahlte Dividenden/Ersatzzahlungen (Short-Positionen) sind nicht in "
-            "den Ausschüttungszeilen enthalten; steuerliche Behandlung manuell prüfen. "
-            "Hinweis: Die internen Kontrollwerte (ETF-Netto) verrechnen diese Beträge "
-            "weiterhin und können daher von der Formularlogik abweichen."
+            "Gezahlte Dividenden/Ersatzzahlungen (Short-Positionen) sind "
+            "nicht in den Ausschüttungszeilen enthalten; steuerliche "
+            "Behandlung manuell prüfen."
         )
 
-    form_table = "| KAP-INV | Fondsart | Eintragungswert vor TFS | Steuerpflichtiger Kontrollwert* |\n"
-    form_table += "|---------|----------|-----------------------:|-------------------------------:|\n"
-    for line in kap_inv_form.get('lines', []):
-        form_table += (
-            f"| Zeile {line['line']} | {line['fund_type']} | "
-            f"{fmt_de(line['amount_raw_eur'])} | "
-            f"{fmt_de(line['taxable_control_eur'])} |\n"
-        )
-    if kap_inv_form.get('lines'):
-        st.markdown(form_table)
-        st.caption(
-            "* Kontrollrechnung nach Teilfreistellung, kein Eintragungswert. "
-            "Veräußerungszeilen sind bis zur späteren Berücksichtigung bereits "
-            "angesetzter Vorabpauschalen ausdrücklich noch nicht final."
-        )
-
+    section_title("Quellensteuer")
     if dba_wht_beta_enabled:
-        st.markdown('<div style="margin-top:2px;margin-bottom:8px"><span style="background:linear-gradient(135deg,#f59e0b,#ef4444);color:#fff;padding:5px 16px;border-radius:6px;font-size:0.85em;font-weight:700;letter-spacing:1px;box-shadow:0 2px 8px rgba(239,68,68,0.3)">DBA-PR&Uuml;FUNG &middot; BETA</span></div>', unsafe_allow_html=True)
+        st.markdown('<span class="badge-beta">DBA-Prüfung · Beta</span>',
+                    unsafe_allow_html=True)
         st.warning(
-            f"DBA-Beta aktiv: anrechenbare Fonds-Quellensteuer {fmt_de(etf_wht)} EUR. "
-            "Ereignis-Matching und DBA-Caps sind experimentell; der Betrag ist "
-            "bereits in Anlage KAP Zeile 41 enthalten."
+            f"DBA-Beta aktiv: anrechenbare Fonds-Quellensteuer "
+            f"{fmt_de(etf_wht)} EUR. Ereignis-Matching und DBA-Caps sind "
+            "experimentell; der Betrag ist bereits in Anlage KAP Zeile 41 "
+            "enthalten."
         )
     else:
         st.info(
@@ -2085,119 +3133,118 @@ if has_etf_data and invstg_aktiv:
             "Zeile 41 enthalten. Die optionale DBA-Beta ist deaktiviert."
         )
 
-    # Direkter Modus-Vergleich: beide Berechnungen KONTOWEISE auf Kopien
-    # (die Beta ist durch den Refund-Offset nichtlinear; auf dem gemergten
-    # Event-Pool wuerden Erstattungen eines Kontos gegen Ueberhaenge eines
-    # anderen Kontos verrechnet). Fertige Kontowerte werden nur addiert.
-    # Weder Events noch wht_anrechenbar des aktiven Modus werden veraendert.
-    _has_wht_activity = any(
+    # Modus-Vergleich Standard vs. Beta — KONTOWEISE auf Kopien (die Beta ist
+    # durch den Refund-Offset nichtlinear; nie auf dem gemergten Pool rechnen).
+    has_wht_activity = any(
         abs(info.get('wht', 0)) > 0.005 or info.get('wht_events')
         for info in etf_by_isin.values()
     )
-    if _has_wht_activity:
-        _compare_pools = []
-        for _pool in per_account_wht_pools or [etf_by_isin]:
-            _pool_copy = copy.deepcopy(_pool)
-            # Manuelle Fondsart-Overrides aus der UI auf die Konto-Kopien
-            # spiegeln, damit der Vergleich denselben Datenstand nutzt.
-            for _isin, _entry in _pool_copy.items():
-                _merged_entry = etf_by_isin.get(_isin)
-                if _merged_entry:
-                    _entry['tfs_rate'] = _merged_entry.get(
-                        'tfs_rate', _entry.get('tfs_rate')
-                    )
-                    _entry['classification'] = _merged_entry.get(
-                        'classification', _entry.get('classification')
-                    )
-            _compare_pools.append(_pool_copy)
-        _mode_compare = calculate_tax_report.compare_kap_inv_wht_modes(
-            _compare_pools
-        )
-        wht_standard_value = _mode_compare['standard_eur']
-        wht_beta_value = _mode_compare['beta_eur']
-        wht_mode_diff = _mode_compare['difference_eur']
+    if has_wht_activity:
+        compare_pools = []
+        for pool in per_account_wht_pools or [etf_by_isin]:
+            pool_copy = copy.deepcopy(pool)
+            for isin, entry in pool_copy.items():
+                merged_entry = etf_by_isin.get(isin)
+                if merged_entry:
+                    entry['tfs_rate'] = merged_entry.get(
+                        'tfs_rate', entry.get('tfs_rate'))
+                    entry['classification'] = merged_entry.get(
+                        'classification', entry.get('classification'))
+            compare_pools.append(pool_copy)
+        mode_compare = calculate_tax_report.compare_kap_inv_wht_modes(
+            compare_pools)
+        wht_mode_diff = mode_compare['difference_eur']
         compare_table = (
             "| Fonds-QSt in Zeile 41 | Betrag |\n"
             "|-----------------------|-------:|\n"
-            f"| Standardberechnung | {fmt_de(wht_standard_value)} |\n"
-            f"| DBA-Beta | {fmt_de(wht_beta_value)} |\n"
-            f"| Differenz | {fmt_de(wht_mode_diff)} |\n"
-        )
+            f"| Standardberechnung | {fmt_de(mode_compare['standard_eur'])} |\n"
+            f"| DBA-Beta | {fmt_de(mode_compare['beta_eur'])} |\n"
+            f"| Differenz | {fmt_de(wht_mode_diff)} |\n")
         st.markdown(compare_table)
         if abs(wht_mode_diff) <= 0.005:
             st.caption(
-                "Die DBA-Beta ändert an diesen Daten nichts; beide Modi liefern "
-                "denselben anrechenbaren Betrag."
+                "Die DBA-Beta ändert an diesen Daten nichts; beide Modi "
+                "liefern denselben anrechenbaren Betrag."
             )
         else:
             richtung = "erhöht" if wht_mode_diff > 0 else "verringert"
             st.caption(
-                f"Die DBA-Beta {richtung} die anrechenbare Fonds-Quellensteuer "
-                f"um {fmt_de(abs(wht_mode_diff))} EUR gegenüber der "
-                "Standardberechnung. Details im Prüffall-Bereich (Beta aktivieren)."
+                f"Die DBA-Beta {richtung} die anrechenbare "
+                f"Fonds-Quellensteuer um {fmt_de(abs(wht_mode_diff))} EUR "
+                "gegenüber der Standardberechnung. Aktivieren in der "
+                "Sidebar unter Berechnung."
             )
 
-    wht_metric_html = metric_card("Fonds-QSt → KAP Z. 41", etf_wht)
+    wht_metric_html = metric_card(
+        "Fonds-Quellensteuer → KAP Z. 41", etf_wht, "info")
     if abs(etf_wht_raw - etf_wht) > 0.01:
-        wht_metric_html = metric_card("ETF-QSt roh", etf_wht_raw) + wht_metric_html
+        wht_metric_html = (
+            metric_card("Fonds-Quellensteuer roh", etf_wht_raw, "info")
+            + wht_metric_html)
     tk_metric_html = ""
     if tageskurs_aktiv and abs(tageskurs_kapinv_corr_raw) > 0.01:
-        tk_metric_html += metric_card("Tageskurs-Korr. roh", tageskurs_kapinv_corr_raw, "info")
-        tk_metric_html += metric_card("Tageskurs-Korr. stpfl.", tageskurs_kapinv_corr, "info")
+        tk_metric_html += metric_card(
+            "Tageskurs-Anpassung vor TFS", tageskurs_kapinv_corr_raw, "info")
+        tk_metric_html += metric_card(
+            "Tageskurs-Anpassung nach TFS", tageskurs_kapinv_corr, "info")
 
-    st.markdown(
-        '<div class="metric-grid">'
-        + metric_card("ETF-Gewinne (roh)", etf_gain_raw, "gain")
-        + metric_card("ETF-Verluste (roh)", etf_loss_raw, "loss")
-        + metric_card("Teilfreistellung", etf_gain_raw - etf_gain_taxable + etf_loss_raw - etf_loss_taxable, "info")
-        + metric_card("G/V Kontrollwert*", etf_gain_taxable + etf_loss_taxable, "saldo")
-        + metric_card("Div. Kontrollwert*", etf_div_taxable)
-        + tk_metric_html
-        + wht_metric_html
-        + '</div>',
-        unsafe_allow_html=True
-    )
+    with st.expander("Summen und Kontrollwerte", expanded=False):
+        st.caption(
+            "Werte zur rechnerischen Abstimmung; die zu übertragenden "
+            "Steuerzeilen stehen in der Eintragungsübersicht."
+        )
+        st.markdown(metric_grid(
+            metric_card("Fonds-Gewinne vor Tageskurs", etf_gain_raw, "info"),
+            metric_card("Fonds-Verluste vor Tageskurs", etf_loss_raw, "info"),
+            metric_card(
+                "Teilfreistellungseffekt vor Tageskurs",
+                etf_gain_raw - etf_gain_taxable
+                + etf_loss_raw - etf_loss_taxable,
+                "info"),
+            metric_card("Veräußerungs-Kontrollwert nach TFS",
+                        kap_inv_sale_control, "info"),
+            metric_card("Ausschüttungs-Kontrollwert nach TFS",
+                        kap_inv_distribution_control, "info"),
+            tk_metric_html,
+            wht_metric_html,
+        ), unsafe_allow_html=True)
 
-    wht_review_items = kap_inv.get('wht_review_items', []) or []
+    wht_review_items = vm['wht_review_items'] or []
     if dba_wht_beta_enabled and wht_review_items:
         unverified_sum = sum(
             e.get('creditable_tax_eur', 0) for e in wht_review_items
-            if e.get('status') == 'dba_unverified'
-        )
+            if e.get('status') == 'dba_unverified')
         if abs(unverified_sum) > 0.01:
             st.warning(
-                f"Zeile 41 enthält {fmt_de(unverified_sum)} EUR Fonds-Quellensteuer "
-                "ohne hinterlegten DBA-Höchstsatz. Der Betrag ist nur auf den "
-                "deutschen 25%-Höchstbetrag begrenzt; besteht im Quellenstaat ein "
-                "Erstattungsanspruch, ist er entsprechend zu kürzen. Details im "
-                "Prüffall-Bereich unten."
+                f"Zeile 41 enthält {fmt_de(unverified_sum)} EUR "
+                "Fonds-Quellensteuer ohne hinterlegten DBA-Höchstsatz. Der "
+                "Betrag ist nur auf den deutschen 25%-Höchstbetrag begrenzt; "
+                "besteht im Quellenstaat ein Erstattungsanspruch, ist er "
+                "entsprechend zu kürzen."
             )
         with st.expander(
-            f"Quellensteuer-Prüffälle ({len(wht_review_items)})",
-            expanded=False,
-        ):
+                f"Quellensteuer-Prüffälle ({len(wht_review_items)})",
+                expanded=False):
             st.caption(
                 "DBA-Sätze werden nicht aus dem ISIN-Länderpräfix geraten. "
-                "Unbelegte DBA-Fälle und zeitversetzte Erstattungen bleiben sichtbar. "
-                "Buchung = Buchungsdatum (bestimmt das Steuerjahr); "
-                "Bezugsdatum = Datum der zugrunde liegenden Ausschüttung, "
-                "kann im Vorjahr liegen."
+                "Unbelegte DBA-Fälle und zeitversetzte Erstattungen bleiben "
+                "sichtbar. Buchung = Buchungsdatum (bestimmt das "
+                "Steuerjahr); Bezugsdatum = Datum der zugrunde liegenden "
+                "Ausschüttung."
             )
             review_rows = calculate_tax_report.build_wht_review_rows(
-                wht_review_items, etf_by_isin
-            )
-
-            # Verdichtung: eine Zeile je Produkt/Buchung/Status mit Anzahl,
-            # Summe und Produktnamen - darunter die Einzel-Ereignisse.
+                wht_review_items, etf_by_isin)
             review_groups = {}
             for row in review_rows:
-                group_key = (row['product'], row['booking_date'], row['status_label'])
+                group_key = (row['product'], row['booking_date'],
+                             row['status_label'])
                 group = review_groups.setdefault(group_key, {
                     'count': 0, 'sum': 0.0, 'name': row['name'],
                 })
                 group['count'] += 1
                 group['sum'] += row['net_foreign_tax_eur']
-            for (product, booking, status_label), group in sorted(review_groups.items()):
+            for (product, booking, status_label), group in sorted(
+                    review_groups.items()):
                 name_part = f" ({group['name']})" if group['name'] else ""
                 plural = "Ereignisse" if group['count'] != 1 else "Ereignis"
                 st.markdown(
@@ -2205,7 +3252,6 @@ if has_etf_data and invstg_aktiv:
                     f"gebucht am {booking}, Netto-QSt gesamt "
                     f"{fmt_de(group['sum'])} EUR. Status: {status_label}."
                 )
-
             review_df_rows = []
             for row in review_rows:
                 treaty_cap = row['treaty_cap_eur']
@@ -2213,917 +3259,717 @@ if has_etf_data and invstg_aktiv:
                     'Produkt': row['product'],
                     'Buchung': row['booking_date'],
                     'Bezugsdatum': row['entitlement_date'],
-                    'Netto-QSt (+ Einbehalt / − Erstattung)': fmt_de(row['net_foreign_tax_eur']),
+                    'Netto-QSt (+ Einbehalt / − Erstattung)':
+                        fmt_de(row['net_foreign_tax_eur']),
                     'DE-Höchstbetrag': fmt_de(row['german_cap_eur']),
-                    'DBA-Limit': fmt_de(treaty_cap) if treaty_cap is not None else 'prüfen',
+                    'DBA-Limit': (fmt_de(treaty_cap)
+                                  if treaty_cap is not None else 'prüfen'),
                     'Anrechenbar': fmt_de(row['creditable_tax_eur']),
                     'Status': row['status_label'],
                 })
-            st.dataframe(review_df_rows, use_container_width=True, hide_index=True)
+            st.dataframe(review_df_rows, width="stretch",
+                         hide_index=True)
             st.caption("Alle Beträge in EUR.")
 
-    with st.expander("ETF-Details nach ISIN"):
-        etf_table = "| Ticker | Typ | TFS | G/V roh | G/V stpfl. | Div roh | Div stpfl. |\n"
-        etf_table += "|--------|-----|----:|--------:|----------:|--------:|----------:|\n"
-        for isin, info in sorted(etf_by_isin.items(), key=lambda x: x[1].get('ticker', '')):
-            cls_short = {'aktienfonds': 'Aktien', 'mischfonds': 'Misch', 'sonstiger_fonds': 'Sonst.'}.get(info.get('classification', ''), '?')
-            tfs_pct = f"{info.get('tfs_rate', 0) * 100:.0f}%"
-            gv_raw = info.get('gain', 0) + info.get('loss', 0)
-            gv_tax = info.get('gain_taxable', 0) + info.get('loss_taxable', 0)
-            div_raw = info.get('div', 0)
-            div_tax = info.get('div_taxable', 0)
-            etf_table += f"| {info.get('ticker', isin)} | {cls_short} | {tfs_pct} | {fmt_de(gv_raw)} | {fmt_de(gv_tax)} | {fmt_de(div_raw)} | {fmt_de(div_tax)} |\n"
-        st.markdown(etf_table)
-
-
-# ── Topf 2 · Sonderprodukte außerhalb InvStG ────────────────────────────────
-
-if no_invstg_summary:
-    section_title("Topf 2 · Sonderprodukte außerhalb InvStG")
-    st.caption(
-        "Einzelnachweis für ETPs/Trusts, die nicht als Investmentfonds nach "
-        "InvStG behandelt werden. Die Beträge sind bereits in Topf 2 enthalten. "
-        "Negative QSt-Werte kennzeichnen Erstattungen."
-    )
-    with st.expander("Sonderprodukte nach ISIN", expanded=True):
-        special_table = "| Ticker | ISIN | Realisiertes G/V | Tageskurs | Ausschüttungen | QSt | Summe Topf 2 |\n"
-        special_table += "|--------|------|----------------:|----------:|---------------:|----:|-------------:|\n"
-        for isin, info in sorted(no_invstg_summary.items(), key=lambda x: x[1].get('ticker', '')):
-            realized = info.get('gain', 0) + info.get('loss', 0)
-            special_table += (
-                f"| {info.get('ticker', isin)} | {isin} | {fmt_de(realized)} | "
-                f"{fmt_de(info.get('tageskurs', 0))} | {fmt_de(info.get('div', 0))} | "
-                f"{fmt_de(info.get('wht_reported', 0))} | {fmt_de(info.get('total', 0))} |\n"
-            )
-        st.markdown(special_table)
-
-
-# ── Anlage SO — manuelle Zuordnung (Issue #51) ───────────────────────────────
-# Nutzer kann ETFs manuell als Anlage SO markieren, auch wenn sie nicht in der
-# Klassifizierungstabelle stehen (z.B. physische Edelmetall-ETCs mit Lieferanspruch).
-all_traded_etf_isins = d.get('all_traded_etf_isins', [])
-_so_lookup = d.get('anlage_so', {}).get('by_isin', {})
-
-
-def _anlage_so_label(isin):
-    info = get_etf_info(isin)
-    if info:
-        name = info.get('name', '')
-        return f"{info['ticker']} - {name} ({isin})" if name else f"{info['ticker']} ({isin})"
-    fb = etf_by_isin.get(isin) or _so_lookup.get(isin) or {}
-    ticker = fb.get('ticker', isin[:12])
-    name = fb.get('name', '')
-    return f"{ticker} - {name} ({isin})" if name else f"{ticker} ({isin})"
-
-
-selectable_etfs = sorted(
-    isin for isin in all_traded_etf_isins
-    if isin
-    and not is_anlage_so(isin)
-    # Nur ETCs (no_invstg) und unklassifizierte ETFs erlauben - Aktien-/Misch-/Sonstige
-    # Fonds sind InvStG-Investmentfonds und gehoeren nach §20 EStG, nicht §23 EStG.
-    and get_classification(isin) in ('no_invstg', None)
-)
-
-# Defensive-Bereinigung: Overrides aus früheren Sessions/XML-Uploads wegnehmen,
-# wenn ihre ISIN in der aktuellen Auswahl nicht mehr vorkommt.
-_prev_overrides = st.session_state.get('anlage_so_overrides', [])
-_clean_overrides = [isin for isin in _prev_overrides if isin in selectable_etfs]
-if _clean_overrides != list(_prev_overrides):
-    st.session_state['anlage_so_overrides'] = _clean_overrides
-
-if selectable_etfs:
-    section_title("Anlage SO - manuelle Zuordnung")
-    st.markdown("""
-<div style="background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #fbbf24;">Nur für physische Edelmetall-ETCs mit Lieferanspruch</strong>
-    (BFH VIII R 35/14 und VIII R 4/15, analog zu Xetra-Gold / EUWAX Gold II). Die Zuordnung gilt nur für diese Session:
-    ausgewählte ETFs werden aus Anlage KAP-INV entfernt und auf Anlage SO (§23 EStG) berechnet,
-    inkl. 1-Jahres-Spekulationsfrist.
-</div>
-""", unsafe_allow_html=True)
-    st.multiselect(
-        "ETFs als Anlage SO (§23 EStG) behandeln",
-        options=selectable_etfs,
-        format_func=_anlage_so_label,
-        key='anlage_so_overrides',
-        help="Die Auswahl wird beim nächsten Rerun berücksichtigt. Abwählen verschiebt den ETF zurück in KAP-INV.",
-    )
-
-
-# ── Anlage SO · Private Veräußerungsgeschäfte (§23 EStG) ──────────────────────
-
-anlage_so = d.get('anlage_so', {})
-so_by_isin = anlage_so.get('by_isin', {})
-has_so_data = bool(so_by_isin)
-
-if has_so_data:
-    section_title("Anlage SO · Private Veräußerungsgeschäfte (§23 EStG)")
-
-    so_taxable = anlage_so.get('taxable_gain', 0) + anlage_so.get('taxable_loss', 0)
-    so_free = anlage_so.get('tax_free_gain', 0) + anlage_so.get('tax_free_loss', 0)
-    so_total = anlage_so.get('total_gain', 0) + anlage_so.get('total_loss', 0)
-
-    so_unknown = abs(anlage_so.get('unknown_gain', 0)) + abs(anlage_so.get('unknown_loss', 0))
-    so_has_unknown = so_unknown > 0.01
-
-    history_hint = ""
-    if so_has_unknown:
-        history_hint = (
-            '<br><br><strong style="color: #f87171;">Haltedauer nicht ermittelbar:</strong> '
-            'Ohne Vorjahres-XMLs oder CLOSED_LOT-Daten kann die Haltedauer nicht bestimmt werden. '
-            f'Betroffene Positionen ({fmt(so_unknown)}) werden konservativ als <strong>steuerpflichtig</strong> behandelt. '
-            'Die XML-Datei des Kaufjahres als History-Datei hochladen, damit die Spekulationsfrist korrekt berechnet werden kann.'
+    with st.expander("Fondsdetails nach ISIN · KAP-INV-Abstimmung"):
+        form_tab, calculation_tab = st.tabs(["Formularwerte", "Prüfrechnung"])
+        sorted_fund_details = sorted(
+            kap_inv_form.get('details', []),
+            key=lambda item: item.get('ticker', ''),
         )
+        with form_tab:
+            form_fund_table = (
+                "| Produkt | ISIN | Fondsart / TFS | Ausschüttungen | "
+                "Veräußerung |\n"
+                "|---------|------|----------------|---------------:|"
+                "------------:|\n")
+            for detail in sorted_fund_details:
+                fund_type = detail.get(
+                    'fund_type', detail.get('classification', '?'))
+                if fund_type == 'Sonstige Investmentfonds':
+                    fund_type = 'Sonstiger Fonds'
+                form_fund_table += (
+                    f"| {detail.get('ticker', detail['isin'])} | "
+                    f"{detail['isin']} | {fund_type} "
+                    f"({detail.get('tfs_rate', 0) * 100:.0f}%) | "
+                    f"{fmt_de(detail.get('distribution_raw_eur', 0))} | "
+                    f"{fmt_de(detail.get('sale_raw_eur', 0))} |\n")
+            st.markdown(form_fund_table)
+            st.caption(
+                "Alle Beträge in EUR vor Teilfreistellung. Ausschüttungen "
+                "enthalten nur erhaltene Zahlungen; gezahlte Ersatzzahlungen "
+                "auf Short-Positionen stehen separat bei den Prüffällen."
+            )
+        with calculation_tab:
+            calculation_table = (
+                "| Produkt | Vor Tageskurs | Tageskurs-Anpassung | "
+                "KAP-INV-Wert | Nach TFS* |\n"
+                "|---------|---------------:|--------------------:|"
+                "-------------:|----------:|\n")
+            for detail in sorted_fund_details:
+                sale_raw = detail.get('sale_raw_eur', 0)
+                tageskurs_raw = detail.get('tageskurs_raw_eur', 0)
+                calculation_table += (
+                    f"| {detail.get('ticker', detail['isin'])} | "
+                    f"{fmt_de(sale_raw - tageskurs_raw)} | "
+                    f"{fmt_de(tageskurs_raw)} | {fmt_de(sale_raw)} | "
+                    f"{fmt_de(detail.get('sale_taxable_control_eur', 0))} |\n")
+            st.markdown(calculation_table)
+            st.caption(
+                "* Steuerpflichtiger Kontrollwert nach Teilfreistellung, "
+                "kein zusätzlicher Formularwert. Der KAP-INV-Wert enthält "
+                "die Tageskurs-Anpassung. Durch Rundung je ISIN kann die "
+                "sichtbare Summe um einen Cent vom Formularwert abweichen."
+            )
 
-    st.markdown(f"""
-<div style="background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
-    <strong style="color: #fbbf24;">Physische Edelmetall-ETCs mit Lieferanspruch</strong> werden nach
-    <strong>§23 Abs. 1 S. 1 Nr. 2 EStG</strong> als private Veräußerungsgeschäfte behandelt
-    (bestätigt durch <strong>BFH VIII R 35/14</strong> für die Veräußerung und <strong>VIII R 4/15</strong> für die
-    physische Auslieferung von Xetra-Gold; analog für Silber/Platin/Palladium).
-    Die Spekulationsfrist beträgt <strong>1 Jahr</strong> (§23 Abs. 1 S. 1 Nr. 2 S. 1 EStG) -
-    Veräußerungsgewinne nach Ablauf dieser Frist sind <strong style="color: #4ade80;">steuerfrei</strong>.
-    Innerhalb der Frist sind sie auf <strong>Anlage SO</strong> zu erklären (nicht auf Anlage KAP).{history_hint}
-</div>
-""", unsafe_allow_html=True)
 
-    so_hero_color = "#fbbf24" if so_taxable >= 0 else "#f87171"
-    st.markdown(f"""
-<div class="hero-card-so">
-    <div class="hero-label">Anlage SO · Steuerpflichtiger Gewinn/Verlust (Haltedauer ≤ 1 Jahr)</div>
-    <div class="hero-value" style="color:{so_hero_color}">{fmt(so_taxable)}</div>
-    <div class="hero-formula">Gesamt {fmt(so_total)} − Steuerfrei {fmt(so_free)} (Haltedauer > 1 Jahr)</div>
-</div>
-""", unsafe_allow_html=True)
+# ── Renderer: Anlage SO ──────────────────────────────────────────────────────
+
+def render_anlage_so():
+    st.markdown('<p class="page-title">Anlage SO</p>', unsafe_allow_html=True)
+    _inline_marker('anlage_so')
+    if not has_so_data:
+        st.info(
+            "Aktuell führt kein Produkt zu Anlage-SO-Werten. Die manuelle "
+            "Zuordnung von Gold-ETCs steht im Bereich Prüffälle."
+        )
+        return
+
+    so_by_isin = anlage_so.get('by_isin', {})
+    so_unknown = (abs(anlage_so.get('unknown_gain', 0))
+                  + abs(anlage_so.get('unknown_loss', 0)))
+    history_hint = ""
+    if so_unknown > 0.01:
+        history_hint = (
+            " Haltedauer nicht ermittelbar: ohne Vorjahres-XMLs oder "
+            f"CLOSED_LOT-Daten werden {fmt(so_unknown)} konservativ als "
+            "steuerpflichtig behandelt; XML des Kaufjahres als Historie "
+            "hochladen."
+        )
+    st.markdown(notice_html({
+        'class': 'transparenz', 'severity': 'normal',
+        'title': 'Private Veräußerungsgeschäfte (§23 EStG)',
+        'body': (
+            "Physische Edelmetall-ETCs mit Lieferanspruch werden nach §23 "
+            "Abs. 1 S. 1 Nr. 2 EStG behandelt (BFH VIII R 35/14, "
+            "VIII R 4/15). Spekulationsfrist 1 Jahr: Gewinne nach Ablauf "
+            "steuerfrei, innerhalb der Frist auf Anlage SO zu erklären "
+            "(nicht auf Anlage KAP)." + history_hint
+        ),
+        'target': None,
+    }, show_target=False), unsafe_allow_html=True)
 
     st.markdown(
-        '<div class="metric-grid">'
-        + metric_card("Gesamt G/V", so_total, "saldo")
-        + metric_card("Steuerfrei (> 1J)", so_free, "gain")
-        + metric_card("Steuerpflichtig (≤ 1J)", so_taxable, "loss" if so_taxable < 0 else "info")
+        '<div class="card">'
+        '<div class="eyebrow" style="margin-top:0;">Anlage SO</div>'
+        + kap_row("SO", "Steuerpflichtiger Gewinn/Verlust (bis 1 Jahr)",
+                  so_taxable, highlight=True)
+        + kap_row("SO", "Steuerfrei (über 1 Jahr Haltedauer)", so_free)
+        + kap_row("SO", "Gesamtergebnis", so_total)
         + '</div>',
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
     with st.expander("ETC-Details nach ISIN"):
-        so_table = "| Ticker | ISIN | Gesamt | Steuerfrei (> 1J) | Steuerpflichtig (≤ 1J) |\n"
-        so_table += "|--------|------|-------:|------------------:|-----------------------:|\n"
-        for isin, info in sorted(so_by_isin.items(), key=lambda x: abs(x[1]['total']), reverse=True):
-            so_table += f"| {info.get('ticker', isin)} | {isin} | {fmt_de(info['total'])} | {fmt_de(info.get('tax_free', 0))} | {fmt_de(info.get('taxable', 0))} |\n"
+        so_table = (
+            "| Ticker | ISIN | Gesamt | Steuerfrei (>1J) | "
+            "Steuerpflichtig (≤1J) |\n"
+            "|--------|------|-------:|------------------:|"
+            "-----------------------:|\n")
+        for isin, info in sorted(so_by_isin.items(),
+                                 key=lambda x: abs(x[1]['total']),
+                                 reverse=True):
+            so_table += (
+                f"| {info.get('ticker', isin)} | {isin} | "
+                f"{fmt_de(info['total'])} | {fmt_de(info.get('tax_free', 0))} | "
+                f"{fmt_de(info.get('taxable', 0))} |\n")
         st.markdown(so_table)
-
         so_details = anlage_so.get('details', [])
         if so_details:
             st.markdown("**Lot-Details (FIFO-Zuordnung):**")
-            lot_table = "| Ticker | Kauf | Verkauf | Stk. | G/V (EUR) | Status |\n"
-            lot_table += "|--------|------|---------|-----:|----------:|--------|\n"
+            lot_table = (
+                "| Ticker | Kauf | Verkauf | Stk. | G/V (EUR) | Status |\n"
+                "|--------|------|---------|-----:|----------:|--------|\n")
             for lot in so_details:
-                status = "steuerfrei" if lot.get('is_tax_free') else "steuerpflichtig"
+                status = ("steuerfrei" if lot.get('is_tax_free')
+                          else "steuerpflichtig")
                 qty = abs(lot.get('quantity', 0))
-                lot_table += f"| {lot['ticker']} | {lot.get('open_date', '?')} | {lot.get('close_date', '?')} | {qty:.0f} | {fmt_de(lot['pnl_eur'])} | {status} |\n"
+                lot_table += (
+                    f"| {lot['ticker']} | {lot.get('open_date', '?')} | "
+                    f"{lot.get('close_date', '?')} | {qty:.0f} | "
+                    f"{fmt_de(lot['pnl_eur'])} | {status} |\n")
             st.markdown(lot_table)
 
 
-# ── Einzelnachweise - Trade-Level-Reporting ──────────────────────────────────
-trade_details = list(d.get('trade_details', []))
-if trade_details and tageskurs_aktiv:
-    for lot in d.get('fx_correction_details', []):
-        if abs(lot.get('delta_eur', 0)) < 0.005:
-            continue
-        underlying = (lot.get('underlyingSymbol', '') or lot.get('symbol', '') or '').split()[0]
-        open_dt = (lot.get('openDateTime', '') or '')[:10]
-        close_dt = lot.get('reportDate', '')
-        delta_eur = lot['delta_eur']
-        note = f'Tageskurs-Korrektur (Kauf {open_dt}, Kurs {lot["fx_open"]:.5f} → {lot["fx_close"]:.5f})'
-        if lot.get('invstg_basis_adjustment_raw', 0) > 0:
-            note += (' · KAP-INV-AK inkl. zusätzlicher ausländischer '
-                     'Basisreduktion (z. B. ROC) auf Put-Strike normalisiert')
-        if lot.get('topf') == 'KAP-INV' and invstg_aktiv:
-            isin = lot.get('isin', '')
-            tfs_rate = etf_by_isin.get(isin, {}).get('tfs_rate', lot.get('tfs_rate', 0))
-            taxable_delta = delta_eur * (1 - tfs_rate)
-            if abs(taxable_delta - delta_eur) > 0.005:
-                note += f' · roh {fmt_de(delta_eur)} EUR, stpfl. nach TFS {fmt_de(taxable_delta)} EUR'
-            delta_eur = taxable_delta
-        trade_details.append({
-            'dateTime': close_dt, 'reportDate': close_dt,
-            'symbol': lot.get('symbol', ''),
-            'description': note,
-            'isin': lot.get('isin', ''), 'assetCategory': lot.get('assetCategory', ''),
-            'subCategory': lot.get('subCategory', ''), 'buySell': '', 'openClose': '',
-            'quantity': lot.get('quantity', ''), 'transactionType': 'FX-Korrektur',
-            'currency': lot.get('currency', ''), 'tradePrice': 0, 'cost': lot.get('cost', 0),
-            'proceeds': 0, 'fifoPnlRealized': 0, 'fxRateToBase': 0,
-            'pnl_eur': delta_eur, 'topf': lot.get('topf', 'Topf2'),
-            'strike': '', 'expiry': '', 'putCall': '', 'multiplier': '',
-            'underlyingSymbol': underlying, 'source': 'tageskurs_korrektur',
-        })
-    trade_details.sort(key=lambda r: r.get('dateTime', '') or r.get('reportDate', '') or 'zzzz')
-if d:
-    section_title('Export - Excel-Steuerreport')
-    st.markdown('<div style="margin-top:-18px;margin-bottom:12px"><span style="background:linear-gradient(135deg,#f59e0b,#ef4444);color:#fff;padding:5px 16px;border-radius:6px;font-size:0.85em;font-weight:700;letter-spacing:1px;box-shadow:0 2px 8px rgba(239,68,68,0.3)">NEUE FUNKTION &middot; BETA</span></div>', unsafe_allow_html=True)
+# ── Renderer: Prüffälle ──────────────────────────────────────────────────────
 
-    from collections import defaultdict
-    topf_readable = {
-        'Topf1': 'Topf 1 - Aktien (§20 Abs. 2 Nr. 1 EStG)',
-        'Topf2': 'Topf 2 - Sonstiges (Termingeschäfte, Stillhalter, FX)',
-        'KAP-INV': 'Anlage KAP-INV (InvStG)',
-        'Anlage SO': 'Anlage SO (§23 EStG)',
-        'Nicht zugeordnet': 'Nicht zugeordnet (bitte manuell prüfen)',
-    }
-    cat_labels = {
-        'STK': 'Aktie', 'OPT': 'Option', 'FUT': 'Future',
-        'FOP': 'Futures-Option', 'FSFOP': 'Flex-Option',
-        'BILL': 'T-Bill', 'BOND': 'Anleihe',
-        'WAR': 'Optionsschein', 'CFD': 'CFD',
-    }
-    trades_by_topf = defaultdict(list)
-    for row in trade_details:
-        trades_by_topf[row.get('topf', 'Topf2')].append(row)
+def _render_so_override_picker():
+    """Manuelle Anlage-SO-Zuordnung (Issue #51). Lebt bewusst im immer
+    sichtbaren Prueffall-Bereich: ohne bestehendes SO-Ergebnis waere der
+    Anlage-SO-Bereich sonst nie erreichbar."""
+    all_traded_etf_isins = d.get('all_traded_etf_isins', [])
+    so_lookup = anlage_so.get('by_isin', {})
 
-    n_trades = sum(1 for r in trade_details if r.get('source') == 'trades')
-    n_korr = len(trade_details) - n_trades
-    n_underlyings = len(set(
-        (r.get('underlyingSymbol', '') or r.get('symbol', '') or '?').split()[0]
-        for r in trade_details if r.get('source') == 'trades'
-    ))
-    if n_trades > 0:
-        header = f"**{n_trades} Trades, {n_underlyings} Wertpapiere"
-        if n_korr > 0:
-            header += f" (+ {n_korr} Korrekturen/Zuflüsse)"
-        header += "**"
-    elif n_korr > 0:
-        header = f"**Keine Trades, {n_korr} Korrektur-/Zuflusspositionen**"
-    else:
-        header = "**Keine Trade-Details - Zusammenfassung verfügbar**"
-    summary_lines = [header]
-    for topf_key in ['Topf1', 'Topf2', 'KAP-INV', 'Anlage SO', 'Nicht zugeordnet']:
-        rows = trades_by_topf.get(topf_key, [])
-        if rows:
-            s = sum(r.get('pnl_eur', 0) for r in rows)
-            summary_lines.append(f"{topf_readable.get(topf_key, topf_key).split(' - ')[0]}: {fmt_de(s)} EUR")
-    st.markdown(" | ".join(summary_lines))
-    st.caption("Die Excel-Datei enthält zuerst die steuerliche Zusammenfassung aus denselben finalen Werten wie GUI und Textreport. Die Trade-Details dienen als Nachweis und werden separat abgestimmt.")
+    def _so_label(isin):
+        info = get_etf_info(isin)
+        if info:
+            name = info.get('name', '')
+            return (f"{info['ticker']} - {name} ({isin})" if name
+                    else f"{info['ticker']} ({isin})")
+        fb = etf_by_isin.get(isin) or so_lookup.get(isin) or {}
+        ticker = fb.get('ticker', isin[:12])
+        name = fb.get('name', '')
+        return f"{ticker} - {name} ({isin})" if name else f"{ticker} ({isin})"
 
-    def _format_instrument(row):
-        sym = row.get('symbol', '') or ''; desc = row.get('description', '') or ''
-        pc = row.get('putCall', '') or ''; strike = row.get('strike', '') or ''; expiry = row.get('expiry', '') or ''
-        if pc and strike and expiry:
-            pc_label = 'Call' if pc == 'C' else 'Put'
-            exp_fmt = f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:]}" if len(expiry) == 8 else expiry[:10]
-            return f"{sym} ({pc_label} {strike} exp. {exp_fmt})"
-        if desc and sym: return f"{sym} ({desc})"
-        return sym or desc or ''
+    selectable = sorted(
+        isin for isin in all_traded_etf_isins
+        if isin
+        and not is_anlage_so(isin)
+        # Nur ETCs (no_invstg) und unklassifizierte ETFs: InvStG-Fonds
+        # gehoeren nach §20 EStG, nicht §23 EStG.
+        and get_classification(isin) in ('no_invstg', None)
+    )
+    # Overrides bereinigen, deren ISIN im aktuellen Datensatz fehlt.
+    cleaned = [i for i in _dom.get('anlage_so_overrides', [])
+               if i in selectable]
+    if cleaned != list(_dom.get('anlage_so_overrides', [])):
+        _dom['anlage_so_overrides'] = cleaned
+    if not selectable:
+        return
 
-    def _get_group_key(row):
-        us = (row.get('underlyingSymbol', '') or '').strip()
-        if us: return us.split()[0]
-        sym = (row.get('symbol', '') or '').strip()
-        return sym.split()[0] if sym else '?'
+    section_title("Anlage SO · manuelle Zuordnung")
+    st.caption(
+        "Nur für physische Edelmetall-ETCs mit Lieferanspruch (BFH VIII R "
+        "35/14, VIII R 4/15). Ausgewählte Produkte werden aus KAP-INV "
+        "entfernt und auf Anlage SO (§23 EStG) mit 1-Jahres-Frist "
+        "berechnet. Die Auswahl ändert die Berechnung und löst einen "
+        "Neulauf aus."
+    )
+    so_key = f"_ui_so_overrides_{_dataset_id[:12]}"
 
-    def _build_excel(trade_details, trades_by_topf, export_context):
-        from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-        from openpyxl.utils import get_column_letter
-        import io
-        wb = Workbook()
-        ws_details = wb.active
-        ws_details.title = f"Trade-Details {steuerjahr}"
-        ws = wb.create_sheet("Zusammenfassung")
-        hdr_font = Font(bold=True, color="FFFFFF", size=11); hdr_fill = PatternFill("solid", fgColor="1e3a5f")
-        grp_font = Font(bold=True, size=10); grp_fill = PatternFill("solid", fgColor="d6e4f0")
-        gain_font = Font(color="006100", size=9); gain_fill = PatternFill("solid", fgColor="e2efda")
-        loss_font = Font(color="9c0006", size=9); loss_fill = PatternFill("solid", fgColor="fce4ec")
-        korr_font = Font(italic=True, size=9); korr_fill = PatternFill("solid", fgColor="fff9c4")
-        sub_font = Font(bold=True, size=9); sub_fill = PatternFill("solid", fgColor="f2f2f2")
-        total_font = Font(bold=True, size=10, color="FFFFFF"); total_fill = PatternFill("solid", fgColor="4a4a4a")
-        normal_font = Font(size=9); thin_border = Border(bottom=Side(style='thin', color='cccccc'))
-        num_fmt_eur = '#,##0.00'; num_fmt_4d = '#,##0.0000'
+    def _sync_so():
+        _dom['anlage_so_overrides'] = list(st.session_state[so_key])
 
-        f = export_context['final']
-        has_etf = export_context['has_etf_data'] and export_context['invstg_aktiv']
-        kap_inv_form_export = export_context.get('kap_inv_form', {})
-        has_so = export_context['has_so_data']
-        special_products = export_context['no_invstg_summary']
-        so_taxable = export_context['so_taxable']
-        so_free = export_context['so_free']
-        trade_sums = {
-            key: sum(float(r.get('pnl_eur') or 0) for r in rows)
-            for key, rows in trades_by_topf.items()
-        }
-        trade_topf1_reconciled = trade_sums.get('Topf1', 0)
-        trade_topf2_reconciled = trade_sums.get('Topf2', 0)
-        kap_inv_trade_total = trade_sums.get('KAP-INV', 0)
-        kap_inv_reintegration_note = ""
-        if export_context['has_etf_data'] and not export_context['invstg_aktiv'] and abs(kap_inv_trade_total) > 0.005:
-            trade_topf1_reconciled += kap_inv_trade_total
-            kap_inv_reintegration_note = "KAP-INV-Detailwerte wurden wegen deaktivierter InvStG-Klassifizierung in Topf 1 reintegriert."
+    st.multiselect(
+        "Produkte als Anlage SO (§23 EStG) behandeln",
+        options=selectable,
+        default=cleaned,
+        format_func=_so_label,
+        key=so_key,
+        on_change=_sync_so,
+        placeholder="Produkte auswählen",
+    )
 
-        summary_cols = ["Bereich", "Position", "Wert EUR / Anzahl", "Hinweis"]
-        for i, width in enumerate([22, 44, 16, 60], 1):
-            ws.column_dimensions[get_column_letter(i)].width = width
-        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(summary_cols))
-        cell = ws.cell(row=1, column=1, value=f"ANLAGE KAP {steuerjahr} - Steuerbericht")
-        cell.font = hdr_font
-        cell.fill = hdr_fill
-        cell.alignment = Alignment(horizontal='left')
-        row_num = 2
-        meta_rows = [
-            ("Erstellt", export_context['created_at']),
-            ("Basiswährung", export_context['base_currency']),
-            ("Quelle", "final (GUI/Textreport Single Source of Truth)"),
-        ]
-        for label, value in meta_rows:
-            ws.cell(row=row_num, column=1, value=label)
-            ws.cell(row=row_num, column=2, value=value)
-            for ci in range(1, len(summary_cols) + 1):
-                cell = ws.cell(row=row_num, column=ci)
-                cell.font = normal_font
-                cell.border = thin_border
-            ws.cell(row=row_num, column=1).font = sub_font
-            row_num += 1
 
-        summary_rows = [
-            ("Topf 1", "Aktiengewinne", f['stocks_gain'], ""),
-            ("Topf 1", "Aktienverluste", f['stocks_loss'], ""),
-            ("Topf 1", "Saldo Aktien", f['topf_1'], ""),
-            ("Topf 2", "Dividenden", f['dividends'], ""),
-            ("Topf 2", "Zinsen netto", f['interest'], ""),
-            ("Topf 2", "Sonstige Gewinne", f['options_gain'], ""),
-            ("Topf 2", "Sonstige Verluste", f['options_loss'], ""),
-            ("Topf 2", "Saldo Sonstiges", f['topf_2'], ""),
-            ("Anlage KAP", "Zeile 7 - inländischer Steuerabzug", f['zeile_7'], ""),
-            ("Anlage KAP", "Zeile 19 - ausländische Kapitalerträge netto", f['zeile_19'], ""),
-            ("Anlage KAP", "Zeile 20 - Aktiengewinne", f['zeile_20'], ""),
-            ("Anlage KAP", "Zeile 22 - Verluste ohne Aktien", f['zeile_22'], "positiver Eintrag"),
-            ("Anlage KAP", "Zeile 23 - Aktienverluste", f['zeile_23'], "positiver Eintrag"),
-            ("Anlage KAP", "Zeile 37 - Kapitalertragsteuer", f['zeile_37'], ""),
-            ("Anlage KAP", "Zeile 38 - Solidaritätszuschlag", f['zeile_38'], ""),
-            ("Anlage KAP", "Zeile 41 - ausl. Quellensteuer", f['quellensteuer'], ""),
-        ]
-        if has_etf:
-            for line in kap_inv_form_export.get('lines', []):
-                note = (
-                    "Bruttowert vor TFS; steuerpflichtiger Kontrollwert "
-                    f"{fmt_de(line.get('taxable_control_eur', 0))} EUR"
-                )
-                if line.get('kind') == 'sale':
-                    note += "; vor Abzug bereits angesetzter Vorabpauschalen"
-                summary_rows.append((
-                    "Anlage KAP-INV",
-                    f"Zeile {line['line']} - {line['fund_type']}",
-                    line['amount_raw_eur'],
-                    note,
-                ))
-            for item in kap_inv_form_export.get('blocked_details', []):
-                summary_rows.append((
-                    "Anlage KAP-INV Prüffall",
-                    f"{item.get('ticker', '')} ({item['isin']}) - Ausschüttung roh",
-                    item.get('distribution_raw_eur', 0),
-                    "keine Formularzeile bis zur bestätigten Fondsart; "
-                    f"G/V roh {fmt_de(item.get('sale_raw_eur', 0))} EUR",
-                ))
-            for item in kap_inv_form_export.get('negative_distribution_details', []):
-                summary_rows.append((
-                    "Anlage KAP-INV Prüffall",
-                    f"{item.get('ticker', '')} ({item['isin']}) - gezahlte Ausschüttungen",
-                    item.get('paid_distribution_eur', 0),
-                    "gezahlte Dividenden/Ersatzzahlungen (Short-Position); nicht in "
-                    "den Ausschüttungszeilen enthalten; steuerliche Behandlung "
-                    "manuell prüfen",
-                ))
-            summary_rows.append((
-                "Anlage KAP-INV",
-                "Fonds-QSt: enthalten in Anlage KAP Zeile 41",
-                f['etf_wht'],
-                "keine eigene KAP-INV-Zeile",
-            ))
-        for isin, info in sorted(special_products.items(), key=lambda x: x[1].get('ticker', '')):
-            summary_rows.append((
-                "Topf 2 Sonderprodukte",
-                f"{info.get('ticker', isin)} ({isin})",
-                info.get('total', 0),
-                "no_invstg; realisiertes G/V + Tageskurs + Ausschüttungen; "
-                f"QSt {fmt_de(info.get('wht_reported', 0))} EUR; negativ = Erstattung",
-            ))
-        if has_so:
-            summary_rows.extend([
-                ("Anlage SO", "Steuerpflichtig <= 1 Jahr", so_taxable, ""),
-                ("Anlage SO", "Steuerfrei > 1 Jahr", so_free, "nicht in Anlage KAP"),
-            ])
-
-        row_num += 1
-        for ci, cn in enumerate(summary_cols, 1):
-            cell = ws.cell(row=row_num, column=ci, value=cn)
-            cell.font = Font(bold=True, size=9)
-            cell.fill = PatternFill("solid", fgColor="e8e8e8")
-            cell.border = thin_border
-        row_num += 1
-        current_area = None
-        for area, label, value, note in summary_rows:
-            if area != current_area:
-                current_area = area
-                ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=len(summary_cols))
-                cell = ws.cell(row=row_num, column=1, value=area)
-                cell.font = grp_font
-                cell.fill = grp_fill
-                row_num += 1
-            values = [area, label, value, note]
-            for ci, val in enumerate(values, 1):
-                cell = ws.cell(row=row_num, column=ci, value=val)
-                cell.font = normal_font
-                cell.border = thin_border
-                if ci == 3 and isinstance(val, (int, float)):
-                    cell.number_format = num_fmt_eur
-                    if val > 0.005:
-                        cell.fill = gain_fill
-                        cell.font = gain_font
-                    elif val < -0.005:
-                        cell.fill = loss_fill
-                        cell.font = loss_font
-            if label.startswith("Saldo ") or label.startswith("Zeile 19") or label.startswith("Erträge "):
-                for ci in range(1, len(summary_cols) + 1):
-                    ws.cell(row=row_num, column=ci).font = sub_font
-                    ws.cell(row=row_num, column=ci).fill = sub_fill
-            row_num += 1
-
-        row_num += 1
-        ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=len(summary_cols))
-        cell = ws.cell(row=row_num, column=1, value="Abstimmung")
-        cell.font = hdr_font
-        cell.fill = hdr_fill
-        cell.alignment = Alignment(horizontal='left')
-        row_num += 1
-        reconciliation_rows = [
-            ("Topf 1", "Finaler Wert", f['topf_1'], "GUI/TXT/Excel-Summary"),
-            ("Topf 1", "Trade-Details", trade_topf1_reconciled, kap_inv_reintegration_note or "Nachweis-Sheet"),
-            ("Topf 1", "Differenz", f['topf_1'] - trade_topf1_reconciled, "Kontrollwert; Abweichungen können aus PnL-Summary-Fallbacks, Rundung oder Toggle-Reintegration stammen"),
-            ("Topf 2", "Finaler Wert", f['topf_2'], "inkl. Dividenden, Zinsen, FX, Stillhalter"),
-            ("Topf 2", "Trade-Details", trade_topf2_reconciled, "Trades und Korrekturen"),
-            ("Topf 2", "Nicht-Trade-Anteil", f['topf_2'] - trade_topf2_reconciled, "Cash-Erträge/Korrekturen, z.B. Dividenden und Zinsen"),
-            ("Anlage KAP", "Zeile 19 minus Topf 1 minus Topf 2", f['zeile_19'] - (f['topf_1'] + f['topf_2']), "sollte 0 sein"),
-        ]
-        for ci, cn in enumerate(summary_cols, 1):
-            cell = ws.cell(row=row_num, column=ci, value=cn)
-            cell.font = Font(bold=True, size=9)
-            cell.fill = PatternFill("solid", fgColor="e8e8e8")
-            cell.border = thin_border
-        row_num += 1
-        current_area = None
-        for area, label, value, note in reconciliation_rows:
-            if area != current_area:
-                current_area = area
-                ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=len(summary_cols))
-                cell = ws.cell(row=row_num, column=1, value=area)
-                cell.font = grp_font
-                cell.fill = grp_fill
-                row_num += 1
-            for ci, val in enumerate([area, label, value, note], 1):
-                cell = ws.cell(row=row_num, column=ci, value=val)
-                cell.font = normal_font
-                cell.border = thin_border
-                if ci == 3 and isinstance(val, (int, float)):
-                    cell.number_format = num_fmt_eur
-            if label in ("Differenz", "Nicht-Trade-Anteil", "Zeile 19 minus Topf 1 minus Topf 2"):
-                for ci in range(1, len(summary_cols) + 1):
-                    ws.cell(row=row_num, column=ci).font = sub_font
-                    ws.cell(row=row_num, column=ci).fill = sub_fill
-            row_num += 1
-        ws.freeze_panes = 'A6'
-
-        ws = ws_details
-        cols = ['Datum', 'Handelsdatum', 'Wertpapier', 'ISIN', 'Kategorie',
-                'K/V', 'Stk.', 'Kurs', 'Kostenbasis', 'Erloese',
-                'G/V (Orig.)', 'Kommission', 'Waehrung', 'Wechselkurs', 'G/V (EUR)', 'Anmerkung']
-        col_widths = [12, 12, 42, 15, 10, 6, 8, 11, 13, 13, 13, 11, 6, 11, 14, 40]
-        eur_col = 15
-        for i, w in enumerate(col_widths, 1): ws.column_dimensions[get_column_letter(i)].width = w
-        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(cols))
-        notice = ws.cell(
-            row=1,
-            column=1,
-            value=(
-                "Hinweis: IBKR-/OCC-Bezeichnungen können vom geläufigen "
-                "Basiswert abweichen, z. B. BRKB/BRK B und ODAX für DAX."
+def render_prueffaelle():
+    st.markdown('<p class="page-title">Prüffälle</p>', unsafe_allow_html=True)
+    n = vm['notice_counts']['prueffaelle']
+    if n == 0:
+        st.markdown(notice_html({
+            'class': 'transparenz', 'severity': 'normal',
+            'title': 'Keine offenen Prüffälle',
+            'body': (
+                "Alle Buchungen und Instrumente wurden automatisch "
+                "zugeordnet. Transparenzhinweise (Kapitalmaßnahmen, "
+                "Symbol-Aliasse, Methodik) stehen im Bereich Rechenwege."
             ),
-        )
-        notice.font = Font(italic=True, size=9, color="7f6000")
-        notice.fill = korr_fill
-        row_num = 3
-        for topf_key in ['Topf1', 'Topf2', 'KAP-INV', 'Anlage SO', 'Nicht zugeordnet']:
-            topf_rows = trades_by_topf.get(topf_key, [])
-            if not topf_rows: continue
-            ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=len(cols))
-            cell = ws.cell(row=row_num, column=1, value=topf_readable.get(topf_key, topf_key))
-            cell.font = hdr_font; cell.fill = hdr_fill; cell.alignment = Alignment(horizontal='left')
-            row_num += 1
-            for ci, cn in enumerate(cols, 1):
-                cell = ws.cell(row=row_num, column=ci, value=cn)
-                cell.font = Font(bold=True, size=9); cell.fill = PatternFill("solid", fgColor="e8e8e8"); cell.border = thin_border
-            row_num += 1
-            groups = defaultdict(list)
-            for r in topf_rows: groups[_get_group_key(r)].append(r)
-            topf_total = 0.0
-            for grp_key in sorted(groups.keys()):
-                grp_rows = groups[grp_key]
-                grp_rows.sort(key=lambda r: r.get('dateTime', '') or r.get('reportDate', '') or '')
-                grp_desc = ''; grp_isin = ''
-                for r in grp_rows:
-                    if r.get('description') and r.get('source') != 'stillhalter_korrektur': grp_desc = r['description']
-                    if r.get('isin'): grp_isin = r['isin']
-                    if grp_desc and grp_isin: break
-                grp_label = grp_key
-                if grp_desc: grp_label += f" - {grp_desc}"
-                if grp_isin: grp_label += f" ({grp_isin})"
-                ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=len(cols))
-                cell = ws.cell(row=row_num, column=1, value=grp_label); cell.font = grp_font; cell.fill = grp_fill
-                row_num += 1; grp_total = 0.0
-                for r in grp_rows:
-                    source = r.get('source', ''); pnl_eur = r.get('pnl_eur', 0)
-                    pnl_orig = r.get('fifoPnlRealized', 0); fx = r.get('fxRateToBase', 0)
-                    cost = r.get('cost', 0); proceeds = r.get('proceeds', 0); price = r.get('tradePrice', 0)
-                    commission = r.get('ibCommission', 0) or 0
-                    anmerkung = ''
-                    if source == 'pnl_summary': anmerkung = 'Aus IBKR PnL-Summary'
-                    elif source == 'stillhalter_korrektur': anmerkung = r.get('description', 'Korrektur')
-                    elif source == 'zufluss': anmerkung = r.get('description', 'Zufluss §11 EStG')
-                    elif source == 'zufluss_korrektur': anmerkung = r.get('description', 'Vorjahres-Korrektur')
-                    elif source == 'tageskurs_korrektur': anmerkung = r.get('description', 'Tageskurs')
-                    elif source == 'cross_year_put_korrektur': anmerkung = r.get('description', 'Cross-Year Put-Korrektur')
-                    elif source == 'trades' and r.get('stillhalter_adjusted'):
-                        anmerkung = 'Korrigiert: Prämie separiert (s. Stillhalterprämie Topf 2)'
-                        if r.get('invstg_basis_adjustment_raw'):
-                            anmerkung += '; KAP-INV-AK auf Ausübungspreis normalisiert'
-                    bs = r.get('buySell', ''); oc = r.get('openClose', '')
-                    if bs == 'SELL' and oc == 'O': bs_label = 'STO'
-                    elif bs == 'BUY' and oc == 'C': bs_label = 'BTC'
-                    elif bs == 'BUY' and oc == 'O': bs_label = 'BTO'
-                    elif bs == 'SELL' and oc == 'C': bs_label = 'STC'
-                    else: bs_label = bs
-                    values = [
-                        (r.get('reportDate', '') or '')[:10], (r.get('dateTime', '') or '')[:10],
-                        _format_instrument(r), r.get('isin', ''),
-                        cat_labels.get(r.get('assetCategory', ''), r.get('assetCategory', '')),
-                        bs_label, r.get('quantity', ''),
-                        price if price else None, cost if cost else None, proceeds if proceeds else None,
-                        pnl_orig if pnl_orig else None, commission if commission else None, r.get('currency', ''),
-                        fx if fx else None, pnl_eur, anmerkung,
-                    ]
-                    for ci, val in enumerate(values, 1):
-                        cell = ws.cell(row=row_num, column=ci, value=val); cell.font = normal_font
-                        if ci in (8, 9, 10, 11, 12, 15) and isinstance(val, (int, float)): cell.number_format = num_fmt_eur
-                        elif ci == 14 and isinstance(val, (int, float)): cell.number_format = num_fmt_4d
-                    if source in ('stillhalter_korrektur', 'zufluss', 'zufluss_korrektur', 'tageskurs_korrektur', 'cross_year_put_korrektur'):
-                        for ci in range(1, len(cols) + 1): ws.cell(row=row_num, column=ci).fill = korr_fill; ws.cell(row=row_num, column=ci).font = korr_font
-                    elif pnl_eur > 0.005:
-                        for ci in range(1, len(cols) + 1): ws.cell(row=row_num, column=ci).fill = gain_fill; ws.cell(row=row_num, column=ci).font = gain_font
-                    elif pnl_eur < -0.005:
-                        for ci in range(1, len(cols) + 1): ws.cell(row=row_num, column=ci).fill = loss_fill; ws.cell(row=row_num, column=ci).font = loss_font
-                    grp_total += pnl_eur; row_num += 1
-                ws.cell(row=row_num, column=1, value=f"Zwischensumme {grp_key}")
-                for ci in range(1, len(cols) + 1): ws.cell(row=row_num, column=ci).font = sub_font; ws.cell(row=row_num, column=ci).fill = sub_fill; ws.cell(row=row_num, column=ci).border = thin_border
-                cell = ws.cell(row=row_num, column=eur_col, value=grp_total); cell.number_format = num_fmt_eur; cell.font = sub_font; cell.fill = sub_fill
-                topf_total += grp_total; row_num += 1
-            topf_label = topf_readable.get(topf_key, topf_key).split(' - ')[0]
-            ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=eur_col - 1)
-            cell = ws.cell(row=row_num, column=1, value=f"SUMME {topf_label}"); cell.font = total_font; cell.fill = total_fill; cell.alignment = Alignment(horizontal='right')
-            for ci in range(1, len(cols) + 1): ws.cell(row=row_num, column=ci).fill = total_fill
-            cell = ws.cell(row=row_num, column=eur_col, value=topf_total); cell.number_format = num_fmt_eur; cell.font = total_font; cell.fill = total_fill
-            row_num += 2
-        ws.freeze_panes = 'A4'
-        buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
-
-    so_taxable_export = 0
-    so_free_export = 0
-    if has_so_data:
-        so_taxable_export = anlage_so.get('taxable_gain', 0) + anlage_so.get('taxable_loss', 0)
-        so_free_export = anlage_so.get('tax_free_gain', 0) + anlage_so.get('tax_free_loss', 0)
-    export_context = {
-        'final': final,
-        'base_currency': d.get('base_currency', 'USD'),
-        'created_at': created_at,
-        'has_etf_data': has_etf_data,
-        'invstg_aktiv': invstg_aktiv,
-        'kap_inv_form': kap_inv_form if (has_etf_data and invstg_aktiv) else {},
-        'no_invstg_summary': no_invstg_summary,
-        'has_so_data': has_so_data,
-        'so_taxable': so_taxable_export,
-        'so_free': so_free_export,
-    }
-    try:
-        xlsx_data = _build_excel(trade_details, trades_by_topf, export_context)
-    except ModuleNotFoundError as e:
-        if e.name != 'openpyxl':
-            raise
-        st.warning("Excel-Export nicht verfügbar: Bitte `openpyxl` installieren (`pip install openpyxl`).")
+            'target': None,
+        }, show_target=False), unsafe_allow_html=True)
     else:
-        st.download_button(
-            label=f"Steuerreport als Excel herunterladen ({len(trade_details)} Detailpositionen)",
-            data=xlsx_data,
-            file_name=f"steuerbericht_{steuerjahr}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
+        noun = "Prüffall" if n == 1 else "Prüffälle"
+        st.caption(
+            f"{n} {noun}. Kritische Fälle zuerst; jeder Eintrag nennt den "
+            "betroffenen Bereich."
         )
+        ordered = kritisch_notices + [
+            notice for notice in prueffall_notices
+            if notice['severity'] != 'kritisch'
+        ]
+        render_notices(ordered, show_target=True)
+
+    _render_so_override_picker()
 
 
-# ── Plausibilitätscheck (wenn CSV hochgeladen) ─────────────────────────────
-csv_cats = d.get('csv_category_totals', {})
-if csv_cats:
-    section_title("Plausibilitätscheck (IBKR-Bericht vs. Berechnung)")
-    cross_put = d['audit'].get('cross_year_put_total', 0)
-    no_invstg_gain = d['audit'].get('no_invstg_gain', 0)
-    no_invstg_loss = d['audit'].get('no_invstg_loss', 0)
-    # Add back what was actually subtracted from stock/ETF pools for IBKR comparison.
-    # Uses the actual per-trade correction totals (at stock_fx), not the premium at option_fx,
-    # because the gain/loss split subtracts at the stock trade's FX rate.
-    stillhalter_addback = d['audit'].get('stk_correction_cy', 0) + d['audit'].get('etf_correction_cy', 0)
-    our_stk_gain = d['stocks_gain_eur'] + stillhalter_addback + cross_put + no_invstg_gain
-    our_stk_loss = d['stocks_loss_eur'] + no_invstg_loss
+# ── Renderer: Rechenwege ─────────────────────────────────────────────────────
 
-    # If InvStG active: add ETF values back for IBKR comparison (IBKR counts ETFs as Aktien)
-    # Note: stillhalter_premium_eur already includes the ETF portion — don't add etf_stillhalter again
-    kap_inv_data = d.get('kap_inv', {})
-    if has_etf_data and invstg_aktiv:
-        our_stk_gain += kap_inv_data.get('etf_gain_raw_eur', 0)
-        our_stk_loss += kap_inv_data.get('etf_loss_raw_eur', 0)
+def _render_transparency_details():
+    """Transparenzhinweise mit Detail-Expandern (Kenntnisnahme, kein
+    Handlungsbedarf)."""
+    if transparenz_notices:
+        render_notices(transparenz_notices, show_target=False)
 
-    # Add back Anlage SO Gold-ETC values for IBKR comparison (IBKR counts them as STK)
-    if has_so_data:
-        our_stk_gain += anlage_so.get('total_gain', 0)
-        our_stk_loss += anlage_so.get('total_loss', 0)
+    occ_rename_matches = audit.get('occ_rename_matches', [])
+    if occ_rename_matches:
+        split_count = sum(
+            m.get('match_type') == 'split' for m in occ_rename_matches)
+        adjustment_count = sum(
+            m.get('match_type') == 'contract_adjustment'
+            for m in occ_rename_matches)
+        rename_count = len(occ_rename_matches) - split_count - adjustment_count
+        action_parts = []
+        if split_count:
+            action_parts.append(f"{split_count} Split-Zuordnung(en)")
+        if adjustment_count:
+            action_parts.append(f"{adjustment_count} Kontraktanpassung(en)")
+        if rename_count:
+            action_parts.append(f"{rename_count} Serien-Umbenennung(en)")
+        with st.expander(
+                f"Kapitalmaßnahmen · {' und '.join(action_parts)}",
+                expanded=False):
+            st.caption(
+                "Die veränderte Optionsserie wurde über die stabile "
+                "IBKR-Kontraktidentität und ihre FIFO-Kostenbasis dem "
+                "ursprünglichen Verkauf zugeordnet, damit die "
+                "Stillhalterprämie nur einmal versteuert wird. Falls es "
+                "sich wider Erwarten um zwei verschiedene Kontrakte "
+                "handelt, die Positionen in den Trade-Details prüfen."
+            )
+            occ_table = ("| Verkauft | am | Geschlossen als | am | Menge |\n"
+                         "|----------|----|-----------------|----|-------|\n")
+            for m in occ_rename_matches:
+                if m.get('match_type') == 'split':
+                    qty_text = (f"{m.get('quantity', 0):g} alte → "
+                                f"{m.get('close_quantity', 0):g} neue")
+                else:
+                    qty_text = f"{m.get('quantity', 0):g} Kontrakt(e)"
+                occ_table += (
+                    f"| {esc(m['sell_symbol'])} | {esc(m['sell_date'])} | "
+                    f"{esc(m['close_symbol'])} | {esc(m['close_date'])} | "
+                    f"{esc(qty_text)} |\n")
+            st.markdown(occ_table)
 
-    ibkr_topf2_cats = ["Aktien- und Indexoptionen", "Futures", "Optionen auf Futures (Future-Style)",
-                        "Optionen auf Futures", "Anleihen", "Treasury Bills"]
-    # Reverse Zufluss adjustments for IBKR comparison (IBKR doesn't know about Zufluss)
-    zufluss_adj = d['audit'].get('zufluss_premium_eur', 0) - d['audit'].get('prior_zufluss_correction_eur', 0)
-    our_topf2_gain = d['options_gain_eur'] - d['audit'].get('stillhalter_premium_eur', 0) - d.get('fx_total_gain', 0) - no_invstg_gain - zufluss_adj
-    our_topf2_loss = d['options_loss_eur'] - d.get('fx_total_loss', 0) - no_invstg_loss
-    ibkr_topf2_gain = sum(csv_cats.get(c, {}).get('gain', 0) for c in ibkr_topf2_cats)
-    ibkr_topf2_loss = sum(csv_cats.get(c, {}).get('loss', 0) for c in ibkr_topf2_cats)
+    underlying_symbol_aliases = audit.get('underlying_symbol_aliases', {})
+    if underlying_symbol_aliases:
+        with st.expander("Symbol-Aliasse und Ticker-Umbenennungen",
+                         expanded=False):
+            st.caption(
+                "IBKR führt dieselbe Aktie unter verschiedenen Symbolen "
+                "(Handelsplatz-Suffix oder Ticker-Umbenennung); die "
+                "Zuordnung von Optionsprämien zu Aktien-Trades läuft über "
+                "die stabile Kontraktidentität (conid/ISIN)."
+            )
+            alias_table = "| Schreibweisen | Kanonisch |\n|---|---|\n"
+            for canon, members in sorted(underlying_symbol_aliases.items()):
+                alias_table += (
+                    f"| {esc(', '.join(sorted(str(m) for m in members)))} | "
+                    f"{esc(canon)} |\n")
+            st.markdown(alias_table)
 
-    ibkr_stk = csv_cats.get('Aktien', {})
-    ibkr_fx = csv_cats.get('Devisen', {})
+    open_short = audit.get('stillhalter_open_short', [])
+    if open_short:
+        with st.expander(
+                f"Offene Short-Positionen aus Andienungen ({len(open_short)})",
+                expanded=False):
+            st.caption(
+                "PnL unrealisiert, keine Korrektur nötig. Beim "
+                "Folgejahr-Lauf dieses XML als Historie mitladen."
+            )
+            for item in open_short:
+                st.markdown(f"- {esc(item)}")
 
-    # Dividenden/Quellensteuer: ETF-Werte für IBKR-Vergleich zurückaddieren
-    our_div = d['dividends_eur']
-    our_wht = d['withholding_tax_eur']
-    if has_etf_data and invstg_aktiv:
-        our_div += kap_inv_data.get('etf_dividends_raw_eur', 0)
-        our_wht += kap_inv_data.get('etf_wht_eur', 0)
 
-    rows = [
-        ("Aktien (Topf 1) Netto", ibkr_stk.get('net', 0), our_stk_gain + our_stk_loss),
-        ("Sonstiges (Topf 2) Netto", ibkr_topf2_gain + ibkr_topf2_loss, our_topf2_gain + our_topf2_loss),
-        ("FX (Devisen) Netto", ibkr_fx.get('net', 0), fx_total_gain + fx_total_loss),
-    ]
+def _render_stillhalter_zufluss():
+    if not (cross_year_details or zufluss_details or prior_zufluss_details):
+        return
+    section_title("Stillhalter & Zuflussprinzip")
+    st.caption(
+        "Alle berücksichtigten Summen sofort sichtbar; die einzelnen "
+        "Positionen sind zur Prüfung eingeklappt."
+    )
+    summary_cards = []
+    if zuflussprinzip_aktiv and cross_year_details:
+        summary_cards.append(metric_card(
+            "Vorjahres-Prämien herausgerechnet", -cross_year_premium, "info"))
+    if zufluss_details:
+        summary_cards.append(metric_card(
+            "Offene Stillhalter · Zufluss", zufluss_premium, "info"))
+    if prior_zufluss_details:
+        summary_cards.append(metric_card(
+            "Vorjahres-Glattstellungen korrigiert",
+            -prior_zufluss_correction, "info"))
+    if summary_cards:
+        st.markdown(metric_grid(*summary_cards), unsafe_allow_html=True)
 
-    # Dividenden, Zinsen, Quellensteuer aus CSV
-    csv_income = d.get('csv_income_totals', {})
-    if 'dividends_eur' in csv_income:
-        rows.append(("Dividenden", csv_income['dividends_eur'], our_div))
-    if 'interest_eur' in csv_income:
-        our_interest_for_comparison = d['interest_eur'] + d.get('debit_interest_eur', 0)
-        rows.append(("Zinsen", csv_income['interest_eur'], our_interest_for_comparison))
-    if 'withholding_tax_eur' in csv_income:
-        rows.append((
-            "Quellensteuer",
-            calculate_tax_report.get_withholding_tax_for_reporting(
-                csv_income['withholding_tax_eur']
-            ),
-            our_wht,
+    if zuflussprinzip_aktiv and cross_year_details:
+        with st.expander(
+                f"Vorjahres-Prämien · {len(cross_year_details)} Position(en)",
+                expanded=False):
+            st.caption(
+                "Diese Prämien gehören in die Steuererklärung des "
+                "jeweiligen Vorjahres und wurden aus dem aktuellen "
+                "Steuerjahr herausgerechnet."
+            )
+            detail_table = (
+                "| Symbol | Strike | Verkauf (Zufluss) | Assignment | "
+                "Prämie (EUR) |\n"
+                "|--------|--------|-------------------|------------|"
+                "-------------:|\n")
+            for det in cross_year_details:
+                detail_table += (
+                    f"| {det['symbol']} | {det['strike']} | "
+                    f"{det['orig_sell_date']} | {det['assignment_date']} | "
+                    f"{fmt_de(det['premium_eur'])} |\n")
+            st.markdown(detail_table)
+            st.markdown("**Zusammenfassung nach Zuflussjahr:**")
+            year_table = ("| Steuerjahr | Prämien-Summe (EUR) | Hinweis |\n"
+                          "|:----------:|--------------------:|--------|\n")
+            for year in sorted(cross_year_by_year):
+                year_table += (
+                    f"| {year} | {fmt_de(cross_year_by_year[year])} | "
+                    f"In Steuererklärung {year} eintragen |\n")
+            st.markdown(year_table)
+            st.info(
+                f"Zeile 19 wurde im aktuellen Jahr um "
+                f"{fmt_de(cross_year_premium)} EUR reduziert."
+            )
+
+    if zufluss_details:
+        with st.expander(
+                f"Offene Stillhalterpositionen · {len(zufluss_details)} Position(en)",
+                expanded=False):
+            st.caption(
+                f"{fmt_de(zufluss_premium)} EUR Prämien wurden im Steuerjahr "
+                "vereinnahmt und bereits zu Topf 2 addiert."
+            )
+            zt = ("| Symbol | Verkaufsdatum | Stk. | Prämie (EUR) |\n"
+                  "|--------|--------------|-----:|-------------:|\n")
+            for det in zufluss_details:
+                zt += (
+                    f"| {det['symbol']} | {det['sell_date'][:10]} | "
+                    f"{det['quantity']} | {fmt_de(det['premium_eur'])} |\n")
+            st.markdown(zt)
+
+    if prior_zufluss_details:
+        with st.expander(
+                f"Vorjahres-Glattstellungen · {len(prior_zufluss_details)} Korrektur(en)",
+                expanded=False):
+            st.caption(
+                f"{fmt_de(prior_zufluss_correction)} EUR waren bereits im "
+                "Verkaufsjahr steuerpflichtig und wurden vom aktuellen PnL "
+                "abgezogen."
+            )
+            pt = ("| Symbol | Verkaufsjahr | Stk. | Korrektur (EUR) |\n"
+                  "|--------|:-----------:|-----:|----------------:|\n")
+            for det in prior_zufluss_details:
+                pt += (
+                    f"| {det['symbol']} | {det['sell_year']} | "
+                    f"{det['quantity']} | -{fmt_de(det['premium_eur'])} |\n")
+            st.markdown(pt)
+
+
+def _render_toggle_explainers():
+    """Rechtsgrundlagen und Wirkung der aktiven Methoden."""
+    method_blocks = []
+    if cross_year_details or zufluss_details or prior_zufluss_details:
+        zufluss_parts = []
+        if cross_year_details:
+            zufluss_parts.append(
+                f"{len(cross_year_details)} Assignment-Prämienanteil(e) aus "
+                f"Vorjahren ({fmt_de(cross_year_premium)} EUR)")
+        if zufluss_details:
+            zufluss_parts.append(
+                f"{len(zufluss_details)} offene Stillhalter-Position(en) mit "
+                f"Zufluss im Steuerjahr ({fmt_de(zufluss_premium)} EUR, "
+                "bereits enthalten)")
+        if prior_zufluss_details:
+            zufluss_parts.append(
+                f"{len(prior_zufluss_details)} Vorjahres-Prämie(n) aus "
+                f"Glattstellungen korrigiert "
+                f"(-{fmt_de(prior_zufluss_correction)} EUR, bereits "
+                "enthalten)")
+        method_blocks.append((
+            "Zuflussprinzip",
+            "**BMF Rn. 25, 33:** " + "; ".join(zufluss_parts) + ".",
+            None,
         ))
 
-    # FX-Saldo-Korrektur-Diff (für Erkennung der erwarteten FX-Devisen-Abweichung)
-    _fx_meta_chk = d.get('fx_option_a_meta', {}) or {}
-    _fx_corr_active_chk = d.get('fx_margin_correction_enabled', True)
-    _fx_margin_diff_chk = _fx_meta_chk.get('corrected_total', 0.0) - _fx_meta_chk.get('raw_total', 0.0)
-    _fx_margin_explains_diff = _fx_corr_active_chk and abs(_fx_margin_diff_chk) > 0.01
+    if has_etf_data:
+        cls_labels = {
+            'aktienfonds': 'Aktienfonds (30% TFS)',
+            'mischfonds': 'Mischfonds (15% TFS)',
+            'immobilienfonds': 'Immobilienfonds (60% TFS)',
+            'auslands_immobilienfonds': 'Auslands-Immobilienfonds (80% TFS)',
+        }
+        cls_counts = {}
+        for v in etf_by_isin.values():
+            classification = v.get('classification')
+            label = ('Fondsart nicht bestätigt' if classification is None
+                     else cls_labels.get(classification,
+                                         'sonstige Fonds (0% TFS)'))
+            cls_counts[label] = cls_counts.get(label, 0) + 1
+        cls_summary = ", ".join(
+            f"{n} {label}" for label, n in sorted(cls_counts.items()))
+        etf_tickers = ", ".join(sorted(
+            v.get('ticker', '?') for v in etf_by_isin.values()))
+        method_blocks.append((
+            "InvStG-Klassifizierung",
+            f"**§2 InvStG:** {len(etf_by_isin)} Produkte laufen im "
+            "Investmentfondspfad. Verifiziert klassifizierte Investmentfonds "
+            "werden auf Anlage KAP-INV gemeldet; bei unbekannten ISINs "
+            "entsteht erst nach ausdrücklicher Fondsart-Bestätigung eine "
+            f"Formularzeile. Davon {cls_summary}.",
+            f"Betroffene Fondsprodukte: {esc(etf_tickers)}",
+        ))
 
-    check_table = "| Kategorie | IBKR-Bericht | Unsere Berechnung | Differenz |\n|-----------|-------------|-------------------|----------|\n"
-    all_match = True
-    zinsen_fx_diff = False
-    fx_saldo_diff = False
-    for label, ibkr_val, our_val in rows:
-        diff = our_val - ibkr_val
-        match = abs(diff) < 1.0
-        # FX (Devisen)-Differenz durch Saldo-Korrektur ist eine bekannte steuerliche
-        # Anpassung, kein Verarbeitungsfehler — wie Zinsen-FX-Diff behandeln.
-        is_fx_saldo = (label == "FX (Devisen) Netto"
-                       and _fx_margin_explains_diff
-                       and abs(diff - _fx_margin_diff_chk) < 1.0)
-        if not match:
-            if label == "Zinsen":
-                zinsen_fx_diff = True
-            elif is_fx_saldo:
-                fx_saldo_diff = True
-            else:
-                all_match = False
-        if match:
+    if abs(fx_corr_total) > 0.01:
+        method_blocks.append((
+            "Tageskurs-Methode",
+            "**§20 Abs. 4 S. 1 EStG:** Einnahmen werden zum Verkaufskurs und "
+            "Anschaffungskosten zum Kaufkurs in Euro umgerechnet. IBKR rechnet "
+            "den gesamten Netto-PnL zum Schlusskurs um. Abweichung für "
+            f"{steuerjahr}: **{'+' if fx_corr_total >= 0 else ''}"
+            f"{fmt_de(fx_corr_total)} EUR** (CLOSED_LOT-Analyse, ohne Futures).",
+            "Futures bleiben ausgeschlossen: Ihre Kostenbasis ist der volle "
+            "Kontraktwert, nicht die gezahlte Margin; eine FX-Korrektur auf "
+            "den Notional würde Phantom-Gewinne oder -Verluste erzeugen.",
+        ))
+
+    if not method_blocks:
+        return
+
+    section_title("Aktive Methoden im Report")
+    for title, body, caption in method_blocks:
+        st.markdown(f"### {title}")
+        st.markdown(body)
+        if caption:
+            st.caption(caption)
+
+
+def _render_catalogs():
+    section_title("Produktzuordnungen")
+    st.caption(
+        "Nachvollziehbare Steuerpfade für alle hinterlegten ETF-, Fonds- "
+        "und ETP-Zuordnungen."
+    )
+    traded_product_isins = d.get('all_traded_etf_isins', []) or []
+    if traded_product_isins:
+        report_catalog_rows = get_classification_catalog(traded_product_isins)
+        report_kap_inv_count = sum(
+            row.get('tax_route') == 'Anlage KAP-INV'
+            for row in report_catalog_rows)
+        st.markdown("### Produkte aus dem Upload · inklusive Vorjahreshistorie")
+        st.write(
+            f"{len(report_catalog_rows)} im Upload erkannte ETF-, "
+            "Fonds- und ETP-ISINs, einschließlich Produkten aus der "
+            "Vorjahreshistorie. Zuordnungs- und Transparenzkatalog, "
+            "keine Zählung der im Steuerjahr betroffenen Positionen. "
+            f"Davon laufen {report_kap_inv_count} über Anlage KAP-INV "
+            f"und {len(report_catalog_rows) - report_kap_inv_count} "
+            "über einen anderen Steuerpfad. Unbekannte ISINs bleiben "
+            "ausdrücklich unklassifiziert."
+        )
+        render_classification_catalog(
+            report_catalog_rows,
+            key_prefix="report_classification_catalog",
+            show_filters=False,
+            offer_download=False,
+        )
+    full_catalog = get_classification_catalog()
+    with st.expander(
+            f"Gesamtkatalog · alle hinterlegten Zuordnungen "
+            f"({len(full_catalog)})",
+            expanded=False):
+        st.write(
+            "Der Gesamtkatalog trennt produktspezifisch geprüfte "
+            "Entscheidungen von festen, aktiv berechneten "
+            "Katalogzuordnungen. Beide werden angewandt; nur unbekannte ISINs "
+            "bleiben bis zur Bestätigung unklassifiziert."
+        )
+        render_classification_catalog(
+            full_catalog,
+            key_prefix="global_classification_catalog",
+            show_filters=True,
+            offer_download=True,
+        )
+
+
+def _render_plausibility():
+    if not plaus:
+        return
+    section_title("Plausibilitätscheck (IBKR-Bericht vs. Berechnung)")
+    check_table = (
+        "| Kategorie | IBKR-Bericht | Unsere Berechnung | Differenz |\n"
+        "|-----------|-------------|-------------------|----------|\n")
+    for row in plaus['rows']:
+        if row['match']:
             icon = ""
-        elif label == "Zinsen":
+        elif row['label'] == "Zinsen":
             icon = " **(FX)**"
-        elif is_fx_saldo:
+        elif row['is_fx_saldo']:
             icon = " **(FX-Saldo)**"
         else:
             icon = " **(!)**"
-        check_table += f"| {label} | {fmt_de(ibkr_val)} | {fmt_de(our_val)} | {fmt_de(diff)}{icon} |\n"
+        check_table += (
+            f"| {row['label']} | {fmt_de(row['ibkr'])} | "
+            f"{fmt_de(row['ours'])} | {fmt_de(row['diff'])}{icon} |\n")
     st.markdown(check_table)
-    if all_match and not zinsen_fx_diff and not fx_saldo_diff:
+    if plaus['all_match'] and not (plaus['zinsen_fx_diff']
+                                   or plaus['fx_saldo_diff']):
         st.success("Alle Kategorien stimmen mit dem IBKR-Bericht überein.")
-    elif all_match and (zinsen_fx_diff or fx_saldo_diff):
+    elif plaus['all_match']:
         explanations = []
-        if zinsen_fx_diff:
-            explanations.append("Zinsen-Differenz ist eine bekannte FX-Konvertierungsdifferenz "
-                                "(IBKR konvertiert Fremdwährungs-Anleiheposten im CSV-Bericht mit "
-                                "anderen Kursen als in der XML-BaseCurrency-Ansicht)")
-        if fx_saldo_diff:
-            explanations.append("FX-Differenz ist die aktivierte Saldo-Korrektur "
-                                "(§20 Abs. 2 S. 1 Nr. 7 EStG, BMF Rn. 131; IBKR kennt keine "
-                                "Margin-Schuld-Unterscheidung)")
-        st.success("Alle Kategorien stimmen überein. " + "; ".join(explanations) + ".")
+        if plaus['zinsen_fx_diff']:
+            explanations.append(
+                "Zinsen-Differenz ist eine bekannte FX-Konvertierungs"
+                "differenz (IBKR konvertiert Fremdwährungs-Anleiheposten im "
+                "CSV mit anderen Kursen als in der XML-BaseCurrency-Ansicht)")
+        if plaus['fx_saldo_diff']:
+            explanations.append(
+                "FX-Differenz ist die aktivierte Saldo-Korrektur (§20 Abs. 2 "
+                "S. 1 Nr. 7 EStG, BMF Rn. 131; IBKR kennt keine "
+                "Margin-Schuld-Unterscheidung)")
+        st.success("Alle Kategorien stimmen überein. "
+                   + "; ".join(explanations) + ".")
     else:
-        st.info("Kleine Abweichungen sind normal (FX-Rundung, Steuerkorrekturen aus Vorjahren).")
+        st.info(
+            "Kleine Abweichungen sind normal (FX-Rundung, Steuerkorrekturen "
+            "aus Vorjahren)."
+        )
     if has_etf_data and invstg_aktiv:
-        st.caption("InvStG aktiv: ETF-Werte wurden für diesen Vergleich zurückaddiert, da der IBKR-Bericht keine InvStG-Trennung kennt.")
+        st.caption(
+            "InvStG aktiv: ETF-Werte wurden für den Vergleich zurückaddiert, "
+            "da der IBKR-Bericht keine InvStG-Trennung kennt."
+        )
     if has_so_data:
-        st.caption("Anlage SO aktiv: Gold-ETC-Werte wurden für diesen Vergleich zurückaddiert, da IBKR sie als Aktien zählt.")
-    # FX-Saldo-Korrektur als zusätzlicher Korrektur-Posten gegen IBKR-Rohwerte
-    _fx_meta_pl = d.get('fx_option_a_meta', {}) or {}
-    _fx_corr_active_pl = d.get('fx_margin_correction_enabled', True)
-    _fx_corrected_total_pl = _fx_meta_pl.get('corrected_total', 0.0)
-    _fx_raw_total_pl = _fx_meta_pl.get('raw_total', 0.0)
-    _fx_margin_diff = _fx_corrected_total_pl - _fx_raw_total_pl
-    _fx_margin_relevant = _fx_corr_active_pl and abs(_fx_margin_diff) > 0.01
-
-    if tageskurs_aktiv or zufluss_adj != 0 or _fx_margin_relevant:
+        st.caption(
+            "Anlage SO aktiv: Gold-ETC-Werte wurden für den Vergleich "
+            "zurückaddiert, da IBKR sie als Aktien zählt."
+        )
+    if tageskurs_aktiv or plaus['zufluss_adj'] != 0 or plaus['fx_margin_relevant']:
         notes = []
         if tageskurs_aktiv:
             corr_sign = "+" if fx_corr_total >= 0 else ""
-            notes.append(f"Tageskurs-Korrektur ({corr_sign}{fmt_de(fx_corr_total)} EUR)")
-        if zufluss_adj != 0:
-            notes.append(f"Stillhalter-Zufluss ({'+' if zufluss_adj >= 0 else ''}{fmt_de(zufluss_adj)} EUR)")
-        if _fx_margin_relevant:
-            notes.append(f"FX-Saldo-Korrektur ({'+' if _fx_margin_diff >= 0 else ''}{fmt_de(_fx_margin_diff)} EUR)")
-        excluded = " und ".join(notes)
+            notes.append(
+                f"Tageskurs-Korrektur ({corr_sign}{fmt_de(fx_corr_total)} EUR)")
+        if plaus['zufluss_adj'] != 0:
+            notes.append(
+                f"Stillhalter-Zufluss "
+                f"({'+' if plaus['zufluss_adj'] >= 0 else ''}"
+                f"{fmt_de(plaus['zufluss_adj'])} EUR)")
+        if plaus['fx_margin_relevant']:
+            notes.append(
+                f"FX-Saldo-Korrektur "
+                f"({'+' if plaus['fx_margin_diff'] >= 0 else ''}"
+                f"{fmt_de(plaus['fx_margin_diff'])} EUR)")
         st.caption(
-            f"Der Plausibilitätscheck vergleicht unsere Berechnung 1:1 gegen IBKR's eigene Summen. "
-            f"Steuerliche Korrekturen, die über IBKR's Zahlen hinausgehen, werden dabei herausgerechnet: "
-            f"{excluded}. So lässt sich prüfen, ob die Basisdaten korrekt verarbeitet wurden, "
-            f"bevor die steuerlichen Anpassungen darauf aufsetzen."
+            "Der Plausibilitätscheck vergleicht die Berechnung 1:1 gegen "
+            "IBKRs eigene Summen. Steuerliche Korrekturen über IBKRs Zahlen "
+            "hinaus werden dabei herausgerechnet: " + " und ".join(notes)
+            + ". So lässt sich prüfen, ob die Basisdaten korrekt verarbeitet "
+            "wurden, bevor die steuerlichen Anpassungen aufsetzen."
         )
 
-# ── Anlage KAP Zeilen ────────────────────────────────────────────────────────
 
-section_title(f"Anlage KAP {steuerjahr} · Eintragungen")
-
-kap_rows_html = ""
-if abs(final['zeile_7']) > 0.01:
-    kap_rows_html += (
-        kap_row("Z. 7", "Kapitalerträge mit inländischem Steuerabzug", final['zeile_7'], highlight=True)
-        + kap_row("Z. 37", "Kapitalertragsteuer", final['zeile_37'])
-        + kap_row("Z. 38", "Solidaritätszuschlag", final['zeile_38'])
+def _render_diagnostics():
+    section_title("Berechnungs-Diagnose")
+    st.caption(
+        "Nicht-sensitive Metadaten des Berechnungslaufs; Cache-Zustand "
+        "gilt für den aktuellen Seitenaufbau."
     )
+    diag_table = (
+        "| Merkmal | Wert |\n|---|---|\n"
+        f"| Datensatz | {esc(_dataset_id[:16])}… |\n"
+        f"| Berechnungslauf | {esc(_snapshot['computed_at'])}, "
+        f"{_snapshot['duration_s']} s |\n"
+        f"| Schema-Version | {_snapshot['schema_version']} |\n"
+        f"| Generation | {_snapshot['generation']} |\n"
+        f"| Cache | {'Treffer (keine Neuberechnung)' if _cache_hit else 'Neuberechnung in diesem Lauf'} |\n"
+        f"| Unterdrückte Log-Zeilen | {_snapshot.get('suppressed_log_lines', 0)} |\n"
+        f"| FX-Saldo-Korrektur | {'aktiv' if _dom['toggles'].get('fx_margin', True) else 'deaktiviert'} |\n"
+        f"| DBA-Beta | {'aktiv' if _dom['toggles'].get('dba_beta') else 'deaktiviert'} |\n"
+    )
+    st.markdown(diag_table)
 
-kap_rows_html += (
-    kap_row("Z. 19", "Ausländische Kapitalerträge (Netto)", final['zeile_19'], highlight=True)
-    + kap_row("Z. 20", "Davon: Aktiengewinne", final['zeile_20'])
-    + kap_row("Z. 22", "Verluste ohne Aktien", final['zeile_22'], force_positive=True)
-    + kap_row("Z. 23", "Aktienverluste", final['zeile_23'], force_positive=True)
-    + kap_row("Z. 41", "Anrechenbare ausländische Quellensteuer", final['quellensteuer'])
-)
 
-if has_etf_data and invstg_aktiv:
-    kap_rows_html += '<div class="section-title" style="margin-top:1.5rem;">Anlage KAP-INV</div>'
-    for line in kap_inv_form.get('lines', []):
-        kind_label = (
-            "Ausschüttungen" if line.get('kind') == 'distribution'
-            else "Veräußerungsergebnis vor Abzug von Vorabpauschalen"
-        )
-        kap_rows_html += kap_row(
-            f"Z. {line['line']}",
-            f"{kind_label} · {line['fund_type']} (vor TFS)",
-            line['amount_raw_eur'],
-            highlight=True,
-        )
-
-if has_so_data:
-    so_taxable_for_row = anlage_so.get('taxable_gain', 0) + anlage_so.get('taxable_loss', 0)
-    so_free_for_row = anlage_so.get('tax_free_gain', 0) + anlage_so.get('tax_free_loss', 0)
-    kap_rows_html += '<div class="section-title" style="margin-top:1.5rem;">Anlage SO (§23 EStG)</div>'
-    kap_rows_html += kap_row("SO", "Steuerpflichtiger Gewinn/Verlust (≤ 1 Jahr)", so_taxable_for_row, highlight=True)
-    if abs(so_free_for_row) > 0.01:
-        kap_rows_html += kap_row("SO", "Steuerfrei (> 1 Jahr Haltedauer)", so_free_for_row)
-
-st.markdown(kap_rows_html, unsafe_allow_html=True)
-
-if de_kest_variante_b and abs(zeile_7) > 0.01:
-    st.markdown(f"""
-<div style="background: rgba(56,189,248,0.06); border: 1px solid rgba(56,189,248,0.2); border-radius: 10px; padding: 0.6rem 1rem; margin-top: 0.5rem; margin-bottom: 1rem; font-size: 0.75rem; color: #94a3b8;">
-    <strong style="color: #38bdf8;">Variante B aktiv:</strong> {fmt_de(zeile_7)} EUR Bruttodividende auf DE-ISINs zu Z. 19 addiert · {fmt_de(zeile_37 + zeile_38)} EUR DE-KESt+Soli zu Z. 41 addiert.
-</div>
-""", unsafe_allow_html=True)
-
-# ── Multi-Account Breakdown ─────────────────────────────────────────────────
-
-if n_accounts > 1:
-    with st.expander(f"Aufschlüsselung nach Konten ({n_accounts} Konten)"):
-        acct_table = "| Konto | Topf 1 (Aktien) | Topf 2 (Sonstiges) | Z. 7 | Z. 19 (Netto) | Z. 37 | Z. 38 | Z. 41 (QSt) |\n"
-        acct_table += "|-------|----------------:|-------------------:|-----:|--------------:|------:|------:|------------:|\n"
-        for idx, (name, rep) in enumerate(zip(account_names, reports)):
-            t1 = rep.get('topf_1_aktien_netto', 0)
-            t2 = rep.get('topf_2_sonstiges_netto', 0)
-            z7 = rep.get('zeile_7_kapitalertraege_mit_inlaendischem_steuerabzug_eur', 0)
-            z19 = rep.get('zeile_19_netto_eur', t1 + t2)
-            z37 = rep.get('zeile_37_kapitalertragsteuer_eur', 0)
-            z38 = rep.get('zeile_38_solidaritaetszuschlag_eur', 0)
-            z41 = calculate_tax_report.get_kap_line_41_for_reporting(
-                rep,
-                invstg_enabled=invstg_aktiv,
-            )
-            if de_kest_variante_b and abs(z7) > 0.01:
-                t2 += z7
-                z19 += z7
-                z41 += z37 + z38
-                z7 = z37 = z38 = 0
-            label = f"Konto {idx+1} ({name})"
-            acct_table += f"| {label} | {fmt_de(t1)} | {fmt_de(t2)} | {fmt_de(z7)} | {fmt_de(z19)} | {fmt_de(z37)} | {fmt_de(z38)} | {fmt_de(z41)} |\n"
-        acct_table += f"| **Gesamt** | **{fmt_de(final['topf_1'])}** | **{fmt_de(final['topf_2'])}** | **{fmt_de(final['zeile_7'])}** | **{fmt_de(final['zeile_19'])}** | **{fmt_de(final['zeile_37'])}** | **{fmt_de(final['zeile_38'])}** | **{fmt_de(final['quellensteuer'])}** |\n"
-        st.markdown(acct_table)
-        st.info("Jedes Konto wurde vollständig separat berechnet (eigene Trades, Dividenden, FX-Berechnung, "
-                "Stillhalter-Erkennung). Die Einzelergebnisse wurden anschließend addiert.")
-
-# ── Zuflussprinzip Details ────────────────────────────────────────────────────
-
-if zuflussprinzip_aktiv and cross_year_details:
-    section_title("Zuflussprinzip · Vorjahres-Prämien (BMF Rn. 25, 33)")
-    st.markdown("""
-<div style="background: rgba(168,85,247,0.06); border: 1px solid rgba(168,85,247,0.2); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.82rem; color: #94a3b8;">
-    Die folgenden Stillhalterprämien wurden <strong>aus dem aktuellen Steuerjahr herausgerechnet</strong>,
-    da der Zufluss (= Verkauf der Option) in einem Vorjahr stattfand.
-    Diese Beträge gehören in die <strong>Steuererklärung des jeweiligen Vorjahres</strong>.
-</div>
-""", unsafe_allow_html=True)
-
-    detail_table = "| Symbol | Strike | Verkauf (Zufluss) | Assignment | Prämie (EUR) |\n"
-    detail_table += "|--------|--------|-------------------|------------|-------------:|\n"
-    for det in cross_year_details:
-        detail_table += (f"| {det['symbol']} | {det['strike']} | "
-                        f"{det['orig_sell_date']} | "
-                        f"{det['assignment_date']} | "
-                        f"{fmt_de(det['premium_eur'])} |\n")
-    st.markdown(detail_table)
-
-    st.markdown("**Zusammenfassung nach Zuflussjahr:**")
-    year_table = "| Steuerjahr | Prämien-Summe (EUR) | Hinweis |\n"
-    year_table += "|:----------:|--------------------:|--------|\n"
-    for year in sorted(cross_year_by_year.keys()):
-        year_table += f"| {year} | {fmt_de(cross_year_by_year[year])} | In Steuererklärung {year} eintragen |\n"
-    st.markdown(year_table)
-
-    st.info(f"**Gesamtbetrag Vorjahres-Prämien:** {fmt_de(cross_year_premium)} EUR. "
-            f"um diesen Betrag wurde Zeile 19 im aktuellen Jahr reduziert.")
-
-# ── Stillhalter-Zufluss Details (offene Positionen + Vorjahres-Korrekturen) ──
-
-if zufluss_details or prior_zufluss_details:
-    section_title("Stillhalter-Zufluss - Offene Positionen & Korrekturen")
-    if zufluss_details:
+def _render_legal():
+    section_title("Rechtliche Hinweise")
+    with st.container():
         st.markdown(f"""
-<div style="background: rgba(34,197,94,0.06); border: 1px solid rgba(34,197,94,0.2); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.82rem; color: #94a3b8;">
-    <strong style="color: #22c55e;">Stillhalter-Zufluss (§11 EStG):</strong> {len(zufluss_details)} Short-Option(en) im Steuerjahr verkauft, deren Position am Jahresende noch offen ist.
-    Die Prämien ({fmt_de(zufluss_premium)} EUR) sind als Zufluss im Steuerjahr steuerpflichtig und wurden zu Topf 2 addiert.
-</div>
-""", unsafe_allow_html=True)
-        zt = "| Symbol | Verkaufsdatum | Stk. | Prämie (EUR) |\n"
-        zt += "|--------|--------------|-----:|-------------:|\n"
-        for det in zufluss_details:
-            zt += f"| {det['symbol']} | {det['sell_date'][:10]} | {det['quantity']} | {fmt_de(det['premium_eur'])} |\n"
-        st.markdown(zt)
+**Eigenverantwortliche Nutzung.** Dieses Tool dient ausschließlich zur Unterstützung
+bei der Erstellung der Einkommensteuererklärung. Die berechneten Werte sind
+unverbindlich und ohne Gewähr für Richtigkeit, Vollständigkeit oder
+Aktualität. Alle Ergebnisse und Angaben sind vor der Übernahme in die
+Steuererklärung eigenverantwortlich zu prüfen.
 
-    if prior_zufluss_details:
+**Keine Steuerberatung.** Dieses Tool stellt keine Steuerberatung im Sinne
+des Steuerberatungsgesetzes (StBerG) dar und ersetzt nicht die Beratung
+durch einen Steuerberater, Wirtschaftsprüfer oder eine andere zur
+Steuerberatung befugte Person. Bei Unsicherheiten oder komplexen
+Sachverhalten ist eine steuerliche Beratung hinzuzuziehen.
+
+**Haftungsbeschränkung.** Soweit gesetzlich zulässig, ist die Haftung für
+Schäden aus der Nutzung oder Nichtnutzung des Tools sowie aus fehlerhaften,
+unvollständigen oder nicht aktuellen Berechnungsergebnissen ausgeschlossen.
+Die Haftungsbeschränkung gilt nicht bei Vorsatz, grober Fahrlässigkeit, bei
+Schäden aus der Verletzung von Leben, Körper oder Gesundheit sowie in
+sonstigen Fällen zwingender gesetzlicher Haftung. Bei einer leicht
+fahrlässigen Verletzung wesentlicher Pflichten ist die Haftung auf den
+typischerweise vorhersehbaren Schaden begrenzt.
+
+**Datenschutz und Datenverarbeitung.** Sämtliche Berechnungen erfolgen in
+der lokal gestarteten Anwendung auf dem eigenen Rechner. Hochgeladene Dateien
+werden nur an den lokalen Streamlit-Prozess (`localhost`) übertragen und
+dort temporär verarbeitet; das Tool sendet sie nicht an externe Server oder
+Dritte und speichert sie nicht dauerhaft. Im Tool findet kein Tracking und
+keine Nutzungsanalyse statt.
+
+**Rechtsstand und Aktualität.** Dieser Bericht wurde für das Steuerjahr
+{int(steuerjahr)} berechnet. Berücksichtigter Rechtsstand: §20 EStG, das
+BMF-Schreiben vom 14.05.2025 (Einzelfragen zur Abgeltungsteuer) und das
+Jahressteuergesetz 2024, jeweils soweit für das ausgewählte Steuerjahr
+anwendbar und einschließlich rückwirkender Änderungen. Spätere Änderungen
+der Rechtslage, Verwaltungsauffassung oder Rechtsprechung werden nicht
+automatisch berücksichtigt.
+
+**Open Source.** Dieses Projekt ist unter der MIT-Lizenz veröffentlicht.
+Der Quellcode ist frei einsehbar und prüfbar unter
+[github.com/KonvexInvestment/ibkr-steuer](https://github.com/KonvexInvestment/ibkr-steuer).
+""")
+
+
+def render_rechenwege():
+    st.markdown('<p class="page-title">Rechenwege</p>', unsafe_allow_html=True)
+    st.caption(
+        "Methoden, Produktzuordnungen und Nachweise sind in vier Themen "
+        "gegliedert. Alles hier ist Kenntnisnahme; Handlungsbedarf steht im "
+        "Bereich Prüffälle."
+    )
+    methods_tab, products_tab, calculation_tab, legal_tab = st.tabs([
+        "Methoden im Report",
+        "Produktzuordnungen",
+        "Berechnung & Diagnose",
+        "Rechtliches",
+    ])
+    with methods_tab:
+        _render_toggle_explainers()
+        _render_stillhalter_zufluss()
+        _render_transparency_details()
+    with products_tab:
+        _render_catalogs()
+    with calculation_tab:
+        tax_tab, processing_tab, diagnostics_tab = st.tabs([
+            "Steuerlogik",
+            "XML & Verarbeitung",
+            "Diagnose",
+        ])
+        with tax_tab:
+            _render_tax_rules()
+        with processing_tab:
+            _render_processing_method()
+        with diagnostics_tab:
+            _render_plausibility()
+            _render_diagnostics()
+    with legal_tab:
+        _render_legal()
+
+
+def _render_tax_rules():
+    section_title("Steuerliche Regeln & Berechnungsmethodik")
+    sh_count = audit.get("stillhalter_count", 0)
+    sh_eur = audit.get("stillhalter_premium_eur", 0)
+    base_curr = d.get("base_currency", "USD")
+    with st.container():
         st.markdown(f"""
-<div style="background: rgba(168,85,247,0.06); border: 1px solid rgba(168,85,247,0.2); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.82rem; color: #94a3b8;">
-    <strong style="color: #a855f7;">Vorjahres-Korrektur:</strong> {len(prior_zufluss_details)} Position(en) wurden in einem Vorjahr als Stillhalter eröffnet und im Steuerjahr glattgestellt.
-    Die Prämien ({fmt_de(prior_zufluss_correction)} EUR) waren bereits im Verkaufsjahr steuerpflichtig und wurden vom aktuellen PnL abgezogen.
-</div>
-""", unsafe_allow_html=True)
-        pt = "| Symbol | Verkaufsjahr | Stk. | Korrektur (EUR) |\n"
-        pt += "|--------|:-----------:|-----:|----------------:|\n"
-        for det in prior_zufluss_details:
-            pt += f"| {det['symbol']} | {det['sell_year']} | {det['quantity']} | -{fmt_de(det['premium_eur'])} |\n"
-        st.markdown(pt)
-
-# ── Steuerliche Regeln & Berechnungsmethodik ─────────────────────────────────
-
-section_title("Steuerliche Regeln & Berechnungsmethodik")
-
-sh_count = audit.get('stillhalter_count', 0)
-sh_eur = audit.get('stillhalter_premium_eur', 0)
-base_curr = d.get('base_currency', 'USD')
-
-with st.expander("Regeln anzeigen - So kommen die Ergebnisse zustande"):
-    st.markdown(f"""
 ### Zwei-Töpfe-Struktur (§20 Abs. 6 EStG)
 
 Das deutsche Steuerrecht unterscheidet zwei getrennte Verrechnungstöpfe:
@@ -3164,11 +4010,11 @@ Beim Halten von Fremdwährungsguthaben (z.B. USD) auf einem verzinslichen Konto 
 
 - **Anschaffung** = jeder Zufluss von Fremdwährung (Kauf, Dividende, Verkaufserlös)
 - **Veräußerung** = jeder Abfluss, der ein Guthaben auflöst (Rücktausch, Aktienkauf, Gebühren)
-- **Auslegung des Tools für Margin-Schulden:** Ein Abfluss bei bereits negativem Saldo vertieft die Schuld; ein Zufluss kann sie tilgen. Beides löst kein Guthaben auf. BMF Rn. 131 knüpft an ein Fremdwährungs**guthaben** bzw. eine Kapital**forderung** an und regelt die Verbindlichkeit nicht ausdrücklich. Diese konservative Auslegung ist über die Checkbox "FX-Saldo-Korrektur anwenden" abschaltbar.
+- **Auslegung des Tools für Margin-Schulden:** Ein Abfluss bei bereits negativem Saldo vertieft die Schuld; ein Zufluss kann sie tilgen. Beides löst kein Guthaben auf. BMF Rn. 131 knüpft an ein Fremdwährungs**guthaben** bzw. eine Kapital**forderung** an und regelt die Verbindlichkeit nicht ausdrücklich. Diese konservative Auslegung ist über die Checkbox "FX-Saldo-Korrektur" in der Sidebar unter Berechnung abschaltbar.
 - **FIFO-Methode**: die zuerst erworbenen Beträge werden zuerst veräußert
 - **Rechtsgrundlage**: §20 Abs. 2 S. 1 Nr. 7 EStG, Anlage KAP, Topf 2
 
-**Datenquellen:** Enthält die Flex Query `<FxTransactions>`, verwendet das Tool IBKRs FIFO-Ergebnis pro Buchung und kann Schuldtilgungen einzeln prüfen. Bei EUR-Basiskonten dient andernfalls ein hochgeladener IBKR-Standardbericht als aggregierter FIFO-Rohwert; einzelne Schuldtilgungen sind darin nicht erkennbar. Fehlen beide Quellen, rechnet das Tool bei EUR-Basiskonten selbst eine FIFO-Näherung aus den Kontobewegungen. Vorjahres-XMLs vervollständigen dabei die Lot-Historie, beseitigen aber nicht die Kursnäherung. Ohne Vorjahres-XMLs wird zusätzlich der Jahresanfangsbestand vereinfachend zum 01.01.-Kurs angesetzt. Für USD-Basiskonten ist ohne `<FxTransactions>` weder der CSV- noch der FIFO-Fallback verfügbar.
+**Datenquellen:** Enthält die Flex Query `<FxTransactions>`, verwendet das Tool IBKRs FIFO-Ergebnis pro Buchung und kann Schuldtilgungen einzeln prüfen. Bei EUR-Basiskonten dient andernfalls ein hochgeladener IBKR-Standardbericht als aggregierter FIFO-Rohwert (CSV-Upload beim Start oder über "Daten ändern" in der Sidebar; nur bei einem einzelnen Konto aktiv); einzelne Schuldtilgungen sind darin nicht erkennbar. Fehlen beide Quellen, rechnet das Tool bei EUR-Basiskonten selbst eine FIFO-Näherung aus den Kontobewegungen. Vorjahres-XMLs vervollständigen dabei die Lot-Historie, beseitigen aber nicht die Kursnäherung. Ohne Vorjahres-XMLs wird zusätzlich der Jahresanfangsbestand vereinfachend zum 01.01.-Kurs angesetzt. Für USD-Basiskonten ist ohne `<FxTransactions>` weder der CSV- noch der FIFO-Fallback verfügbar.
 
 ---
 
@@ -3188,7 +4034,7 @@ Bei **beiden** Assignment-Typen gilt laut BMF: „Die vereinnahmte Optionsprämi
 ### Dividenden & Payment in Lieu (PIL)
 
 - **Dividenden** (DIV): Laufende Erträge in Topf 2
-- **Deutsche Dividenden mit `- DE Steuer`**: werden separat als Kapitalerträge mit inländischem Steuerabzug behandelt (Zeile 7), nicht als ausländische Kapitalerträge in Zeile 19
+- **Deutsche Dividenden mit `- DE Steuer`**: werden separat als Kapitalerträge mit inländischem Steuerabzug behandelt (Zeile 7), nicht als ausländische Kapitalerträge in Zeile 19. Liegt die Buchung auf einem deutschen Investmentfonds, wird die einbehaltene Steuer als Prüffall gemeldet statt automatisch zugeordnet (siehe Quellensteuer-Abschnitt)
 - **Payment in Lieu** (PIL): Ersatzzahlung wenn Aktien verliehen sind, wird steuerlich wie eine Dividende behandelt und mit diesen zusammen verrechnet
 
 ---
@@ -3205,7 +4051,9 @@ Bei **beiden** Assignment-Typen gilt laut BMF: „Die vereinnahmte Optionsprämi
 
 Ausländische Quellensteuern auf Dividenden und Zinsen (z.B. 15% US-Quellensteuer) werden in Zeile 41 als **anrechenbare ausländische Steuern** gemeldet. Zeile 41 setzt sich aus zwei Teilen zusammen: der Quellensteuer außerhalb der Fonds und der anrechenbaren Fonds-Quellensteuer aus KAP-INV. Damit steht die Fonds-Quellensteuer genau einmal im Formular; KAP-INV hat keine eigene Quellensteuer-Zeile.
 
-Deutsche Dividendensteuer aus Buchungen mit `- DE Steuer` wird dagegen in Kapitalertragsteuer (Zeile 37) und Solidaritätszuschlag (Zeile 38) aufgeteilt. Wenn das Steuerprogramm diese Zeilen ohne Steuerbescheinigung nach §45a EStG sperrt, bietet "Variante B" eine technische Ersatzdarstellung über Zeile 19 bzw. 41. Sie ist kein amtlich belegter Ersatz für die Steuerbescheinigung und sollte vor der Abgabe mit Finanzamt oder Steuerberatung abgestimmt werden.
+Deutsche Dividendensteuer aus Buchungen mit `- DE Steuer` wird dagegen in Kapitalertragsteuer (Zeile 37) und Solidaritätszuschlag (Zeile 38) aufgeteilt. Wenn das Steuerprogramm diese Zeilen ohne Steuerbescheinigung nach §45a EStG sperrt, bietet "Variante B" eine technische Ersatzdarstellung über Zeile 19 bzw. 41 (Checkbox im Bereich Anlage KAP). Sie ist kein amtlich belegter Ersatz für die Steuerbescheinigung und sollte vor der Abgabe mit Finanzamt oder Steuerberatung abgestimmt werden.
+
+Sonderfall deutscher Investmentfonds: Behält IBKR deutsche Kapitalertragsteuer auf einem DE-Fonds ein, wird sie weder in Zeile 41 angerechnet noch automatisch in Zeile 37/38 eingetragen. §32d Abs. 5 EStG erfasst nur ausländische Steuern, und die auszahlende Stelle berücksichtigt die Teilfreistellung bereits beim Steuerabzug (§43a Abs. 2 EStG). Der Betrag erscheint als Prüffall ("DE-Steuer auf Fonds") und muss anhand der IBKR-Abrechnung manuell zugeordnet werden.
 
 ---
 
@@ -3239,8 +4087,11 @@ Da Interactive Brokers ein **ausländischer Broker ohne inländischen Steuerabzu
 - **Anlage KAP** - Zeilen 9/14 (Termingeschäfte) existieren nur in der Sektion mit inländischem Steuerabzug und sind für IBKR nicht relevant
 """)
 
-with st.expander("Berechnungsdetails - So werden die XML-Daten verarbeitet"):
-    st.markdown(f"""
+def _render_processing_method():
+    base_curr = d.get("base_currency", "USD")
+    section_title("XML-Verarbeitung und Rechenlogik")
+    with st.container():
+        st.markdown(f"""
 ### Schritt 1: XML-Extraktion
 
 Die IBKR Flex Query XML wird in einzelne CSV-Dateien zerlegt. Jede XML-Sektion enthält spezifische Daten:
@@ -3296,7 +4147,8 @@ Tageskurs-Methode: PnL (EUR) = Erlös × FX_Verkaufstag − AK × FX_Kauftag
 |---|---|---|---|
 | `STK` | `COMMON` / `REIT` / `ADR` | Aktienveräußerung (§20 Abs. 2 Nr. 1) | **Topf 1** |
 | `STK` | `ETF` (InvStG-Fonds) | Investmentfonds (InvStG §2) | **KAP-INV** (optional) |
-| `STK` | `ETF` (no\\_invstg, z.B. IBIT, GLD) | Kein Investmentfonds i.S.d. InvStG (Sonstige Kapitalforderung, §20 Abs. 1 Nr. 7) | **Topf 2** |
+| `STK` | `ETF` (no\\_invstg, z.B. VXX/FNGU-ETNs) | Schuldverschreibung, kein Investmentfonds i.S.d. InvStG | **Topf 2** |
+| `STK` | `ETF` (Personengesellschaft, z.B. USO/UNG) | §1 Abs. 3 Nr. 2 InvStG; Besteuerung nach anteiliger Jahresallokation | **blockiert**, bis K-1/K-3 bzw. äquivalenter Nachweis vorliegt |
 | `OPT` | | Termingeschäft, Option (§20 Abs. 2 Nr. 3) | Topf 2 |
 | `FUT` | | Termingeschäft, Future (§20 Abs. 2 Nr. 3) | Topf 2 |
 | `FOP` / `FSFOP` | | Termingeschäft, Future-Option (§20 Abs. 2 Nr. 3) | Topf 2 |
@@ -3308,7 +4160,7 @@ Tageskurs-Methode: PnL (EUR) = Erlös × FX_Verkaufstag − AK × FX_Kauftag
 
 Kategorien außerhalb dieser Tabelle werden nicht stillschweigend verworfen: Taucht eine unbekannte `assetCategory` mit einem Ergebnis auf, meldet das Tool sie als Prüffall.
 
-**InvStG-Klassifizierung (optional):** ETFs mit `subCategory="ETF"` werden gegen eine Lookup-Tabelle geprüft. Produkte, deren Einordnung fachlich offen ist (etwa Single-Asset-Trusts oder Closed-End-Funds), stehen in einer Prüf-Liste: Sie behalten ihren bisherigen Rechenweg, werden aber als offener Punkt ausgewiesen statt geraten. Aktienfonds (≥51% Aktienquote) erhalten 30% Teilfreistellung, sonstige Fonds 0%. Crypto/Commodity-ETPs (IBIT, GLD etc.) sind keine Investmentfonds i.S.d. InvStG (keine Risikomischung, einzelner Basiswert) und landen in Topf 2 (§20 Abs. 1 Nr. 7 EStG). Optionen auf ETFs bleiben in Topf 2.
+**InvStG-Klassifizierung (optional):** ETFs mit `subCategory="ETF"` werden gegen die belegte Produkttabelle geprüft. Maßgeblich ist §1 Abs. 2 InvStG i.V.m. dem Investmentvermögensbegriff des §1 Abs. 1 KAGB; das geltende Recht verlangt keine Risikomischung. Passive Single-Asset-/Grantor-Trusts wie GLD oder IBIT und registrierte Closed-End-Funds werden deshalb nach der hier vertretenen Auffassung als Investmentfonds behandelt; die Einordnung ist nicht höchstrichterlich geklärt (Gegenauffassung: transparente Behandlung als anteiliges Wirtschaftsgut nach §23 EStG). Ohne verbindlich belegte Kapitalbeteiligungsquote gilt 0% Teilfreistellung; eine fortlaufende Quote über 50% führt zum Aktienfonds mit 30%, über 25% zum Mischfonds mit 15% (§2 Abs. 6, 7 InvStG). Produkte ohne bestätigte Fondsart bleiben aus den KAP-INV-Formularzeilen ausgeschlossen, bis die Fondsart im Bereich Anlage KAP-INV ausdrücklich bestätigt wird; bis dahin erscheinen sie dort als Prüffall. Ausdrückliche Limited Partnerships wie USO/UNG sind dagegen nach §1 Abs. 3 Nr. 2 InvStG ausgeschlossen. Ihre Broker-PnL und Ausschüttungen werden nicht ersatzweise in Topf 2 geschoben, sondern bis zur Jahresallokation blockiert. Optionen auf ETFs bleiben in Topf 2.
 
 **Jahresfilter:** Es wird `reportDate` verwendet, nicht `dateTime`. Grund: Trades am Jahresende (z.B. `dateTime=2024-12-29`, Settlement `reportDate=2025-01-02`) gehören steuerlich zum Settlement-Jahr (Zuflussprinzip §11 EStG).
 
@@ -3341,7 +4193,7 @@ Jede Teilfüllung wird einzeln umgerechnet. Ein gewichteter Durchschnittskurs w�
 - `stocks_gain -= Prämie` (aus Topf 1 entfernen)
 - `options_gain += Prämie` (in Topf 2 als §20 Abs. 1 Nr. 11)
 
-**Cross-Year:** Wenn die Option in einem Vorjahr verkauft wurde und im Steuerjahr assigned wird, gehört die Prämie ins Vorjahr (Zuflussprinzip). Vorjahres-XMLs müssen hochgeladen werden, damit der Original-SELL gefunden wird.
+**Cross-Year:** Wenn die Option in einem Vorjahr verkauft wurde und im Steuerjahr assigned wird, gehört die Prämie ins Vorjahr (Zuflussprinzip). Vorjahres-XMLs müssen mit hochgeladen werden (beim Start oder über "Daten ändern" in der Sidebar), damit der Original-SELL gefunden wird. Findet das Tool zu einer Andienung im Steuerjahr keinen Original-Verkauf (fehlendes oder lückenhaftes Vorjahres-XML), erscheint eine Stillhalter-Warnung mit den betroffenen Serien; die Prämie bleibt dann unkorrigiert im Aktien-Ergebnis. Fehlt der Original-Verkauf bei einer noch älteren Put-Andienung, wird nur dann ein separater Prüffall angezeigt, wenn das daraus entstandene Aktien-Lot tatsächlich im Steuerjahr veräußert wurde.
 
 **Cross-Year Put-Korrektur:** Wenn Aktien aus Put-Assignments früherer Jahre im Steuerjahr verkauft werden, wird IBKR's PnL korrigiert. Die Prämie war bereits im Assignment-Jahr versteuert und darf die Anschaffungskosten nicht mindern. Das Matching läuft über FIFO-Lots; Schreibweisen desselben Basiswerts (Handelsplatz-Suffix, Ticker-Wechsel im Jahresverlauf) werden dabei über die Kontraktnummer oder ISIN zusammengeführt.
 
@@ -3360,7 +4212,7 @@ Aus `statement_of_funds.csv` werden Cash-Positionen nach `activityCode` zugeordn
 | `INTP` | Stückzinsen (beim Kauf gezahlt) | Negative Einnahmen, Topf 2 (BMF Rn. 51) |
 | `DINT` | Debit Interest (Sollzinsen, Leihgebühren, CFD-Finanzierung) | **Nicht** in Topf 2. Werbungskosten, nach §20 Abs. 9 EStG durch den Sparer-Pauschbetrag abgegolten; nur nachrichtlich |
 | `CFD` | CFD-Zinsen und -Gebühren | Habenzinsen in Topf 2, Finanzierungskosten wie `DINT` nur nachrichtlich |
-| `FRTAX` / `WHT` | Quellensteuer (Withholding Tax) | Zeile 41 (anrechenbar). Ausnahme: deutsche Kapitalertragsteuer auf DE-Wertpapieren geht nach Zeile 37/38 |
+| `FRTAX` / `WHT` | Quellensteuer (Withholding Tax) | Zeile 41 (anrechenbar). Ausnahmen: deutsche Kapitalertragsteuer auf DE-Wertpapieren geht nach Zeile 37/38; liegt sie auf einem DE-Fonds, wird sie als Prüffall gemeldet, da §32d Abs. 5 EStG nur ausländische Steuern erfasst und die Formularzuordnung nicht automatisierbar ist |
 | `OFEE` / `STAX` | Gebühren, Umsatzsteuer | Nicht abziehbar (§20 Abs. 9), nur nachrichtlich |
 | `TTAX` | Transaktionssteuer | Nach §20 Abs. 4 EStG ergebniswirksam, aber ohne belastbare Zuordnung zum Trade. Wird als Prüffall ausgewiesen statt automatisch verbucht |
 | `BUY` / `SELL` / `ADJ` / `ASSIGN` / `EXE` | Trade- und Settlement-Buchungen | Übersprungen; das realisierte Ergebnis kommt aus den Trade-Daten |
@@ -3400,7 +4252,7 @@ Fremdwährungsgewinne/-verluste entstehen durch Kursänderungen auf verzinsliche
 | Priorität | Quelle | Genauigkeit | Wann verfügbar |
 |---|---|---|---|
 | 1. | **XML `<FxTransactions>`** | Exakt (IBKR-internes FIFO, `realizedPL` pro Transaktion) | Wenn in Flex Query aktiviert |
-| 2. | **IBKR Standard-Bericht (CSV)** | Aggregierter IBKR-FIFO-Rohwert; keine Prüfung einzelner Schuldtilgungen möglich | Manuell erstellt, nur für EUR-Basiskonten als FX-Quelle |
+| 2. | **IBKR Standard-Bericht (CSV)** | Aggregierter IBKR-FIFO-Rohwert; keine Prüfung einzelner Schuldtilgungen möglich | Manuell erstellt und über den CSV-Uploader geladen; nur für EUR-Basiskonten und nur bei einem einzelnen Konto als FX-Quelle |
 | 3. | **FIFO-Approximation** | Näherung aus den Kontobewegungen | Bei EUR-Basiskonten, wenn keine vorrangige Quelle greift |
 
 Nur Quelle 1 enthält einzelne Buchungen: Dort filtert das Tool bei aktiver Saldo-Korrektur Schuldtilgungen heraus; Abflüsse bleiben ungekürzt, weil IBKR bei nur teilweise gedeckten Buchungen bereits allein das Ergebnis des gedeckten Teils ausweist. Quelle 2 ist aggregiert und kann diese Prüfung nicht leisten. Bei negativem Währungssaldo und aktiver Korrektur wird der CSV-Wert deshalb nicht verwendet, sondern auf Quelle 3 zurückgefallen. Ist die Korrektur deaktiviert, wird der CSV-Rohwert bewusst unverändert übernommen.
@@ -3414,8 +4266,10 @@ FX-Gewinne/-Verluste fließen in **Topf 2**.
 ```
 Topf 1 = Aktiengewinne + Aktienverluste (nach Stillhalter-Separation)
          (ohne InvStG-ETFs, wenn aktiviert)
-Topf 2 = Dividenden + Zinsen + Optionsgewinne + Optionsverluste
-         (inkl. Stillhalterprämien + FX-Gewinne/-Verluste)
+Topf 2 = Dividenden + Zinsen
+         + realisierte G/V aller Topf-2-Instrumente
+           (Optionen, Futures, Anleihen, T-Bills und Produkte außerhalb InvStG)
+         + Stillhalter-, Zufluss-, FX- und Tageskurs-Anpassungen
 
 Zeile 19 = Topf 1 + Topf 2 (Nettobetrag)
 Zeile 20 = Aktiengewinne (brutto, ohne Verluste)
@@ -3436,7 +4290,9 @@ Die Teilfreistellung wird pro ISIN nur als steuerlicher Kontrollwert berechnet:
   Sonstiger Fonds:                 0% steuerfrei
 
 KAP-INV-Zeilen = Rohbeträge vor TFS nach Fondsart (Z. 4–8 und 14/17/20/23/26)
-Kontrollwert = (ETF-G/V + ETF-Div) × (1 − TFS); kein Eintragungswert
+Kontrollwert = (ETF-G/V bzw. erhaltene ETF-Ausschüttung) × (1 − TFS);
+                gezahlte Ersatzzahlungen werden nicht gegengerechnet;
+                kein Eintragungswert
 ETF-Quellensteuer wird im Standardmodus wie vor dem DBA-Update proportional
 zur Teilfreistellung gekürzt. Optional kann die ausdrücklich als Beta markierte
 ereignisbezogene DBA-/Erstattungsprüfung aktiviert werden. Der Ergebnisbetrag
@@ -3455,205 +4311,596 @@ fließt das rohe Delta; das teilfreigestellte Delta dient nur der Kontrollrechnu
 ```
 """)
 
-# ── Export ───────────────────────────────────────────────────────────────────
 
-section_title("Export")
+# ── Export: Excel-Builder (aus dem Bestands-Code gehoben) ────────────────────
 
-# Build optional export sections
-fx_export = ""
-if fx_results:
-    fx_export = "\nFREMDWÄHRUNGS-GEWINNE/VERLUSTE (FIFO)\n"
-    for curr, data in sorted(fx_results.items()):
-        fx_export += f"  {curr}: Gewinn {fmt_de(data['gain']):>10}  Verlust {fmt_de(data['loss']):>10}  Netto {fmt_de(data['net']):>10} EUR\n"
-    fx_net = fx_total_gain + fx_total_loss
-    fx_export += f"  ─────────────────────────────────────────────────\n"
-    fx_export += f"  FX Gesamt Gewinn:      {fmt_de(fx_total_gain):>14} EUR\n"
-    fx_export += f"  FX Gesamt Verlust:     {fmt_de(fx_total_loss):>14} EUR\n"
-    fx_export += f"  FX Netto:              {fmt_de(fx_net):>14} EUR\n"
-    fx_export += "  (In Topf 2 enthalten, BMF Rn. 131)\n"
-    # Toggle-Stand dokumentieren, damit der Bericht auch ohne GUI nachvollziehbar bleibt
-    _fx_corr_active = d.get('fx_margin_correction_enabled', True)
-    _fx_neg = d.get('fx_has_negative_balance', False)
-    _fx_meta = d.get('fx_option_a_meta', {}) or {}
-    _fx_debt_n = _fx_meta.get('debt_repayments', 0)
-    _fx_debt_pnl = _fx_meta.get('debt_repayment_pnl', 0.0)
-    if _fx_corr_active:
-        fx_export += "  Saldo-Korrektur (§20 Abs. 2 S. 1 Nr. 7 EStG): AKTIV (konservativ)\n"
-        if _fx_debt_n:
-            fx_export += (
-                f"    → {_fx_debt_n} Buchungen tilgen eine Fremdwährungs-Schuld "
-                f"({fmt_de(_fx_debt_pnl)} EUR) und bleiben unberücksichtigt.\n"
+topf_readable = {
+    'Topf1': 'Topf 1 - Aktien (§20 Abs. 2 Nr. 1 EStG)',
+    'Topf2': 'Topf 2 - Sonstiges (Termingeschäfte, Stillhalter, FX)',
+    'KAP-INV': 'Anlage KAP-INV (InvStG)',
+    'Anlage SO': 'Anlage SO (§23 EStG)',
+    'Personengesellschaft': (
+        'Personengesellschaft - beobachtete Brokerwerte; '
+        'Jahresallokation fehlt'
+    ),
+    'Nicht zugeordnet': 'Nicht zugeordnet (bitte manuell prüfen)',
+}
+EXPORT_TOPF_ORDER = (
+    'Topf1', 'Topf2', 'KAP-INV', 'Anlage SO', 'Personengesellschaft',
+    'Nicht zugeordnet',
+)
+cat_labels = {
+    'STK': 'Aktie', 'OPT': 'Option', 'FUT': 'Future',
+    'FOP': 'Futures-Option', 'FSFOP': 'Flex-Option',
+    'BILL': 'T-Bill', 'BOND': 'Anleihe',
+    'WAR': 'Optionsschein', 'CFD': 'CFD',
+}
+
+def _format_instrument(row):
+    sym = row.get('symbol', '') or ''; desc = row.get('description', '') or ''
+    pc = row.get('putCall', '') or ''; strike = row.get('strike', '') or ''; expiry = row.get('expiry', '') or ''
+    if pc and strike and expiry:
+        pc_label = 'Call' if pc == 'C' else 'Put'
+        exp_fmt = f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:]}" if len(expiry) == 8 else expiry[:10]
+        return f"{sym} ({pc_label} {strike} exp. {exp_fmt})"
+    if desc and sym: return f"{sym} ({desc})"
+    return sym or desc or ''
+
+def _get_group_key(row):
+    us = (row.get('underlyingSymbol', '') or '').strip()
+    if us: return us.split()[0]
+    sym = (row.get('symbol', '') or '').strip()
+    return sym.split()[0] if sym else '?'
+
+def _build_excel(trade_details, trades_by_topf, export_context):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    import io
+    wb = Workbook()
+    ws_details = wb.active
+    ws_details.title = f"Trade-Details {steuerjahr}"
+    ws = wb.create_sheet("Zusammenfassung")
+    hdr_font = Font(bold=True, color="FFFFFF", size=11); hdr_fill = PatternFill("solid", fgColor="1e3a5f")
+    grp_font = Font(bold=True, size=10); grp_fill = PatternFill("solid", fgColor="d6e4f0")
+    gain_font = Font(color="006100", size=9); gain_fill = PatternFill("solid", fgColor="e2efda")
+    loss_font = Font(color="9c0006", size=9); loss_fill = PatternFill("solid", fgColor="fce4ec")
+    korr_font = Font(italic=True, size=9); korr_fill = PatternFill("solid", fgColor="fff9c4")
+    sub_font = Font(bold=True, size=9); sub_fill = PatternFill("solid", fgColor="f2f2f2")
+    total_font = Font(bold=True, size=10, color="FFFFFF"); total_fill = PatternFill("solid", fgColor="4a4a4a")
+    normal_font = Font(size=9); thin_border = Border(bottom=Side(style='thin', color='cccccc'))
+    num_fmt_eur = '#,##0.00'; num_fmt_4d = '#,##0.0000'
+
+    f = export_context['final']
+    has_etf = export_context['has_etf_data'] and export_context['invstg_aktiv']
+    kap_inv_form_export = export_context.get('kap_inv_form', {})
+    has_so = export_context['has_so_data']
+    special_products = export_context['no_invstg_summary']
+    partnership_tax_items = export_context.get('partnership_tax_items', {})
+    so_taxable = export_context['so_taxable']
+    so_free = export_context['so_free']
+    trade_sums = {
+        key: sum(float(r.get('pnl_eur') or 0) for r in rows)
+        for key, rows in trades_by_topf.items()
+    }
+    trade_topf1_reconciled = trade_sums.get('Topf1', 0)
+    trade_topf2_reconciled = trade_sums.get('Topf2', 0)
+    kap_inv_trade_total = trade_sums.get('KAP-INV', 0)
+    kap_inv_reintegration_note = ""
+    if export_context['has_etf_data'] and not export_context['invstg_aktiv'] and abs(kap_inv_trade_total) > 0.005:
+        trade_topf1_reconciled += kap_inv_trade_total
+        kap_inv_reintegration_note = "KAP-INV-Detailwerte wurden wegen deaktivierter InvStG-Klassifizierung in Topf 1 reintegriert."
+
+    summary_cols = ["Bereich", "Position", "Wert EUR / Anzahl", "Hinweis"]
+    for i, width in enumerate([22, 44, 16, 60], 1):
+        ws.column_dimensions[get_column_letter(i)].width = width
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(summary_cols))
+    cell = ws.cell(row=1, column=1, value=f"ANLAGE KAP {steuerjahr} - Steuerbericht")
+    cell.font = hdr_font
+    cell.fill = hdr_fill
+    cell.alignment = Alignment(horizontal='left')
+    row_num = 2
+    meta_rows = [
+        ("Erstellt", export_context['created_at']),
+        ("Basiswährung", export_context['base_currency']),
+        ("Quelle", "final (GUI/Textreport Single Source of Truth)"),
+    ]
+    for label, value in meta_rows:
+        ws.cell(row=row_num, column=1, value=label)
+        ws.cell(row=row_num, column=2, value=value)
+        for ci in range(1, len(summary_cols) + 1):
+            cell = ws.cell(row=row_num, column=ci)
+            cell.font = normal_font
+            cell.border = thin_border
+        ws.cell(row=row_num, column=1).font = sub_font
+        row_num += 1
+
+    summary_rows = [
+        ("Topf 1", "Aktiengewinne", f['stocks_gain'], ""),
+        ("Topf 1", "Aktienverluste", f['stocks_loss'], ""),
+        ("Topf 1", "Saldo Aktien", f['topf_1'], ""),
+        ("Topf 2", "Dividenden", f['dividends'], ""),
+        ("Topf 2", "Zinsen netto", f['interest'], ""),
+        ("Topf 2", "Sonstige Gewinne", f['options_gain'], ""),
+        ("Topf 2", "Sonstige Verluste", f['options_loss'], ""),
+        ("Topf 2", "Saldo Sonstiges", f['topf_2'], ""),
+        ("Anlage KAP", "Zeile 7 - inländischer Steuerabzug", f['zeile_7'], ""),
+        ("Anlage KAP", "Zeile 19 - ausländische Kapitalerträge netto", f['zeile_19'], ""),
+        ("Anlage KAP", "Zeile 20 - Aktiengewinne", f['zeile_20'], ""),
+        ("Anlage KAP", "Zeile 22 - Verluste ohne Aktien", f['zeile_22'], "positiver Eintrag"),
+        ("Anlage KAP", "Zeile 23 - Aktienverluste", f['zeile_23'], "positiver Eintrag"),
+        ("Anlage KAP", "Zeile 37 - Kapitalertragsteuer", f['zeile_37'], ""),
+        ("Anlage KAP", "Zeile 38 - Solidaritätszuschlag", f['zeile_38'], ""),
+        ("Anlage KAP", "Zeile 41 - ausl. Quellensteuer", f['quellensteuer'], ""),
+    ]
+    if has_etf:
+        for line in kap_inv_form_export.get('lines', []):
+            note = (
+                "Bruttowert vor TFS; steuerpflichtiger Kontrollwert "
+                f"{fmt_de(line.get('taxable_control_eur', 0))} EUR"
             )
-    else:
-        fx_export += "  Saldo-Korrektur (§20 Abs. 2 S. 1 Nr. 7 EStG): DEAKTIVIERT (Opt-out)\n"
-        if _fx_debt_n:
-            fx_export += (
-                f"    → {_fx_debt_n} Buchungen aus Schuldtilgung ({fmt_de(_fx_debt_pnl)} EUR) "
-                f"sind mit IBKR-Rohwert enthalten.\n"
-            )
-        elif _fx_neg:
-            fx_export += "    → IBKR-/Rohwerte übernommen trotz negativem Fremdwährungssaldo.\n"
-    _fx_open_anom = _fx_meta.get('open_rows_with_pnl', []) or []
-    if _fx_open_anom:
-        fx_export += (
-            f"  PRUEFFALL: {len(_fx_open_anom)} Buchungen tragen ein Ergebnis, obwohl IBKR\n"
-            f"    sie als Eroeffnung ausweist (code != 'C'). Als steuerbar behandelt.\n"
+            if line.get('kind') == 'sale':
+                note += "; vor Abzug bereits angesetzter Vorabpauschalen"
+            summary_rows.append((
+                "Anlage KAP-INV",
+                f"Zeile {line['line']} - {line['fund_type']}",
+                line['amount_raw_eur'],
+                note,
+            ))
+        for item in kap_inv_form_export.get('blocked_details', []):
+            summary_rows.append((
+                "Anlage KAP-INV Prüffall",
+                f"{item.get('ticker', '')} ({item['isin']}) - Ausschüttung roh",
+                item.get('distribution_raw_eur', 0),
+                "keine Formularzeile bis zur bestätigten Fondsart; "
+                f"G/V roh {fmt_de(item.get('sale_raw_eur', 0))} EUR",
+            ))
+        for item in kap_inv_form_export.get('negative_distribution_details', []):
+            summary_rows.append((
+                "Anlage KAP-INV Prüffall",
+                f"{item.get('ticker', '')} ({item['isin']}) - gezahlte Ausschüttungen",
+                item.get('paid_distribution_eur', 0),
+                "gezahlte Dividenden/Ersatzzahlungen (Short-Position); nicht in "
+                "den Ausschüttungszeilen enthalten; steuerliche Behandlung "
+                "manuell prüfen",
+            ))
+        summary_rows.append((
+            "Anlage KAP-INV",
+            "Fonds-QSt: enthalten in Anlage KAP Zeile 41",
+            f['etf_wht'],
+            "keine eigene KAP-INV-Zeile",
+        ))
+    for isin, info in sorted(special_products.items(), key=lambda x: x[1].get('ticker', '')):
+        summary_rows.append((
+            "Topf 2 Sonderprodukte",
+            f"{info.get('ticker', isin)} ({isin})",
+            info.get('total', 0),
+            "no_invstg; realisiertes G/V + Tageskurs + Ausschüttungen; "
+            f"QSt {fmt_de(info.get('wht_reported', 0))} EUR; negativ = Erstattung",
+        ))
+    for isin, item in sorted(
+            partnership_tax_items.items(),
+            key=lambda x: x[1].get('ticker', '')):
+        observed_total = (
+            item.get('observed_trade_pnl_eur', 0)
+            + item.get('observed_tageskurs_delta_eur', 0)
+            + item.get('observed_distributions_eur', 0)
+            + item.get('observed_other_cash_eur', 0)
         )
+        summary_rows.append((
+            "Personengesellschaft · blockiert",
+            f"{item.get('ticker', isin)} ({isin}) · beobachtete Brokerwerte",
+            observed_total,
+            "Kein Steuerwert: K-1/K-3 bzw. äquivalente Jahresallokation fehlt; "
+            f"QSt beobachtet {fmt_de(item.get('observed_withholding_tax_eur', 0))} EUR",
+        ))
+    if has_so:
+        summary_rows.extend([
+            ("Anlage SO", "Steuerpflichtig <= 1 Jahr", so_taxable, ""),
+            ("Anlage SO", "Steuerfrei > 1 Jahr", so_free, "nicht in Anlage KAP"),
+        ])
 
-sh_export = ""
-if sh_count > 0:
-    sh_export = f"\nSTILLHALTERPRÄMIEN (BMF Rn. 25-35)\n"
-    sh_export += f"  {sh_count} Assignment(s) erkannt\n"
-    sh_export += f"  Prämien umgebucht:     {fmt_de(sh_eur):>14} EUR\n"
-    sh_export += f"  (Von Topf 1 nach Topf 2 verschoben)\n"
+    row_num += 1
+    for ci, cn in enumerate(summary_cols, 1):
+        cell = ws.cell(row=row_num, column=ci, value=cn)
+        cell.font = Font(bold=True, size=9)
+        cell.fill = PatternFill("solid", fgColor="e8e8e8")
+        cell.border = thin_border
+    row_num += 1
+    current_area = None
+    for area, label, value, note in summary_rows:
+        if area != current_area:
+            current_area = area
+            ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=len(summary_cols))
+            cell = ws.cell(row=row_num, column=1, value=area)
+            cell.font = grp_font
+            cell.fill = grp_fill
+            row_num += 1
+        values = [area, label, value, note]
+        for ci, val in enumerate(values, 1):
+            cell = ws.cell(row=row_num, column=ci, value=val)
+            cell.font = normal_font
+            cell.border = thin_border
+            if ci == 3 and isinstance(val, (int, float)):
+                cell.number_format = num_fmt_eur
+                if val > 0.005:
+                    cell.fill = gain_fill
+                    cell.font = gain_font
+                elif val < -0.005:
+                    cell.fill = loss_fill
+                    cell.font = loss_font
+        if label.startswith("Saldo ") or label.startswith("Zeile 19") or label.startswith("Erträge "):
+            for ci in range(1, len(summary_cols) + 1):
+                ws.cell(row=row_num, column=ci).font = sub_font
+                ws.cell(row=row_num, column=ci).fill = sub_fill
+        row_num += 1
 
-inv_export = ""
-kap_inv_entries_export = ""
-if has_etf_data and invstg_aktiv:
-    inv_export = f"\nANLAGE KAP-INV: INVESTMENTFONDS (InvStG)\n"
-    if dba_wht_beta_enabled:
-        inv_export += (
-            "  Fonds-QSt-Modus: DBA-BETA AKTIV "
-            "(Ereignis-Matching/DBA-Caps; manuell prüfen)\n"
-        )
-    else:
-        inv_export += (
-            "  Fonds-QSt-Modus: STANDARD "
-            "(Rohsteuer × (1 - Teilfreistellung); DBA-Beta aus)\n"
-        )
-    kap_inv_entries_export = "\nANLAGE KAP-INV EINTRAGUNGEN\n"
-    for line in kap_inv_form.get('lines', []):
-        suffix = (
-            " (vor Abzug bereits angesetzter Vorabpauschalen)"
-            if line.get('kind') == 'sale' else ""
-        )
-        form_row = (
-            f"  Zeile {line['line']:>2}: {fmt_de(line['amount_raw_eur']):>12} EUR  "
-            f"{line['fund_type']} · vor TFS{suffix}\n"
-        )
-        inv_export += form_row
-        kap_inv_entries_export += form_row
-        inv_export += (
-            f"             Kontrollwert nach TFS: "
-            f"{fmt_de(line['taxable_control_eur']):>10} EUR "
-            "(kein Eintragungswert)\n"
-        )
-    inv_export += (
-        f"  Fonds-QSt anrechenbar: {fmt_de(etf_wht):>12} EUR  "
-        "→ bereits in Anlage KAP Zeile 41 enthalten\n"
+    row_num += 1
+    ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=len(summary_cols))
+    cell = ws.cell(row=row_num, column=1, value="Abstimmung")
+    cell.font = hdr_font
+    cell.fill = hdr_fill
+    cell.alignment = Alignment(horizontal='left')
+    row_num += 1
+    reconciliation_rows = [
+        ("Topf 1", "Finaler Wert", f['topf_1'], "GUI/TXT/Excel-Summary"),
+        ("Topf 1", "Trade-Details", trade_topf1_reconciled, kap_inv_reintegration_note or "Nachweis-Sheet"),
+        ("Topf 1", "Differenz", f['topf_1'] - trade_topf1_reconciled, "Kontrollwert; Abweichungen können aus PnL-Summary-Fallbacks, Rundung oder Toggle-Reintegration stammen"),
+        ("Topf 2", "Finaler Wert", f['topf_2'], "inkl. Dividenden, Zinsen, FX, Stillhalter"),
+        ("Topf 2", "Trade-Details", trade_topf2_reconciled, "Trades und Korrekturen"),
+        ("Topf 2", "Nicht-Trade-Anteil", f['topf_2'] - trade_topf2_reconciled, "Cash-Erträge/Korrekturen, z.B. Dividenden und Zinsen"),
+        ("Anlage KAP", "Zeile 19 minus Topf 1 minus Topf 2", f['zeile_19'] - (f['topf_1'] + f['topf_2']), "sollte 0 sein"),
+    ]
+    for ci, cn in enumerate(summary_cols, 1):
+        cell = ws.cell(row=row_num, column=ci, value=cn)
+        cell.font = Font(bold=True, size=9)
+        cell.fill = PatternFill("solid", fgColor="e8e8e8")
+        cell.border = thin_border
+    row_num += 1
+    current_area = None
+    for area, label, value, note in reconciliation_rows:
+        if area != current_area:
+            current_area = area
+            ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=len(summary_cols))
+            cell = ws.cell(row=row_num, column=1, value=area)
+            cell.font = grp_font
+            cell.fill = grp_fill
+            row_num += 1
+        for ci, val in enumerate([area, label, value, note], 1):
+            cell = ws.cell(row=row_num, column=ci, value=val)
+            cell.font = normal_font
+            cell.border = thin_border
+            if ci == 3 and isinstance(val, (int, float)):
+                cell.number_format = num_fmt_eur
+        if label in ("Differenz", "Nicht-Trade-Anteil", "Zeile 19 minus Topf 1 minus Topf 2"):
+            for ci in range(1, len(summary_cols) + 1):
+                ws.cell(row=row_num, column=ci).font = sub_font
+                ws.cell(row=row_num, column=ci).fill = sub_fill
+        row_num += 1
+    ws.freeze_panes = 'A6'
+
+    ws = ws_details
+    cols = ['Datum', 'Handelsdatum', 'Wertpapier', 'ISIN', 'Kategorie',
+            'K/V', 'Stk.', 'Kurs', 'Kostenbasis', 'Erloese',
+            'G/V (Orig.)', 'Kommission', 'Waehrung', 'Wechselkurs', 'G/V (EUR)', 'Anmerkung']
+    col_widths = [12, 12, 42, 15, 10, 6, 8, 11, 13, 13, 13, 11, 6, 11, 14, 40]
+    eur_col = 15
+    for i, w in enumerate(col_widths, 1): ws.column_dimensions[get_column_letter(i)].width = w
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(cols))
+    notice = ws.cell(
+        row=1,
+        column=1,
+        value=(
+            "Hinweis: IBKR-/OCC-Bezeichnungen können vom geläufigen "
+            "Basiswert abweichen, z. B. BRKB/BRK B und ODAX für DAX."
+        ),
     )
-    kap_inv_entries_export += (
-        f"  Fonds-QSt: {fmt_de(etf_wht):>12} EUR  "
-        "→ Anlage KAP Zeile 41, keine KAP-INV-Zeile\n"
-    )
-    for warning in kap_inv_form.get('warnings', []):
-        inv_export += f"  ACHTUNG: {warning}\n"
-        kap_inv_entries_export += f"  ACHTUNG: {warning}\n"
-    for item in kap_inv_form.get('blocked_details', []):
-        blocked_row = (
-            f"  PRUEFFALL {item.get('ticker', '')} ({item['isin']}): "
-            f"Aussch. roh {fmt_de(item.get('distribution_raw_eur', 0))} EUR, "
-            f"G/V roh {fmt_de(item.get('sale_raw_eur', 0))} EUR; "
-            "keine Formularzeile ohne bestaetigte Fondsart\n"
-        )
-        inv_export += blocked_row
-        kap_inv_entries_export += blocked_row
-    for item in kap_inv_form.get('negative_distribution_details', []):
-        paid_row = (
-            f"  PRUEFFALL {item.get('ticker', '')} ({item['isin']}): "
-            f"gezahlte Ausschüttungen {fmt_de(item.get('paid_distribution_eur', 0))} EUR "
-            "(Short-Position); nicht in den Ausschüttungszeilen enthalten\n"
-        )
-        inv_export += paid_row
-        kap_inv_entries_export += paid_row
-    inv_export += "  Details je ISIN:\n"
-    for detail in kap_inv_form.get('details', []):
-        inv_export += (
-            f"    {detail.get('ticker', detail['isin']):8s} "
-            f"Aussch. roh {fmt_de(detail['distribution_raw_eur']):>10} EUR  "
-            f"G/V roh {fmt_de(detail['sale_raw_eur']):>10} EUR  "
-            f"TFS {detail['tfs_rate']*100:.0f}%\n"
-        )
+    notice.font = Font(italic=True, size=9, color="7f6000")
+    notice.fill = korr_fill
+    row_num = 3
+    for topf_key in EXPORT_TOPF_ORDER:
+        topf_rows = trades_by_topf.get(topf_key, [])
+        if not topf_rows: continue
+        ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=len(cols))
+        cell = ws.cell(row=row_num, column=1, value=topf_readable.get(topf_key, topf_key))
+        cell.font = hdr_font; cell.fill = hdr_fill; cell.alignment = Alignment(horizontal='left')
+        row_num += 1
+        for ci, cn in enumerate(cols, 1):
+            cell = ws.cell(row=row_num, column=ci, value=cn)
+            cell.font = Font(bold=True, size=9); cell.fill = PatternFill("solid", fgColor="e8e8e8"); cell.border = thin_border
+        row_num += 1
+        groups = defaultdict(list)
+        for r in topf_rows: groups[_get_group_key(r)].append(r)
+        topf_total = 0.0
+        for grp_key in sorted(groups.keys()):
+            grp_rows = groups[grp_key]
+            grp_rows.sort(key=lambda r: r.get('dateTime', '') or r.get('reportDate', '') or '')
+            grp_desc = ''; grp_isin = ''
+            for r in grp_rows:
+                if r.get('description') and r.get('source') != 'stillhalter_korrektur': grp_desc = r['description']
+                if r.get('isin'): grp_isin = r['isin']
+                if grp_desc and grp_isin: break
+            grp_label = grp_key
+            if grp_desc: grp_label += f" - {grp_desc}"
+            if grp_isin: grp_label += f" ({grp_isin})"
+            ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=len(cols))
+            cell = ws.cell(row=row_num, column=1, value=grp_label); cell.font = grp_font; cell.fill = grp_fill
+            row_num += 1; grp_total = 0.0
+            for r in grp_rows:
+                source = r.get('source', ''); pnl_eur = r.get('pnl_eur', 0)
+                pnl_orig = r.get('fifoPnlRealized', 0); fx = r.get('fxRateToBase', 0)
+                cost = r.get('cost', 0); proceeds = r.get('proceeds', 0); price = r.get('tradePrice', 0)
+                commission = r.get('ibCommission', 0) or 0
+                anmerkung = ''
+                if source == 'pnl_summary': anmerkung = 'Aus IBKR PnL-Summary'
+                elif source == 'stillhalter_korrektur': anmerkung = r.get('description', 'Korrektur')
+                elif source == 'zufluss': anmerkung = r.get('description', 'Zufluss §11 EStG')
+                elif source == 'zufluss_korrektur': anmerkung = r.get('description', 'Vorjahres-Korrektur')
+                elif source == 'tageskurs_korrektur': anmerkung = r.get('description', 'Tageskurs')
+                elif source == 'cross_year_put_korrektur': anmerkung = r.get('description', 'Cross-Year Put-Korrektur')
+                elif source == 'trades' and r.get('stillhalter_adjusted'):
+                    anmerkung = 'Korrigiert: Prämie separiert (s. Stillhalterprämie Topf 2)'
+                    if r.get('invstg_basis_adjustment_raw'):
+                        anmerkung += '; KAP-INV-AK auf Ausübungspreis normalisiert'
+                bs = r.get('buySell', ''); oc = r.get('openClose', '')
+                if bs == 'SELL' and oc == 'O': bs_label = 'STO'
+                elif bs == 'BUY' and oc == 'C': bs_label = 'BTC'
+                elif bs == 'BUY' and oc == 'O': bs_label = 'BTO'
+                elif bs == 'SELL' and oc == 'C': bs_label = 'STC'
+                else: bs_label = bs
+                values = [
+                    (r.get('reportDate', '') or '')[:10], (r.get('dateTime', '') or '')[:10],
+                    _format_instrument(r), r.get('isin', ''),
+                    cat_labels.get(r.get('assetCategory', ''), r.get('assetCategory', '')),
+                    bs_label, r.get('quantity', ''),
+                    price if price else None, cost if cost else None, proceeds if proceeds else None,
+                    pnl_orig if pnl_orig else None, commission if commission else None, r.get('currency', ''),
+                    fx if fx else None, pnl_eur, anmerkung,
+                ]
+                for ci, val in enumerate(values, 1):
+                    cell = ws.cell(row=row_num, column=ci, value=val); cell.font = normal_font
+                    if ci in (8, 9, 10, 11, 12, 15) and isinstance(val, (int, float)): cell.number_format = num_fmt_eur
+                    elif ci == 14 and isinstance(val, (int, float)): cell.number_format = num_fmt_4d
+                if source in ('stillhalter_korrektur', 'zufluss', 'zufluss_korrektur', 'tageskurs_korrektur', 'cross_year_put_korrektur'):
+                    for ci in range(1, len(cols) + 1): ws.cell(row=row_num, column=ci).fill = korr_fill; ws.cell(row=row_num, column=ci).font = korr_font
+                elif pnl_eur > 0.005:
+                    for ci in range(1, len(cols) + 1): ws.cell(row=row_num, column=ci).fill = gain_fill; ws.cell(row=row_num, column=ci).font = gain_font
+                elif pnl_eur < -0.005:
+                    for ci in range(1, len(cols) + 1): ws.cell(row=row_num, column=ci).fill = loss_fill; ws.cell(row=row_num, column=ci).font = loss_font
+                grp_total += pnl_eur; row_num += 1
+            ws.cell(row=row_num, column=1, value=f"Zwischensumme {grp_key}")
+            for ci in range(1, len(cols) + 1): ws.cell(row=row_num, column=ci).font = sub_font; ws.cell(row=row_num, column=ci).fill = sub_fill; ws.cell(row=row_num, column=ci).border = thin_border
+            cell = ws.cell(row=row_num, column=eur_col, value=grp_total); cell.number_format = num_fmt_eur; cell.font = sub_font; cell.fill = sub_fill
+            topf_total += grp_total; row_num += 1
+        topf_label = topf_readable.get(topf_key, topf_key).split(' - ')[0]
+        ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=eur_col - 1)
+        cell = ws.cell(row=row_num, column=1, value=f"SUMME {topf_label}"); cell.font = total_font; cell.fill = total_fill; cell.alignment = Alignment(horizontal='right')
+        for ci in range(1, len(cols) + 1): ws.cell(row=row_num, column=ci).fill = total_fill
+        cell = ws.cell(row=row_num, column=eur_col, value=topf_total); cell.number_format = num_fmt_eur; cell.font = total_font; cell.fill = total_fill
+        row_num += 2
+    ws.freeze_panes = 'A4'
+    buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
-topf2_detail_export = ""
-if topf2_cats:
-    topf2_detail_export = "\nAUFSCHLÜSSELUNG TOPF 2\n"
-    div_eur = final['dividends']
-    int_eur = final['interest']
-    topf2_detail_export += f"  {'Dividenden':24s} G {fmt_de(max(div_eur, 0)):>10} V {fmt_de(min(div_eur, 0)):>10} N {fmt_de(div_eur):>10} EUR\n"
-    topf2_detail_export += f"  {'Zinsen':24s} G {fmt_de(max(int_eur, 0)):>10} V {fmt_de(min(int_eur, 0)):>10} N {fmt_de(int_eur):>10} EUR\n"
-    for cat, vals in sorted(topf2_cats.items()):
-        net = vals['gain'] + vals['loss']
-        topf2_detail_export += f"  {cat:24s} G {fmt_de(vals['gain']):>10} V {fmt_de(vals['loss']):>10} N {fmt_de(net):>10} EUR\n"
-    if zuflussprinzip_aktiv and abs(adj_cross) > 0.01:
-        topf2_detail_export += f"  {'Zufluss-Korrektur':24s} G {fmt_de(0):>10} V {fmt_de(-adj_cross):>10} N {fmt_de(-adj_cross):>10} EUR\n"
-    tk_corr_topf2 = (tk_gain_adj.get('Topf2', 0) + tk_loss_adj.get('Topf2', 0)) if tageskurs_aktiv else 0
-    if tageskurs_aktiv and abs(tk_corr_topf2) > 0.01:
-        if tk_corr_topf2 >= 0:
-            topf2_detail_export += f"  {'Tageskurs-Korrektur':24s} G {fmt_de(tk_corr_topf2):>10} V {fmt_de(0):>10} N {fmt_de(tk_corr_topf2):>10} EUR\n"
+
+# ── Export: Textreport ───────────────────────────────────────────────────────
+
+def _build_text_report():
+    etf_wht = final["etf_wht"]
+    sh_count = audit.get("stillhalter_count", 0)
+    sh_eur = audit.get("stillhalter_premium_eur", 0)
+    zeile_7 = d.get("zeile_7_kapitalertraege_mit_inlaendischem_steuerabzug_eur", 0)
+    zeile_37 = d.get("zeile_37_kapitalertragsteuer_eur", 0)
+    zeile_38 = d.get("zeile_38_solidaritaetszuschlag_eur", 0)
+    classification_review_items = d.get("classification_review_items", []) or []
+    partnership_tax_items = d.get("partnership_tax_items", {}) or {}
+    fx_export = ""
+    if fx_results:
+        fx_export = "\nFREMDWÄHRUNGS-GEWINNE/VERLUSTE (FIFO)\n"
+        for curr, data in sorted(fx_results.items()):
+            fx_export += f"  {curr}: Gewinn {fmt_de(data['gain']):>10}  Verlust {fmt_de(data['loss']):>10}  Netto {fmt_de(data['net']):>10} EUR\n"
+        fx_net = fx_total_gain + fx_total_loss
+        fx_export += f"  ─────────────────────────────────────────────────\n"
+        fx_export += f"  FX Gesamt Gewinn:      {fmt_de(fx_total_gain):>14} EUR\n"
+        fx_export += f"  FX Gesamt Verlust:     {fmt_de(fx_total_loss):>14} EUR\n"
+        fx_export += f"  FX Netto:              {fmt_de(fx_net):>14} EUR\n"
+        fx_export += "  (In Topf 2 enthalten, BMF Rn. 131)\n"
+        # Toggle-Stand dokumentieren, damit der Bericht auch ohne GUI nachvollziehbar bleibt
+        _fx_corr_active = d.get('fx_margin_correction_enabled', True)
+        _fx_neg = d.get('fx_has_negative_balance', False)
+        _fx_meta = d.get('fx_option_a_meta', {}) or {}
+        _fx_debt_n = _fx_meta.get('debt_repayments', 0)
+        _fx_debt_pnl = _fx_meta.get('debt_repayment_pnl', 0.0)
+        if _fx_corr_active:
+            fx_export += "  Saldo-Korrektur (§20 Abs. 2 S. 1 Nr. 7 EStG): AKTIV (buchungs- und saldogeprüft)\n"
+            if _fx_debt_n:
+                fx_export += (
+                    f"    → {_fx_debt_n} Buchungen tilgen eine Fremdwährungs-Schuld "
+                    f"({fmt_de(_fx_debt_pnl)} EUR) und bleiben unberücksichtigt.\n"
+                )
         else:
-            topf2_detail_export += f"  {'Tageskurs-Korrektur':24s} G {fmt_de(0):>10} V {fmt_de(tk_corr_topf2):>10} N {fmt_de(tk_corr_topf2):>10} EUR\n"
-
-special_products_export = ""
-if no_invstg_summary:
-    special_products_export = "\nSONDERPRODUKTE AUSSERHALB INVSTG (IN TOPF 2 ENTHALTEN)\n"
-    for isin, info in sorted(no_invstg_summary.items(), key=lambda x: x[1].get('ticker', '')):
-        realized = info.get('gain', 0) + info.get('loss', 0)
-        special_products_export += (
-            f"  {info.get('ticker', isin):8s} {isin}  "
-            f"G/V {fmt_de(realized):>10}  TK {fmt_de(info.get('tageskurs', 0)):>10}  "
-            f"Aussch. {fmt_de(info.get('div', 0)):>10}  "
-            f"Summe {fmt_de(info.get('total', 0)):>10} EUR\n"
-        )
-        wht_reported = info.get('wht_reported', 0)
-        if abs(wht_reported) > 0.005:
-            wht_label = "Quellensteuer" if wht_reported > 0 else "QSt-Erstattung"
-            special_products_export += (
-                f"           {wht_label}: {fmt_de(wht_reported):>10} EUR\n"
+            fx_export += "  Saldo-Korrektur (§20 Abs. 2 S. 1 Nr. 7 EStG): DEAKTIVIERT (Opt-out)\n"
+            if _fx_debt_n:
+                fx_export += (
+                    f"    → {_fx_debt_n} Buchungen aus Schuldtilgung ({fmt_de(_fx_debt_pnl)} EUR) "
+                    f"sind mit IBKR-Rohwert enthalten.\n"
+                )
+            elif _fx_neg:
+                fx_export += "    → IBKR-/Rohwerte übernommen trotz negativem Fremdwährungssaldo.\n"
+        _fx_open_anom = _fx_meta.get('open_rows_with_pnl', []) or []
+        if _fx_open_anom:
+            fx_export += (
+                f"  PRUEFFALL: {len(_fx_open_anom)} Buchungen tragen ein Ergebnis, obwohl IBKR\n"
+                f"    sie als Eroeffnung ausweist (code != 'C'). Als steuerbar behandelt.\n"
             )
 
-de_kest_export = ""
-if abs(zeile_7) > 0.01:
-    z_kest_total = zeile_37 + zeile_38
-    if de_kest_variante_b:
-        de_kest_export = (
-            "\nHINWEIS DEUTSCHE DIVIDENDEN (Variante B aktiv)\n"
-            f"  Bruttodividende {fmt_de(zeile_7)} EUR wurde nach Zeile 19 verschoben.\n"
-            f"  DE-KESt+Soli {fmt_de(z_kest_total)} EUR wurde nach Zeile 41 verschoben.\n"
-            "  Variante A (Z. 7/37/38) ist tax-legally präziser und im GUI umschaltbar.\n"
+    sh_export = ""
+    if sh_count > 0:
+        sh_export = f"\nSTILLHALTERPRÄMIEN (BMF Rn. 25-35)\n"
+        sh_export += f"  {sh_count} Assignment(s) erkannt\n"
+        sh_export += f"  Prämien umgebucht:     {fmt_de(sh_eur):>14} EUR\n"
+        sh_export += f"  (Von Topf 1 nach Topf 2 verschoben)\n"
+
+    inv_export = ""
+    kap_inv_entries_export = ""
+    if has_etf_data and invstg_aktiv:
+        inv_export = f"\nANLAGE KAP-INV: INVESTMENTFONDS (InvStG)\n"
+        if dba_wht_beta_enabled:
+            inv_export += (
+                "  Fonds-QSt-Modus: DBA-BETA AKTIV "
+                "(Ereignis-Matching/DBA-Caps; manuell prüfen)\n"
+            )
+        else:
+            inv_export += (
+                "  Fonds-QSt-Modus: STANDARD "
+                "(Rohsteuer × (1 - Teilfreistellung); DBA-Beta aus)\n"
+            )
+        kap_inv_entries_export = "\nANLAGE KAP-INV EINTRAGUNGEN\n"
+        for line in kap_inv_form.get('lines', []):
+            suffix = (
+                " (vor Abzug bereits angesetzter Vorabpauschalen)"
+                if line.get('kind') == 'sale' else ""
+            )
+            form_row = (
+                f"  Zeile {line['line']:>2}: {fmt_de(line['amount_raw_eur']):>12} EUR  "
+                f"{line['fund_type']} · vor TFS{suffix}\n"
+            )
+            inv_export += form_row
+            kap_inv_entries_export += form_row
+            inv_export += (
+                f"             Kontrollwert nach TFS: "
+                f"{fmt_de(line['taxable_control_eur']):>10} EUR "
+                "(kein Eintragungswert)\n"
+            )
+        inv_export += (
+            f"  Fonds-QSt anrechenbar: {fmt_de(etf_wht):>12} EUR  "
+            "→ bereits in Anlage KAP Zeile 41 enthalten\n"
         )
-    else:
-        de_kest_export = (
-            "\nHINWEIS DEUTSCHE DIVIDENDEN (Variante A aktiv)\n"
-            "  Falls das Steuerprogramm Z. 7/37/38 nicht freischaltet, alternativ:\n"
-            f"    Zeile 19: +{fmt_de(zeile_7)} EUR  (Bruttodividende)\n"
-            f"    Zeile 41: +{fmt_de(z_kest_total)} EUR  (DE-KESt+Soli als anrechenbare Steuer)\n"
-            "  Variante B ist eine technische Ersatzdarstellung und kein amtlich belegter\n"
-            "  Ersatz fuer die Steuerbescheinigung; vor Abgabe fachlich abstimmen.\n"
+        kap_inv_entries_export += (
+            f"  Fonds-QSt: {fmt_de(etf_wht):>12} EUR  "
+            "→ Anlage KAP Zeile 41, keine KAP-INV-Zeile\n"
+        )
+        for warning in kap_inv_form.get('warnings', []):
+            inv_export += f"  ACHTUNG: {warning}\n"
+            kap_inv_entries_export += f"  ACHTUNG: {warning}\n"
+        for item in kap_inv_form.get('blocked_details', []):
+            blocked_row = (
+                f"  PRUEFFALL {item.get('ticker', '')} ({item['isin']}): "
+                f"Aussch. roh {fmt_de(item.get('distribution_raw_eur', 0))} EUR, "
+                f"G/V roh {fmt_de(item.get('sale_raw_eur', 0))} EUR; "
+                "keine Formularzeile ohne bestaetigte Fondsart\n"
+            )
+            inv_export += blocked_row
+            kap_inv_entries_export += blocked_row
+        for item in kap_inv_form.get('negative_distribution_details', []):
+            paid_row = (
+                f"  PRUEFFALL {item.get('ticker', '')} ({item['isin']}): "
+                f"gezahlte Ausschüttungen {fmt_de(item.get('paid_distribution_eur', 0))} EUR "
+                "(Short-Position); nicht in den Ausschüttungszeilen enthalten\n"
+            )
+            inv_export += paid_row
+            kap_inv_entries_export += paid_row
+        inv_export += "  Details je ISIN:\n"
+        for detail in kap_inv_form.get('details', []):
+            inv_export += (
+                f"    {detail.get('ticker', detail['isin']):8s} "
+                f"Aussch. Formular {fmt_de(detail['distribution_raw_eur']):>10} EUR  "
+                f"G/V KAP-INV {fmt_de(detail['sale_raw_eur']):>10} EUR  "
+                f"TFS {detail['tfs_rate']*100:.0f}%\n"
+            )
+
+    topf2_detail_export = ""
+    if topf2_breakdown:
+        topf2_detail_export = "\nAUFSCHLÜSSELUNG TOPF 2\n"
+        for row in topf2_breakdown['rows']:
+            topf2_detail_export += (
+                f"  {row['label']:24s} G {fmt_de(row['gain']):>10} "
+                f"V {fmt_de(row['loss']):>10} N {fmt_de(row['net']):>10} EUR\n"
+            )
+        topf2_detail_export += (
+            f"  {'Saldo Topf 2':24s} G {fmt_de(topf2_breakdown['total_gain']):>10} "
+            f"V {fmt_de(topf2_breakdown['total_loss']):>10} "
+            f"N {fmt_de(topf2_breakdown['net']):>10} EUR\n"
+            "  Anpassungszeilen sind mit Vorzeichen in G/V addierbar.\n"
         )
 
-multi_acct_export = ""
-if n_accounts > 1:
-    multi_acct_export = f"Konten: {n_accounts} (separat berechnet, Ergebnisse addiert)\n"
+    special_products_export = ""
+    if no_invstg_summary:
+        special_products_export = "\nSONDERPRODUKTE AUSSERHALB INVSTG (IN TOPF 2 ENTHALTEN)\n"
+        for isin, info in sorted(no_invstg_summary.items(), key=lambda x: x[1].get('ticker', '')):
+            realized = info.get('gain', 0) + info.get('loss', 0)
+            special_products_export += (
+                f"  {info.get('ticker', isin):8s} {isin}  "
+                f"G/V {fmt_de(realized):>10}  TK {fmt_de(info.get('tageskurs', 0)):>10}  "
+                f"Aussch. {fmt_de(info.get('div', 0)):>10}  "
+                f"Summe {fmt_de(info.get('total', 0)):>10} EUR\n"
+            )
+            wht_reported = info.get('wht_reported', 0)
+            if abs(wht_reported) > 0.005:
+                wht_label = "Quellensteuer" if wht_reported > 0 else "QSt-Erstattung"
+                special_products_export += (
+                    f"           {wht_label}: {fmt_de(wht_reported):>10} EUR\n"
+                )
 
-classification_review_export = ""
-if classification_review_items:
-    classification_review_export = "\nOFFENE PRODUKTKLASSIFIKATIONEN\n"
-    classification_review_export += (
-        "  Bisheriger Rechenpfad bleibt vorläufig bestehen; Werte manuell prüfen.\n"
-    )
-    for item in classification_review_items:
+    de_kest_export = ""
+    if abs(zeile_7) > 0.01:
+        z_kest_total = zeile_37 + zeile_38
+        if de_kest_variante_b:
+            de_kest_export = (
+                "\nHINWEIS DEUTSCHE DIVIDENDEN (Variante B aktiv)\n"
+                f"  Bruttodividende {fmt_de(zeile_7)} EUR wurde nach Zeile 19 verschoben.\n"
+                f"  DE-KESt+Soli {fmt_de(z_kest_total)} EUR wurde nach Zeile 41 verschoben.\n"
+                "  Variante A (Z. 7/37/38) ist tax-legally präziser und im GUI umschaltbar.\n"
+            )
+        else:
+            de_kest_export = (
+                "\nHINWEIS DEUTSCHE DIVIDENDEN (Variante A aktiv)\n"
+                "  Falls das Steuerprogramm Z. 7/37/38 nicht freischaltet, alternativ:\n"
+                f"    Zeile 19: +{fmt_de(zeile_7)} EUR  (Bruttodividende)\n"
+                f"    Zeile 41: +{fmt_de(z_kest_total)} EUR  (DE-KESt+Soli als anrechenbare Steuer)\n"
+                "  Variante B ist eine technische Ersatzdarstellung und kein amtlich belegter\n"
+                "  Ersatz fuer die Steuerbescheinigung; vor Abgabe fachlich abstimmen.\n"
+            )
+
+    multi_acct_export = ""
+    if n_accounts > 1:
+        multi_acct_export = f"Konten: {n_accounts} (separat berechnet, Ergebnisse addiert)\n"
+
+    classification_review_export = ""
+    if classification_review_items:
+        classification_review_export = "\nOFFENE PRODUKTKLASSIFIKATIONEN\n"
         classification_review_export += (
-            f"  {item.get('ticker', ''):8s} {item.get('isin', '')}  "
-            f"Pfad {item.get('routing_classification', '')}: "
-            f"{item.get('review_reason', '')}\n"
+            "  Kein Altpfad-Fallback; Übernahme bis zum Nachweis blockiert.\n"
         )
+        for item in classification_review_items:
+            classification_review_export += (
+                f"  {item.get('ticker', ''):8s} {item.get('isin', '')}  "
+                f"Pfad {item.get('routing_classification', '')}: "
+                f"{item.get('review_reason', '')}\n"
+            )
 
-report_text = f"""ANLAGE KAP {steuerjahr} - Steuerbericht
+    partnership_export = ""
+    if partnership_tax_items:
+        partnership_export = "\nPERSONENGESELLSCHAFTEN - BERECHNUNG BLOCKIERT\n"
+        partnership_export += (
+            "  Nicht in KAP/KAP-INV enthalten. K-1/K-3 bzw. aequivalente "
+            "Jahresallokation und deutsche Ueberleitung erforderlich.\n"
+        )
+        for isin, item in sorted(partnership_tax_items.items()):
+            partnership_export += (
+                f"  {item.get('ticker', isin):8s} {isin}  "
+                f"Broker-PnL {fmt_de(item.get('observed_trade_pnl_eur', 0))} EUR, "
+                f"Tageskurs {fmt_de(item.get('observed_tageskurs_delta_eur', 0))} EUR, "
+                f"Ausschuettungen {fmt_de(item.get('observed_distributions_eur', 0))} EUR, "
+                f"sonstige Cashwerte {fmt_de(item.get('observed_other_cash_eur', 0))} EUR, "
+                f"QSt {fmt_de(item.get('observed_withholding_tax_eur', 0))} EUR\n"
+            )
+
+    report_text = f"""ANLAGE KAP {steuerjahr} - Steuerbericht
 Erstellt: {created_at}
 Basiswährung: {d.get('base_currency', 'USD')}
 {multi_acct_export}
 {classification_review_export}
+{partnership_export}
 ═══════════════════════════════════════════════════
 TOPF 1: AKTIEN (ohne ETF-Fonds)
   Aktiengewinne:         {fmt_de(final['stocks_gain']):>14} EUR
@@ -3677,51 +4924,207 @@ ANLAGE KAP EINTRAGUNGEN
   Zeile 22 (Verluste o. Aktien): {fmt_de(final['zeile_22']):>8} EUR
   Zeile 23 (Aktienverluste): {fmt_de(final['zeile_23']):>11} EUR
   Zeile 41 (ausl. Quellensteuer): {fmt_de(final['quellensteuer']):>8} EUR
-{de_kest_export}{kap_inv_entries_export}{"" if not has_so_data else chr(10) + "ANLAGE SO (§23 EStG): PRIVATE VERÄUSSERUNGSGESCHÄFTE" + chr(10) + f"  Physische Gold-ETCs (BFH VIII R 35/14, VIII R 4/15)" + chr(10) + f"  Steuerpflichtig (≤ 1J): {fmt_de(so_taxable_for_row):>12} EUR  → Anlage SO" + chr(10) + f"  Steuerfrei (> 1J):      {fmt_de(so_free_for_row):>12} EUR" + chr(10)}═══════════════════════════════════════════════════
+{de_kest_export}{kap_inv_entries_export}{"" if not has_so_data else chr(10) + "ANLAGE SO (§23 EStG): PRIVATE VERÄUSSERUNGSGESCHÄFTE" + chr(10) + f"  Physische Gold-ETCs (BFH VIII R 35/14, VIII R 4/15)" + chr(10) + f"  Steuerpflichtig (≤ 1J): {fmt_de(so_taxable):>12} EUR  → Anlage SO" + chr(10) + f"  Steuerfrei (> 1J):      {fmt_de(so_free):>12} EUR" + chr(10)}═══════════════════════════════════════════════════
 """
+    return report_text
 
-st.download_button(
-    label="Textreport herunterladen",
-    data=report_text,
-    file_name=f"steuerbericht_{steuerjahr}.txt",
-    mime="text/plain",
-    use_container_width=True
-)
 
-with st.expander("Report als Text anzeigen (zum Kopieren)"):
-    st.code(report_text, language=None)
+# ── Renderer: Export ─────────────────────────────────────────────────────────
 
-# ── Rechtliche Hinweise ──────────────────────────────────────────────────────
+def _build_export_trade_details():
+    """Trade-Details inkl. Tageskurs-Korrekturzeilen (bei aktivem Toggle)."""
+    trade_details = list(d.get('trade_details', []))
+    if trade_details and tageskurs_aktiv:
+        for lot in d.get('fx_correction_details', []):
+            if abs(lot.get('delta_eur', 0)) < 0.005:
+                continue
+            underlying = (lot.get('underlyingSymbol', '')
+                          or lot.get('symbol', '') or '').split()[0]
+            open_dt = (lot.get('openDateTime', '') or '')[:10]
+            close_dt = lot.get('reportDate', '')
+            delta_eur = lot['delta_eur']
+            note = (f'Tageskurs-Korrektur (Kauf {open_dt}, Kurs '
+                    f'{lot["fx_open"]:.5f} → {lot["fx_close"]:.5f})')
+            if lot.get('invstg_basis_adjustment_raw', 0) > 0:
+                note += (' · KAP-INV-AK inkl. zusätzlicher ausländischer '
+                         'Basisreduktion (z. B. ROC) auf Put-Strike '
+                         'normalisiert')
+            if lot.get('topf') == 'KAP-INV' and invstg_aktiv:
+                isin = lot.get('isin', '')
+                tfs_rate = etf_by_isin.get(isin, {}).get(
+                    'tfs_rate', lot.get('tfs_rate', 0))
+                taxable_delta = delta_eur * (1 - tfs_rate)
+                if abs(taxable_delta - delta_eur) > 0.005:
+                    note += (f' · roh {fmt_de(delta_eur)} EUR, stpfl. nach '
+                             f'TFS {fmt_de(taxable_delta)} EUR')
+                delta_eur = taxable_delta
+            trade_details.append({
+                'dateTime': close_dt, 'reportDate': close_dt,
+                'symbol': lot.get('symbol', ''),
+                'description': note,
+                'isin': lot.get('isin', ''),
+                'assetCategory': lot.get('assetCategory', ''),
+                'subCategory': lot.get('subCategory', ''),
+                'buySell': '', 'openClose': '',
+                'quantity': lot.get('quantity', ''),
+                'transactionType': 'FX-Korrektur',
+                'currency': lot.get('currency', ''), 'tradePrice': 0,
+                'cost': lot.get('cost', 0),
+                'proceeds': 0, 'fifoPnlRealized': 0, 'fxRateToBase': 0,
+                'pnl_eur': delta_eur, 'topf': lot.get('topf', 'Topf2'),
+                'strike': '', 'expiry': '', 'putCall': '', 'multiplier': '',
+                'underlyingSymbol': underlying,
+                'source': 'tageskurs_korrektur',
+            })
+        trade_details.sort(
+            key=lambda r: r.get('dateTime', '') or r.get('reportDate', '')
+            or 'zzzz')
+    return trade_details
 
-section_title("Rechtliche Hinweise")
 
-st.markdown("""
-<div style="background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 1.25rem 1.25rem; font-size: 0.78rem; color: #64748b; line-height: 1.7;">
+def _build_exports():
+    """XLSX + TXT genau einmal pro view_key erzeugen (lazy, nur im aktiven
+    Export-Renderer). Nach jeder Fondsbestätigung oder Toggle-Änderung
+    ändert sich der view_key; ein alter Export wird nie ausgeliefert."""
+    cache = st.session_state.get('export_cache')
+    if cache and cache.get('view_key') == vm['view_key']:
+        return cache
 
-<strong style="color: #94a3b8;">Haftungsausschluss</strong><br>
-Dieses Tool dient ausschließlich zur Unterstützung bei der Erstellung der Einkommensteuererklärung. Die berechneten Werte sind unverbindlich und ohne Gewähr für Richtigkeit, Vollständigkeit oder Aktualität. Der Nutzer ist für die Prüfung aller Angaben in seiner Steuererklärung selbst verantwortlich. Die Nutzung erfolgt auf eigenes Risiko.
+    trade_details = _build_export_trade_details()
+    trades_by_topf = defaultdict(list)
+    for row in trade_details:
+        trades_by_topf[row.get('topf', 'Topf2')].append(row)
 
-<br><br>
-<strong style="color: #94a3b8;">Keine Steuerberatung</strong><br>
-Dieses Tool stellt keine Steuerberatung im Sinne des Steuerberatungsgesetzes (StBerG) dar und ersetzt nicht die Beratung durch einen Steuerberater, Wirtschaftsprüfer oder eine andere zur Steuerberatung befugte Person. Bei Unsicherheiten oder komplexen Sachverhalten ist eine steuerliche Beratung hinzuzuziehen.
+    export_context = {
+        'final': final,
+        'base_currency': d.get('base_currency', 'USD'),
+        'created_at': created_at,
+        'has_etf_data': has_etf_data,
+        'invstg_aktiv': invstg_aktiv,
+        'kap_inv_form': kap_inv_form if (has_etf_data and invstg_aktiv) else {},
+        'no_invstg_summary': no_invstg_summary,
+        'partnership_tax_items': d.get('partnership_tax_items', {}) or {},
+        'has_so_data': has_so_data,
+        'so_taxable': so_taxable,
+        'so_free': so_free,
+    }
+    xlsx_data = None
+    xlsx_error = None
+    try:
+        xlsx_data = _build_excel(trade_details, trades_by_topf, export_context)
+    except ModuleNotFoundError as exc:
+        if exc.name != 'openpyxl':
+            raise
+        xlsx_error = ("Excel-Export nicht verfügbar: openpyxl installieren "
+                      "(pip install openpyxl).")
 
-<br><br>
-<strong style="color: #94a3b8;">Keine Haftung</strong><br>
-Die Entwickler und Mitwirkenden dieses Projekts haften nicht für Schäden, die durch die Nutzung oder Nichtnutzung der berechneten Informationen entstehen, einschließlich, aber nicht beschränkt auf finanzielle Verluste, Steuernachzahlungen, Bußgelder oder Zinsen. Dies gilt sowohl für direkte als auch für indirekte Schäden, unabhängig davon, ob diese vorhersehbar waren.
+    cache = {
+        'view_key': vm['view_key'],
+        'xlsx': xlsx_data,
+        'xlsx_error': xlsx_error,
+        'txt': _build_text_report(),
+        'n_details': len(trade_details),
+        'trade_sums': {
+            key: sum(float(r.get('pnl_eur') or 0) for r in rows)
+            for key, rows in trades_by_topf.items()
+        },
+        'n_trades': sum(
+            1 for r in trade_details if r.get('source') == 'trades'),
+        'n_underlyings': len(set(
+            (r.get('underlyingSymbol', '') or r.get('symbol', '') or '?')
+            .split()[0]
+            for r in trade_details if r.get('source') == 'trades')),
+    }
+    st.session_state['export_cache'] = cache
+    return cache
 
-<br><br>
-<strong style="color: #94a3b8;">Datenschutz und Datenverarbeitung</strong><br>
-Sämtliche Berechnungen werden ausschließlich lokal im Browser des Nutzers ausgeführt (clientseitige Verarbeitung mittels WebAssembly). Es werden zu keinem Zeitpunkt personenbezogene Daten, Finanzdaten oder hochgeladene Dateien an einen Server übertragen, gespeichert oder an Dritte weitergegeben. Es findet kein Tracking, keine Analyse und keine Protokollierung statt. Die Anwendung erfüllt die Anforderungen der DSGVO, da keine Datenverarbeitung durch den Anbieter erfolgt.
 
-<br><br>
-<strong style="color: #94a3b8;">Rechtsstand und Aktualität</strong><br>
-Die steuerlichen Berechnungen basieren auf dem Rechtsstand des Steuerjahres 2025, insbesondere auf §20 EStG, dem BMF-Schreiben vom 14.05.2025 (Einzelfragen zur Abgeltungsteuer) sowie dem Jahressteuergesetz 2024. Änderungen der Rechtslage, der Verwaltungsauffassung oder der Rechtsprechung nach Veröffentlichung dieses Tools werden nicht automatisch berücksichtigt.
+def render_export():
+    st.markdown('<p class="page-title">Export</p>', unsafe_allow_html=True)
+    st.caption(
+        "Excel mit Einzelnachweisen je Topf, Textreport zum Kopieren. Beide "
+        "enthalten dieselben finalen Werte wie die Übersicht."
+    )
+    exports = _build_exports()
 
-<br><br>
-<strong style="color: #94a3b8;">Open Source</strong><br>
-Dieses Projekt ist unter der MIT-Lizenz veröffentlicht. Der Quellcode ist frei einsehbar und prüfbar unter
-<a href="https://github.com/KonvexInvestment/ibkr-steuer" target="_blank" style="color: #60a5fa;">github.com/KonvexInvestment/ibkr-steuer</a>.
-Jeder kann den Code einsehen, prüfen und zur Verbesserung beitragen.
+    st.markdown(
+        '<div class="notice transparenz">'
+        '<div class="notice-title">Formularwerte und Detailwerte sind zwei '
+        'verschiedene Ebenen</div>'
+        '<strong>Für die Steuererklärung</strong> gelten die Werte aus der '
+        'Übersicht, dem Excel-Blatt „Zusammenfassung“ und dem Textreport. '
+        '<strong>Für die Kontrolle</strong> folgen darunter die Summen der '
+        'einzelnen Trades, Korrekturen und Zuflüsse. Diese Detail-Summen '
+        'dürfen von den Formularwerten abweichen.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
-</div>
-""", unsafe_allow_html=True)
+    n_trades = exports['n_trades']
+    n_korr = exports['n_details'] - n_trades
+    if n_trades > 0:
+        header = (f"**Detailabstimmung: {n_trades} Trades, "
+                  f"{exports['n_underlyings']} Wertpapiere")
+        if n_korr > 0:
+            header += f" (+ {n_korr} Korrekturen/Zuflüsse)"
+        header += "**"
+    elif n_korr > 0:
+        header = (f"**Detailabstimmung: keine Trades, {n_korr} "
+                  "Korrektur-/Zuflusspositionen**")
+    else:
+        header = "**Keine Trade-Details für die Detailabstimmung verfügbar**"
+    summary_lines = [header]
+    for topf_key in EXPORT_TOPF_ORDER:
+        if topf_key in exports['trade_sums']:
+            label = topf_readable.get(topf_key, topf_key).split(' - ')[0]
+            summary_lines.append(
+                f"Details {label}: {fmt_de(exports['trade_sums'][topf_key])} EUR")
+    st.markdown(" | ".join(summary_lines))
+    st.caption(
+        "Warum können die Summen abweichen? Die Detailpositionen bilden "
+        "Trades und einzelne Korrekturen ab. Die Formularwerte berücksichtigen "
+        "zusätzlich Cash-Buchungen, steuerliche Zuordnungen, "
+        "Teilfreistellungen und die Verlustverrechnung. Die "
+        "Detailabstimmung ist deshalb ein Kontrollnachweis und kein zweiter "
+        "Satz Formularwerte."
+    )
+
+    section_title("Excel-Steuerreport")
+    if exports['xlsx_error']:
+        st.warning(exports['xlsx_error'])
+    elif exports['xlsx'] is not None:
+        st.download_button(
+            label=(f"Steuerbericht als Excel herunterladen "
+                   f"({exports['n_details']} Detailpositionen)"),
+            data=exports['xlsx'],
+            file_name=f"steuerbericht_{steuerjahr}.xlsx",
+            mime=("application/vnd.openxmlformats-officedocument."
+                  "spreadsheetml.sheet"),
+            width="stretch",
+        )
+
+    section_title("Textreport")
+    st.download_button(
+        label="Textreport herunterladen",
+        data=exports['txt'],
+        file_name=f"steuerbericht_{steuerjahr}.txt",
+        mime="text/plain",
+        width="stretch",
+    )
+    with st.expander("Report als Text anzeigen (zum Kopieren)"):
+        st.code(exports['txt'], language=None)
+
+
+# ── Dispatch: genau ein aktiver Renderer ─────────────────────────────────────
+
+_PAGE_RENDERERS = {
+    'overview': render_overview,
+    'kap': render_kap,
+    'kap_inv': render_kap_inv,
+    'anlage_so': render_anlage_so,
+    'prueffaelle': render_prueffaelle,
+    'rechenwege': render_rechenwege,
+    'export': render_export,
+}
+
+_PAGE_RENDERERS[_nav_current]()

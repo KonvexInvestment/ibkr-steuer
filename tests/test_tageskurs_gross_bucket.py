@@ -9,6 +9,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from calculate_tax_report import (  # noqa: E402
+    build_topf2_breakdown,
     calculate_tageskurs_gross_adjustment,
     calculate_tax,
 )
@@ -229,8 +230,46 @@ def test_all_sign_transitions_reconcile():
         )
 
 
+def test_topf2_breakdown_keeps_gross_columns_additive():
+    breakdown = build_topf2_breakdown(
+        {
+            "Optionen": {"gain": 250.0, "loss": -80.0},
+            "Futures": {"gain": 40.0, "loss": -120.0},
+        },
+        dividends_eur=25.0,
+        interest_eur=-5.0,
+        tageskurs_gain_adjustment=30.0,
+        tageskurs_loss_adjustment=7.5,
+        zufluss_adjustment=-12.5,
+    )
+
+    _assert_close(
+        breakdown["total_gain"],
+        sum(row["gain"] for row in breakdown["rows"]),
+        "Topf2 Gewinnspalte",
+    )
+    _assert_close(
+        breakdown["total_loss"],
+        sum(row["loss"] for row in breakdown["rows"]),
+        "Topf2 Verlustspalte",
+    )
+    _assert_close(
+        breakdown["net"],
+        breakdown["total_gain"] + breakdown["total_loss"],
+        "Topf2 Netto",
+    )
+    adjustment = next(
+        row for row in breakdown["rows"]
+        if row["label"] == "Tageskurs-Anpassung"
+    )
+    _assert_close(adjustment["gain"], 30.0, "TK Gewinnanteil")
+    _assert_close(adjustment["loss"], 7.5, "TK Verlustanteil")
+    _assert_close(adjustment["net"], 37.5, "TK Netto")
+
+
 if __name__ == "__main__":
     test_stock_gain_flips_to_loss_before_tageskurs_split()
     test_no_invstg_gain_flips_to_loss_in_topf2()
     test_all_sign_transitions_reconcile()
+    test_topf2_breakdown_keeps_gross_columns_additive()
     print("OK: Tageskurs-Bruttozuordnung")

@@ -106,6 +106,14 @@ def test_kap_inv_tageskurs_delta_applies_tfs_per_isin():
     assert round(form_lines[14]["taxable_control_eur"], 2) == 133.00
     assert round(form_lines[26]["amount_raw_eur"], 2) == 190.00
     assert round(form_lines[26]["taxable_control_eur"], 2) == 190.00
+    form_details = {
+        detail["isin"]: detail for detail in rd["kap_inv_form"]["details"]
+    }
+    assert round(form_details["US78462F1030"]["sale_raw_eur"], 2) == 190.00
+    assert round(form_details["US78462F1030"]["tageskurs_raw_eur"], 2) == 100.00
+    assert round(
+        form_details["US78462F1030"]["sale_taxable_control_eur"], 2
+    ) == 133.00
 
 
 def test_kap_inv_form_aggregates_by_fund_type_and_blocks_unknowns():
@@ -164,6 +172,11 @@ def test_kap_inv_form_excludes_paid_distributions_per_isin():
     assert round(lines[4]["amount_raw_eur"], 2) == 100.00
     assert round(lines[4]["taxable_control_eur"], 2) == 70.00
     assert round(form["negative_distribution_details"][0]["paid_distribution_eur"], 2) == -50.00
+    assert round(form["details"][0]["distribution_raw_eur"], 2) == 100.00
+    assert round(form["details"][0]["distribution_paid_eur"], 2) == -50.00
+    assert round(
+        form["details"][0]["distribution_taxable_control_eur"], 2
+    ) == 70.00
     assert form["status"] == "paid_distribution_review_required"
 
     # Legacy-Fallback ohne Komponenten-Felder: netto-negative Ausschuettung

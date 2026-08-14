@@ -244,6 +244,65 @@ def test_pnl_summary_fallback_flags_unknown_category():
     print("  OK  pnl_summary-Fallback: unbekannte Kategorie gemeldet")
 
 
+def test_pnl_summary_fallback_ignores_history_trade_presence():
+    """Vorjahres-Trades duerfen den Summary-Fallback des Steuerjahrs nicht sperren."""
+    isin = "DE0000000001"
+    prior_trade = _trade(
+        "hist1", "STK", 25.0, symbol="HISTORY", isin=isin,
+        dateTime="2024-03-03 10:00:00", tradeDate="2024-03-03",
+        reportDate="2024-03-03",
+    )
+    report = _run(
+        [prior_trade],
+        summary_rows=[{
+            "assetCategory": "STK",
+            "subCategory": "",
+            "symbol": "HISTORY",
+            "description": "Current-year summary only",
+            "isin": isin,
+            "realizedSTProfit": "100",
+            "realizedLTProfit": "0",
+            "realizedSTLoss": "0",
+            "realizedLTLoss": "0",
+        }],
+    )
+
+    _assert_close(report["stocks_gain_eur"], 100.0, "Summary-Gewinn Steuerjahr")
+    _assert_close(report["zeile_20_stock_gains_eur"], 100.0, "Zeile 20")
+    assert report["audit"]["added_from_summary"] == 1
+    print("  OK  pnl_summary: Vorjahres-Trade sperrt Steuerjahr-Fallback nicht")
+
+
+def test_pnl_summary_unknown_etf_routes_to_kap_inv():
+    """Ein als ETF markierter Summary-only-Titel bleibt KAP-INV, auch ohne Lookup."""
+    isin = "DE0000000001"
+    report = _run(
+        [_trade("filler", "STK", 0.0, symbol="FILLER")],
+        summary_rows=[{
+            "assetCategory": "STK",
+            "subCategory": "ETF",
+            "symbol": "UNKNOWNETF",
+            "description": "Unknown ETF",
+            "isin": isin,
+            "realizedSTProfit": "125",
+            "realizedLTProfit": "0",
+            "realizedSTLoss": "-25",
+            "realizedLTLoss": "0",
+        }],
+    )
+
+    _assert_close(report["stocks_gain_eur"], 0.0, "ETF nicht in Topf 1")
+    _assert_close(report["options_gain_eur"], 0.0, "ETF nicht in Topf 2")
+    fund = report["kap_inv"]["etf_by_isin"][isin]
+    assert fund["classification"] is None
+    _assert_close(fund["gain"], 125.0, "KAP-INV-Gewinn roh")
+    _assert_close(fund["loss"], -25.0, "KAP-INV-Verlust roh")
+    assert isin in report["kap_inv"]["etf_unknown_isins"]
+    assert isin in report["kap_inv_form"]["blocked_isins"]
+    assert report["kap_inv_form"]["status"] == "classification_review_required"
+    print("  OK  pnl_summary: unbekannter ETF bleibt KAP-INV-Prueffall")
+
+
 def test_registry_helper_is_additive_and_skips_known_categories():
     registry = {}
     register_unrouted_category(registry, "WAR", 10.0, symbol="A")
@@ -392,6 +451,8 @@ if __name__ == "__main__":
     test_cash_rows_do_not_trigger_the_guard()
     test_pnl_summary_fallback_routes_warrants()
     test_pnl_summary_fallback_flags_unknown_category()
+    test_pnl_summary_fallback_ignores_history_trade_presence()
+    test_pnl_summary_unknown_etf_routes_to_kap_inv()
     test_registry_helper_is_additive_and_skips_known_categories()
     test_category_tables_are_consistent()
     test_fee_codes_are_reported_and_transaction_tax_requires_review()

@@ -132,6 +132,58 @@ class GermanDividendTaxTest(unittest.TestCase):
         self.assertEqual(round(report["zeile_38_solidaritaetszuschlag_eur"], 2), 3.95)
         self.assertEqual(round(report["zeile_41_withholding_tax_eur"], 2), 0.00)
 
+    def test_german_tax_on_german_fund_is_review_case_not_zeile_41(self):
+        """DE-KESt auf einem DE-Fonds ist inlaendischer Steuerabzug (§43 EStG).
+
+        Sie darf weder als "auslaendische" QSt in Zeile 41 landen (§32d Abs. 5
+        EStG erfasst nur auslaendische Steuern) noch zusaetzlich um die
+        Teilfreistellung gekuerzt werden. Da die Formularzuordnung nicht
+        automatisierbar ist, wird sie als sichtbarer Prueffall gemeldet.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            write_statement_of_funds(
+                tmp,
+                [
+                    {
+                        "activityCode": "DIV",
+                        "activityDescription": "DEFONDS Cash Dividend",
+                        "amount": "100",
+                        "assetCategory": "STK",
+                        "subCategory": "ETF",
+                        "currency": "EUR",
+                        "date": "2025-06-30",
+                        "fxRateToBase": "1",
+                        "isin": "DE0001234567",
+                        "reportDate": "2025-06-30",
+                        "symbol": "DEFONDS",
+                    },
+                    {
+                        "activityCode": "",
+                        "activityDescription": "DEFONDS Cash Dividend - DE Steuer",
+                        "amount": "-15",
+                        "assetCategory": "STK",
+                        "subCategory": "ETF",
+                        "currency": "EUR",
+                        "date": "2025-06-30",
+                        "fxRateToBase": "1",
+                        "isin": "DE0001234567",
+                        "reportDate": "2025-06-30",
+                        "symbol": "DEFONDS",
+                    },
+                ],
+            )
+
+            report = calculate_tax(tmp, tax_year=2025)
+
+        self.assertEqual(round(report["zeile_41_withholding_tax_eur"], 2), 0.00)
+        self.assertEqual(round(report["kap_inv"]["etf_wht_anrechenbar_eur"], 2), 0.00)
+        # Auch nicht als inlaendische KESt der Aktien-Schiene verbucht
+        self.assertEqual(round(report["zeile_37_kapitalertragsteuer_eur"], 2), 0.00)
+        review = report["audit"]["unhandled_activity_codes"]
+        de_fund = [e for e in review if e["code"] == "DE-Steuer auf Fonds"]
+        self.assertEqual(len(de_fund), 1)
+        self.assertEqual(round(de_fund[0]["amount_eur"], 2), -15.00)
+
 
 if __name__ == "__main__":
     unittest.main()

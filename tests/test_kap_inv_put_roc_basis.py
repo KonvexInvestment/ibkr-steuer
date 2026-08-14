@@ -24,6 +24,13 @@ SALE_PNL_IBKR = -464.99
 FX_OPEN = 0.92137
 FX_CLOSE = 0.85135
 QDTE_ISIN = "US77926X3044"
+# Klassifizierter sonstiger_fonds (0% TFS): identische Zahlenwerte wie der
+# unbestaetigte Fall, aber ohne Klassifikations-Blocker.
+CLASSIFIED_FUND_ISIN = "US78463V1070"
+PARTNERSHIP_ISINS = {
+    "USO": "US91232N2071",
+    "UNG": "US9123184098",
+}
 
 
 def assert_close(actual, expected, tol=0.001, label=""):
@@ -271,13 +278,18 @@ def test_same_year_qdte_restores_roc_and_premium_to_strike_basis():
 
     assert_close(report["kap_inv"]["etf_loss_raw_eur"], -770.046075,
                  label="QDTE KAP-INV loss before Tageskurs")
+    # Unbestaetigte Fondsart: der steuerpflichtige Tageskurs-Wert bleibt
+    # blockiert (0), bis die Klassifikation bestaetigt ist; der rohe Delta
+    # ist vollstaendig erfasst (Blocker-Semantik des Frontend-Redesigns,
+    # bestaetigter Pfad siehe test_same_year_classified_fund_...).
     tageskurs = get_kap_inv_tageskurs_delta_for_reporting(report)
-    assert_close(tageskurs, -280.08, label="QDTE KAP-INV Tageskurs")
-    assert_close(
-        report["kap_inv"]["etf_net_taxable_eur"] + tageskurs,
-        -1050.126075,
-        label="QDTE combined KAP-INV loss",
-    )
+    assert_close(tageskurs, 0.0, label="QDTE KAP-INV Tageskurs (blockiert)")
+    by_isin = report["fx_correction_kap_inv_by_isin"][QDTE_ISIN]
+    assert by_isin["classification_confirmed"] is False
+    assert_close(by_isin["raw_delta"], -280.08,
+                 label="QDTE KAP-INV Tageskurs roh")
+    assert_close(by_isin["taxable_delta"], 0.0,
+                 label="QDTE KAP-INV Tageskurs steuerpflichtig blockiert")
     assert QDTE_ISIN in report["kap_inv_form"]["blocked_isins"]
     assert report["kap_inv_form"]["status"] == \
         "classification_review_required"
@@ -285,6 +297,25 @@ def test_same_year_qdte_restores_roc_and_premium_to_strike_basis():
     assert len(audit) == 1 and audit[0]["source"] == "same_year_put"
     assert_close(audit[0]["amount_raw"], ROC_REDUCTION,
                  label="QDTE audit ROC amount")
+
+
+def test_same_year_classified_fund_reports_taxable_tageskurs():
+    report = calculate_case(isin=CLASSIFIED_FUND_ISIN)
+    sale = _sale_row(report, "QDTE")
+
+    assert_close(sale["cost"], 4000.0, label="classified fund basis")
+    assert_close(sale["invstg_basis_adjustment_raw"], ROC_REDUCTION,
+                 label="classified fund ROC-only adjustment")
+    tageskurs = get_kap_inv_tageskurs_delta_for_reporting(report)
+    assert_close(tageskurs, -280.08,
+                 label="classified fund KAP-INV Tageskurs")
+    assert_close(
+        report["kap_inv"]["etf_net_taxable_eur"] + tageskurs,
+        -1050.126075,
+        label="classified fund combined KAP-INV loss",
+    )
+    assert CLASSIFIED_FUND_ISIN not in \
+        report["kap_inv_form"]["blocked_isins"]
 
 
 def test_regular_stock_keeps_premium_only_correction():
@@ -326,11 +357,52 @@ def test_cross_year_qdte_uses_the_same_full_basis():
     assert len(audit) == 1 and audit[0]["source"] == "cross_year_put"
 
 
+def test_cross_year_partnership_puts_keep_premium_only_basis():
+    for symbol, isin in PARTNERSHIP_ISINS.items():
+        report = calculate_case(
+            symbol=symbol,
+            isin=isin,
+            is_fund=True,
+            assignment_date="2024-03-20",
+        )
+        sale = _sale_row(report, symbol)
+        correction = report["audit"]["cross_year_put_corrections"]
+        fx_lot = report["fx_correction_details"][0]
+
+        assert_close(sale["cost"], 3753.42,
+                     label=f"cross-year {symbol} premium-only basis")
+        assert_close(sale["stillhalter_adjustment_raw"], PREMIUM,
+                     label=f"cross-year {symbol} premium correction")
+        assert "invstg_basis_adjustment_raw" not in sale
+        assert len(correction) == 1
+        assert_close(
+            correction[0]["correction_per_share_raw"],
+            PREMIUM / 100,
+            label=f"cross-year {symbol} correction per share",
+        )
+        assert_close(
+            correction[0]["invstg_basis_extra_per_share_raw"],
+            0.0,
+            label=f"cross-year {symbol} no InvStG extra correction",
+        )
+        assert not report["audit"].get("invstg_put_basis_adjustments")
+        assert_close(fx_lot["cost"], 3753.42,
+                     label=f"cross-year {symbol} Tageskurs basis")
+        partnership = report["partnership_tax_items"][isin]
+        assert partnership["classification"] == "personengesellschaft"
+        assert partnership["excluded_from_automatic_tax_calculation"] is True
+
+
 if __name__ == "__main__":
     test_same_year_qdte_restores_roc_and_premium_to_strike_basis()
-    print("  OK  Same-Year QDTE: 4,000 USD basis and -280.08 EUR Tageskurs")
+    print("  OK  Same-Year QDTE: 4,000 USD basis, roher Tageskurs -280.08, "
+          "steuerpflichtig blockiert bis Bestaetigung")
+    test_same_year_classified_fund_reports_taxable_tageskurs()
+    print("  OK  Klassifizierter Fonds: -280.08 EUR Tageskurs steuerwirksam")
     test_regular_stock_keeps_premium_only_correction()
     print("  OK  Regular stock control: premium-only behavior unchanged")
     test_cross_year_qdte_uses_the_same_full_basis()
     print("  OK  Cross-Year QDTE: same full-basis correction")
+    test_cross_year_partnership_puts_keep_premium_only_basis()
+    print("  OK  Cross-Year USO/UNG: premium-only, no InvStG basis restore")
     print("OK: Issue #88 KAP-INV put/ROC basis")

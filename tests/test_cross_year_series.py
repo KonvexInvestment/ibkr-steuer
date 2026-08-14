@@ -1790,6 +1790,58 @@ def test_worthless_expiry_without_history_warns_unmatched():
     print("    NOHIST 499.00 als doppelt-versteuert-Risiko gemeldet")
 
 
+def test_prior_put_assignment_without_original_sell_warns_unmatched():
+    """Cross-Year-Andienung ohne Original-SELL muss als Prueffall erscheinen."""
+    trades = [
+        make_assignment(
+            "2024-12-20", 1, strike="100", expiry="2024-12-20",
+            underlying="NOSELL",
+        ),
+    ]
+    rd = calculate_for_trades(trades, tax_year=2025)
+
+    unmatched = rd["audit"].get("stillhalter_unmatched", [])
+    assert len(unmatched) == 1, \
+        f"Cross-Year-Andienung ohne SELL nicht eindeutig gemeldet: {unmatched}"
+    item = unmatched[0]
+    assert item["type"] == "cross_year"
+    assert item["symbol"].startswith("NOSELL")
+    assert item["putCall"] == "P"
+    assert item["quantity"] == 1
+
+    print("  TC44 Cross-Year-Andienung ohne Original-SELL warnt: OK")
+
+
+def test_unrelated_prior_put_without_sell_does_not_warn_current_report():
+    """Alte Andienung ohne im Steuerjahr geschlossenes Lot ist kein Prueffall."""
+    trades = [
+        make_assignment(
+            "2022-12-30", 1, strike="100", expiry="2022-12-30",
+            underlying="OLDPUT",
+        ),
+    ]
+    closed_lots = [{
+        "assetCategory": "STK",
+        "reportDate": "2025-06-30",
+        "dateTime": "2025-06-30 10:00:00",
+        "openDateTime": "2024-01-15 10:00:00",
+        "quantity": "100",
+        "symbol": "OTHER",
+        "underlyingSymbol": "OTHER",
+    }]
+    rd = calculate_for_trades(
+        trades, tax_year=2025, closed_lots=closed_lots,
+    )
+
+    unmatched = rd["audit"].get("stillhalter_unmatched", [])
+    assert unmatched == [], (
+        "Eine historische Andienung ohne aktuellen Closed-Lot-Bezug darf den "
+        f"Steuerjahresbericht nicht warnen: {unmatched}"
+    )
+
+    print("  TC45 Irrelevante Alt-Andienung erzeugt keine aktuelle Warnung: OK")
+
+
 def test_occ_renamed_series_close_matches_original_sell():
     """TC33: OCC-Umbenennung (Spinoff): Close unter MMM1 schliesst den SELL unter MMM.
 
@@ -2490,6 +2542,8 @@ if __name__ == "__main__":
     test_call_assignment_open_short_is_not_an_error()
     test_call_correction_targets_assignment_row_not_unrelated_same_day_trade()
     test_worthless_expiry_without_history_warns_unmatched()
+    test_prior_put_assignment_without_original_sell_warns_unmatched()
+    test_unrelated_prior_put_without_sell_does_not_warn_current_report()
     test_put_correction_prefers_matching_lot_cost_row()
     test_occ_renamed_series_close_matches_original_sell()
     test_occ_family_prefers_exact_series()
@@ -2502,4 +2556,4 @@ if __name__ == "__main__":
     test_long_put_exercise_evidence_is_quantity_capped()
     test_long_put_exercise_override_requires_embedded_premium()
     test_correction_stage3_respects_target_direction()
-    print("\nOK: alle 43 TCs gruen")
+    print("\nOK: alle 45 TCs gruen")
