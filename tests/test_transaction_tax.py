@@ -124,6 +124,24 @@ def _assert_close(actual, expected, label):
         raise AssertionError(f"{label}: erwartet {expected}, aktuell {actual}")
 
 
+def _with_compact_dates(rows):
+    compact_rows = []
+    for source in rows:
+        row = dict(source)
+        for field in ('date', 'reportDate', 'tradeDate'):
+            if row.get(field):
+                row[field] = row[field].replace('-', '')
+        for field in ('dateTime', 'openDateTime'):
+            if not row.get(field):
+                continue
+            date_part, time_part = row[field].split(';', 1)
+            row[field] = (
+                date_part.replace('-', '') + ';' + time_part.replace(':', '')
+            )
+        compact_rows.append(row)
+    return compact_rows
+
+
 def test_real_option_pattern_applies_open_and_close_tax():
     symbol = "ITALYOPT DEC25 14 C"
     trades = [
@@ -154,6 +172,29 @@ def test_real_option_pattern_applies_open_and_close_tax():
     assert audit["applied_count"] == 2
     _assert_close(audit["applied_eur"], 0.05, "angewandte TTAX")
     print("  OK  Reales Optionsmuster: Kauf- und Verkaufs-TTAX in Topf 2")
+
+
+def test_compact_dates_preserve_closed_lot_and_tax_matching():
+    symbol = "ITALYOPT DEC25 14 C"
+    trades = _with_compact_dates([
+        _trade("OPEN", "C1", symbol, "2025-04-10", "BUY", "O", 0, 1),
+        _trade("CLOSE", "C1", symbol, "2025-08-20", "SELL", "C", 216, -1),
+    ])
+    funds = _with_compact_dates([
+        _ttax("OPEN", "C1", symbol, "2025-04-10", -0.025),
+        _ttax("CLOSE", "C1", symbol, "2025-08-20", -0.025),
+    ])
+    lots = _with_compact_dates([_closed_lot(
+        "C1", symbol, "2025-04-10", "2025-08-20", 1, 216,
+    )])
+    report = _run(trades, funds, lots)
+
+    _assert_close(report["options_gain_eur"], 215.95, "kompakter TTAX-Match")
+    detail = [r for r in report["trade_details"] if r["symbol"] == symbol][0]
+    assert detail["reportDate"] == "2025-08-20"
+    assert detail["dateTime"] == "2025-08-20 10:00:00"
+    assert report["audit"]["transaction_tax"]["applied_count"] == 2
+    print("  OK  Kompakte Daten: CLOSED_LOT- und TTAX-Matching unveraendert")
 
 
 def test_open_tax_is_allocated_partially_across_years():
@@ -271,6 +312,7 @@ def test_short_option_open_tax_stays_manual_review():
 
 if __name__ == "__main__":
     test_real_option_pattern_applies_open_and_close_tax()
+    test_compact_dates_preserve_closed_lot_and_tax_matching()
     test_open_tax_is_allocated_partially_across_years()
     test_trade_taxes_field_prevents_double_counting()
     test_break_even_close_becomes_topf2_loss()

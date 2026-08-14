@@ -3,22 +3,49 @@ import csv
 import os
 import sys
 
+from ibkr_dates import (
+    is_supported_ibkr_date,
+    normalize_ibkr_date,
+    normalize_ibkr_row,
+)
+
 FX_FIELDS = ['date', 'settleDate', 'currency', 'fxRateToBase', 'activityCode',
               'activityDescription', 'amount', 'debit', 'credit', 'balance',
               'transactionID', 'levelOfDetail', 'assetCategory', 'symbol',
               'buySell', 'tradeQuantity', 'tradePrice', 'tradeGross',
               'tradeCommission']
 
+
+def get_statement_period(stmt):
+    """Return a validated, ISO-normalized FlexStatement period."""
+    if stmt is None:
+        return '', ''
+    raw_from = stmt.get('fromDate', '')
+    raw_to = stmt.get('toDate', '')
+    invalid = [
+        field for field, value in (
+            ('fromDate', raw_from), ('toDate', raw_to)
+        )
+        if value and not is_supported_ibkr_date(value)
+    ]
+    if invalid:
+        raise ValueError(
+            'Nicht unterstütztes IBKR-Datumsformat in '
+            + ', '.join(invalid)
+        )
+    return normalize_ibkr_date(raw_from), normalize_ibkr_date(raw_to)
+
+
 def extract_conversion_rates(root):
     """Extract ConversionRate elements (official IBKR daily rates) from XML."""
     rows = []
     for cr in root.findall('.//ConversionRate'):
-        rows.append({
+        rows.append(normalize_ibkr_row({
             'reportDate': cr.get('reportDate', ''),
             'fromCurrency': cr.get('fromCurrency', ''),
             'toCurrency': cr.get('toCurrency', ''),
             'rate': cr.get('rate', ''),
-        })
+        }))
     return rows
 
 
@@ -31,7 +58,7 @@ def extract_fx_from_root(root, base_curr, fx_fields=None):
         return []
     fx_rows = []
     for row in stmtfunds_node:
-        attrib = row.attrib
+        attrib = normalize_ibkr_row(row.attrib)
         if attrib.get('levelOfDetail') != 'Currency':
             continue
         if attrib.get('currency') == base_curr:
@@ -51,7 +78,7 @@ def extract_trades_from_root(root):
     for row in trades_node:
         if row.tag != 'Trade':
             continue
-        attrib = row.attrib
+        attrib = normalize_ibkr_row(row.attrib)
         lod = attrib.get('levelOfDetail', '')
         if lod and lod != 'EXECUTION':
             continue
@@ -77,12 +104,15 @@ def extract_fx_multi_xml(xml_files, output_dir):
             t = ET.parse(path)
             stmt = t.getroot().find('.//FlexStatement')
             if stmt is not None:
+                from_date, to_date = get_statement_period(stmt)
                 return {
                     'path': path,
-                    'from_date': stmt.attrib.get('fromDate', ''),
-                    'to_date': stmt.attrib.get('toDate', ''),
+                    'from_date': from_date,
+                    'to_date': to_date,
                 }
-        except Exception:
+        except ValueError:
+            raise
+        except (OSError, ET.ParseError):
             pass
         return {'path': path, 'from_date': '', 'to_date': ''}
 
@@ -181,7 +211,7 @@ def extract_fx_multi_xml(xml_files, output_dir):
             from_date = ''
             stmt = r.find('.//FlexStatement')
             if stmt is not None:
-                from_date = stmt.attrib.get('fromDate', '')
+                from_date, _ = get_statement_period(stmt)
             print(f"  {os.path.basename(xml_path)}: {len(rows)} FX-Einträge (ab {from_date})")
             all_fx.extend(rows)
         except Exception as e:
@@ -287,8 +317,11 @@ def extract_quarterly_xmls(xml_files, output_dir):
     def get_from_date(path):
         try:
             stmt = ET.parse(path).getroot().find('.//FlexStatement')
-            return stmt.get('fromDate', '') if stmt is not None else ''
-        except Exception:
+            from_date, _ = get_statement_period(stmt)
+            return from_date
+        except ValueError:
+            raise
+        except (OSError, ET.ParseError):
             return ''
 
     xml_files = sorted(xml_files, key=get_from_date)
@@ -318,8 +351,7 @@ def extract_quarterly_xmls(xml_files, output_dir):
             continue
 
         stmt = root.find('.//FlexStatement')
-        from_date = stmt.get('fromDate', '') if stmt is not None else ''
-        to_date = stmt.get('toDate', '') if stmt is not None else ''
+        from_date, to_date = get_statement_period(stmt)
         print(f"  {os.path.basename(xml_path)}: {from_date} – {to_date}")
 
         # AccountInfo (from first XML)
@@ -334,7 +366,7 @@ def extract_quarterly_xmls(xml_files, output_dir):
         trades_node = root.find('.//Trades')
         if trades_node is not None:
             for row in trades_node:
-                attrib = row.attrib
+                attrib = normalize_ibkr_row(row.attrib)
                 lod = attrib.get('levelOfDetail', '')
 
                 # Lot / CLOSED_LOT
@@ -368,7 +400,7 @@ def extract_quarterly_xmls(xml_files, output_dir):
         stmtfunds = root.find('.//StmtFunds')
         if stmtfunds is not None:
             for row in stmtfunds:
-                attrib = row.attrib
+                attrib = normalize_ibkr_row(row.attrib)
                 act = attrib.get('activityDescription', '')
 
                 # Starting Balance: only keep from earliest XML (Q1)
@@ -396,7 +428,7 @@ def extract_quarterly_xmls(xml_files, output_dir):
         secinfo = root.find('.//SecuritiesInfo')
         if secinfo is not None:
             for row in secinfo:
-                attrib = row.attrib
+                attrib = normalize_ibkr_row(row.attrib)
                 key = attrib.get('isin', '') or attrib.get('conid', '') or attrib.get('symbol', '')
                 if key not in instruments_seen:
                     instruments_seen.add(key)
@@ -409,7 +441,7 @@ def extract_quarterly_xmls(xml_files, output_dir):
         ct_node = root.find('.//CashTransactions')
         if ct_node is not None:
             for row in ct_node:
-                attrib = row.attrib
+                attrib = normalize_ibkr_row(row.attrib)
                 key = (attrib.get('transactionID', ''), attrib.get('dateTime', ''),
                        attrib.get('type', ''))
                 if key not in cash_seen:
@@ -423,7 +455,7 @@ def extract_quarterly_xmls(xml_files, output_dir):
         ca_node = root.find('.//CorporateActions')
         if ca_node is not None:
             for row in ca_node:
-                attrib = row.attrib
+                attrib = normalize_ibkr_row(row.attrib)
                 key = (attrib.get('transactionID', ''), attrib.get('dateTime', ''))
                 if key not in corp_seen:
                     corp_seen.add(key)
@@ -436,7 +468,7 @@ def extract_quarterly_xmls(xml_files, output_dir):
         pnl_node = root.find('.//FIFOPerformanceSummaryInBase')
         if pnl_node is not None:
             for row in pnl_node:
-                attrib = row.attrib
+                attrib = normalize_ibkr_row(row.attrib)
                 pnl_headers.update(attrib.keys())
                 ac = attrib.get('assetCategory', '')
                 sym = attrib.get('symbol', '')
@@ -672,7 +704,7 @@ def parse_ibkr_xml(xml_file_path, output_dir):
         skipped = 0
 
         for row in rows:
-            attrib = row.attrib
+            attrib = normalize_ibkr_row(row.attrib)
 
             # For Trades: only keep EXECUTION-level rows (real trades).
             # CLOSED_LOT rows are saved separately for per-lot FX correction.
@@ -764,7 +796,7 @@ def parse_ibkr_xml(xml_file_path, output_dir):
         mtm_rows = []
         mtm_headers = set()
         for row in mtm_section:
-            attrib = row.attrib
+            attrib = normalize_ibkr_row(row.attrib)
             if attrib.get('assetCategory') != 'CASH':
                 continue
             if attrib.get('symbol') == base_curr:
@@ -803,10 +835,11 @@ def parse_ibkr_xml(xml_file_path, output_dir):
     flex_stmt = root.find('.//FlexStatement')
     tax_year_detected = None
     if flex_stmt is not None:
-        to_date = flex_stmt.get('toDate', '')
+        from_date, to_date = get_statement_period(flex_stmt)
         if to_date and len(to_date) >= 4:
             tax_year_detected = to_date[:4]
-            print(f"Steuerjahr erkannt: {tax_year_detected} (Zeitraum: {flex_stmt.get('fromDate', '?')} – {to_date})")
+            print(f"Steuerjahr erkannt: {tax_year_detected} "
+                  f"(Zeitraum: {from_date or '?'} – {to_date})")
 
     # Detect and extract FxTransactions (IBKR's own FIFO PnL per FX event)
     fx_trans_node = root.find('.//FxTransactions')
@@ -818,7 +851,9 @@ def parse_ibkr_xml(xml_file_path, output_dir):
                          'code', 'levelOfDetail']
         fx_pnl_rows = []
         for elem in fx_trans_node:
-            row = {field: elem.get(field, '') for field in fx_pnl_fields}
+            row = normalize_ibkr_row({
+                field: elem.get(field, '') for field in fx_pnl_fields
+            })
             if row.get('levelOfDetail') == 'TRANSACTION' and row.get('realizedPL'):
                 fx_pnl_rows.append(row)
         if fx_pnl_rows:

@@ -1842,6 +1842,46 @@ def test_unrelated_prior_put_without_sell_does_not_warn_current_report():
     print("  TC45 Irrelevante Alt-Andienung erzeugt keine aktuelle Warnung: OK")
 
 
+def test_cross_year_assignment_matches_prior_sell_across_date_formats():
+    """TC46: Vorjahres-SELL (ISO) matcht Steuerjahr-Andienung im Kompaktformat.
+
+    Flex Queries koennen pro Query unterschiedlich konfigurierte Datumsformate
+    liefern (Issue #90: yyyyMMdd + Semikolon-Separator als IBKR-Default). Nach
+    der Normalisierung in load_csv muessen expiry-Keys und Datums-Slices
+    identisch sein — sonst verfehlt der Cross-Year-Pfad den Original-SELL und
+    die Praemie faellt als Prueffall aus, obwohl die Daten vollstaendig sind.
+    """
+    def compact(row):
+        row = dict(row)
+        for field in ("tradeDate", "reportDate", "expiry"):
+            row[field] = row[field].replace("-", "")
+        date_part, time_part = row["dateTime"].split(" ", 1)
+        row["dateTime"] = (
+            date_part.replace("-", "") + ";" + time_part.replace(":", "")
+        )
+        return row
+
+    trades = [
+        make_sell("2024-11-15", 1, 2.00, strike="100", expiry="2025-06-20",
+                  underlying="MIXFMT"),
+        compact(make_assignment("2025-06-20", 1, strike="100",
+                                expiry="2025-06-20", underlying="MIXFMT")),
+    ]
+    rd = calculate_for_trades(trades, tax_year=2025)
+
+    unmatched = rd["audit"].get("stillhalter_unmatched", [])
+    assert unmatched == [], (
+        f"Gemischte Datumsformate duerfen keinen Prueffall erzeugen: {unmatched}"
+    )
+    assert_close(rd["audit"]["cross_year_premium_eur"], 1 * 2.00 * 100 - 1,
+                 label="TC46 cross_year_premium")
+    details = rd["audit"].get("stillhalter_details", [])
+    assert any(d.get("is_cross_year") for d in details), \
+        "Cross-Year-Detail fehlt trotz Vorjahres-SELL"
+
+    print("  TC46 Gemischte IBKR-Datumsformate im Cross-Year-Match: OK")
+
+
 def test_occ_renamed_series_close_matches_original_sell():
     """TC33: OCC-Umbenennung (Spinoff): Close unter MMM1 schliesst den SELL unter MMM.
 
@@ -2544,6 +2584,7 @@ if __name__ == "__main__":
     test_worthless_expiry_without_history_warns_unmatched()
     test_prior_put_assignment_without_original_sell_warns_unmatched()
     test_unrelated_prior_put_without_sell_does_not_warn_current_report()
+    test_cross_year_assignment_matches_prior_sell_across_date_formats()
     test_put_correction_prefers_matching_lot_cost_row()
     test_occ_renamed_series_close_matches_original_sell()
     test_occ_family_prefers_exact_series()
@@ -2556,4 +2597,4 @@ if __name__ == "__main__":
     test_long_put_exercise_evidence_is_quantity_capped()
     test_long_put_exercise_override_requires_embedded_premium()
     test_correction_stage3_respects_target_direction()
-    print("\nOK: alle 45 TCs gruen")
+    print("\nOK: alle 46 TCs gruen")

@@ -6,23 +6,45 @@ import sys
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 
+from ibkr_dates import (
+    normalize_ibkr_datetime,
+    normalize_ibkr_row,
+    parse_ibkr_date,
+    unsupported_date_fields,
+)
+
+
 def load_csv(filepath):
     if not os.path.exists(filepath):
         return []
     with open(filepath, 'r', encoding='utf-8') as f:
-        return list(csv.DictReader(f))
+        rows = list(csv.DictReader(f))
+
+    invalid_fields = defaultdict(int)
+    for row in rows:
+        for field in unsupported_date_fields(row):
+            invalid_fields[field] += 1
+    if invalid_fields:
+        details = ', '.join(
+            f'{field}: {count}' for field, count in sorted(invalid_fields.items())
+        )
+        raise ValueError(
+            f"Nicht unterstütztes IBKR-Datumsformat in "
+            f"{os.path.basename(filepath)} ({details}). Erwartet werden "
+            f"YYYY-MM-DD oder YYYYMMDD, optional mit IBKR-Uhrzeit."
+        )
+    return [normalize_ibkr_row(row) for row in rows]
+
 
 def parse_date(date_str):
-    """Parst IBKR-Datumsfelder (2025-01-01 oder 2025-01-01 20:20:00).
+    """Parst ISO- und kompakte IBKR-Datumsfelder.
 
     Liefert None fuer leere/unparsbare Werte — Aufrufer behandeln None als
     "kein Datum". Nur erwartbare Parse-Fehler werden gefangen; System-
     Exceptions (KeyboardInterrupt etc.) laufen durch.
     """
-    try:
-        return datetime.strptime(date_str[:10], '%Y-%m-%d').date()
-    except (ValueError, TypeError):
-        return None
+    return parse_ibkr_date(date_str)
+
 
 def safe_float(val, default=0.0):
     """Convert to float, returning default for empty strings or None."""
@@ -473,14 +495,11 @@ def get_wht_event_status_label(status):
 
 
 def format_german_date(iso_date):
-    """Format 'YYYY-MM-DD' (optionally with time suffix) as 'DD.MM.YYYY'."""
-    if not iso_date:
+    """Format a supported IBKR date as ``DD.MM.YYYY``."""
+    parsed = parse_date(iso_date)
+    if parsed is None:
         return ''
-    date_part = str(iso_date)[:10]
-    parts = date_part.split('-')
-    if len(parts) == 3 and all(parts):
-        return f'{parts[2]}.{parts[1]}.{parts[0]}'
-    return str(iso_date)
+    return parsed.strftime('%d.%m.%Y')
 
 
 def build_wht_review_rows(review_items, etf_by_isin=None):
@@ -2976,7 +2995,8 @@ def _build_tageskurs_put_adjustments(same_year_lots, xy_tageskurs_lots,
 
 def _tageskurs_close_timestamp(row):
     """Normalisierter Close-Timestamp (YYYY-MM-DD HH:MM:SS) einer Trade-/Lot-Row."""
-    value = (row.get('dateTime') or row.get('reportDate') or '').replace(';', ' ')
+    value = normalize_ibkr_datetime(
+        row.get('dateTime') or row.get('reportDate') or '')
     return value[:19]
 
 
@@ -3393,8 +3413,8 @@ def _dedupe_funds(all_funds):
 
 
 def _normalize_ibkr_timestamp(value):
-    """Normalisiert IBKRs ``YYYY-MM-DD;HH:MM:SS``-/Space-Varianten."""
-    return (value or '').strip().replace(';', ' ')
+    """Normalisiert ISO- und kompakte IBKR-Timestamps."""
+    return normalize_ibkr_datetime(value or '')
 
 
 def _trade_value_eur(value_raw, trade, base_currency, usd_to_eur_rates):

@@ -25,6 +25,7 @@ from streamlit.testing.v1 import AppTest  # noqa: E402
 APP_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py",
 )
+INDEX_PATH = os.path.join(os.path.dirname(APP_PATH), "index.html")
 
 SYNTHETIC_BODY = """
       <Trades>
@@ -71,6 +72,31 @@ def make_dataset(named_xmls, csv=None):
     }
 
 
+def make_compact_xml():
+    """IBKR defaults: yyyyMMdd, HHmmss and semicolon separator."""
+    body = SYNTHETIC_BODY
+    replacements = {
+        "2025-03-10 10:00:00": "20250310;100000",
+        "2025-04-10 10:00:00": "20250410;100000",
+        "2025-03-10": "20250310",
+        "2025-04-10": "20250410",
+        "2025-05-15": "20250515",
+    }
+    for old, new in replacements.items():
+        body = body.replace(old, new)
+    return make_xml(body=body, from_date="20250101", to_date="20251231")
+
+
+def make_csv_entry():
+    data = b"Dividenden,Data,Gesamt Dividenden in EUR,,,100.00\n"
+    return {
+        'name': 'ibkr_report.csv',
+        'digest': ui_model.file_digest(data),
+        'kind': 'csv',
+        'data': data,
+    }
+
+
 def run_app(dataset=None, nav=None, session=None):
     at = AppTest.from_file(APP_PATH, default_timeout=300)
     if dataset is not None:
@@ -107,6 +133,12 @@ def test_start_screen_without_dataset():
     assert all(button.label != "Beispielbericht ansehen" for button in at.button)
 
 
+def test_stlite_bundle_includes_date_normalizer():
+    with open(INDEX_PATH, encoding='utf-8') as handle:
+        index_html = handle.read()
+    assert '"ibkr_dates.py": { url: "./ibkr_dates.py" }' in index_html
+
+
 def test_all_pages_render_and_nav_normalizes():
     dataset = make_dataset([("synthetic_2025.xml", make_xml())])
     at = run_app(dataset)
@@ -125,6 +157,28 @@ def test_all_pages_render_and_nav_normalizes():
     at.session_state['nav'] = 'gibt_es_nicht'
     at.run()
     assert at.session_state['nav'] == 'overview'
+
+
+def test_compact_dates_and_optional_csv_preserve_expected_values():
+    dataset = make_dataset(
+        [("compact_2025.xml", make_compact_xml())],
+        csv=make_csv_entry(),
+    )
+    at = run_app(dataset)
+    assert_no_exception(at, "kompakte IBKR-Datumswerte mit CSV")
+
+    payload = at.session_state['snapshot']['payload']
+    report = payload['merged']
+    assert payload['csv_present'] is True
+    assert payload['csv_enabled'] is True
+    assert report['zeile_19_netto_eur'] == 280.0
+    assert report['zeile_20_stock_gains_eur'] == 180.0
+    assert report['dividends_eur'] == 100.0
+    assert report['zeile_41_withholding_tax_eur'] == 15.0
+    assert report['csv_income_totals']['dividends_eur'] == 100.0
+    assert len(report['trade_details']) == 2
+    assert report['trade_details'][0]['reportDate'] == '2025-03-10'
+    assert report['trade_details'][0]['dateTime'] == '2025-03-10 10:00:00'
 
 
 def test_widget_persistence_fund_confirmation_survives_navigation():
@@ -341,7 +395,9 @@ def test_guidance_copy_and_rechenwege_grouping():
 if __name__ == '__main__':
     tests = [
         test_start_screen_without_dataset,
+        test_stlite_bundle_includes_date_normalizer,
         test_all_pages_render_and_nav_normalizes,
+        test_compact_dates_and_optional_csv_preserve_expected_values,
         test_widget_persistence_fund_confirmation_survives_navigation,
         test_compute_cache_hits_on_navigation_and_recomputes_on_compute_toggle,
         test_dataset_switch_resets_domain_state_and_nav,

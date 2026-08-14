@@ -37,6 +37,7 @@ from etf_classification import (
     get_etf_info,
     is_anlage_so,
 )
+from ibkr_dates import is_supported_ibkr_date, normalize_ibkr_date
 
 st.set_page_config(
     page_title="IBKR Steuerbericht",
@@ -836,10 +837,27 @@ def classify_xmls(xml_files):
             stmt = all_stmts[0]
             acct = stmt.find('.//AccountInformation')
             account_id = stmt.get('accountId', 'unknown')
+            raw_from_date = stmt.get('fromDate', '')
+            raw_to_date = stmt.get('toDate', '')
+            invalid_period_fields = [
+                field for field, value in (
+                    ('fromDate', raw_from_date), ('toDate', raw_to_date)
+                )
+                if value and not is_supported_ibkr_date(value)
+            ]
+            if invalid_period_fields:
+                invalid_files.append({
+                    'name': xml_file.name,
+                    'reason': (
+                        'nicht unterstütztes Datumsformat in '
+                        + ', '.join(invalid_period_fields)
+                    ),
+                })
+                continue
             entry = {
                 'file': xml_file,
-                'from_date': stmt.get('fromDate', ''),
-                'to_date': stmt.get('toDate', ''),
+                'from_date': normalize_ibkr_date(raw_from_date),
+                'to_date': normalize_ibkr_date(raw_to_date),
                 'name': xml_file.name,
                 'account_name': acct.get('name', '') if acct is not None else '',
                 'currency': acct.get('currency', 'EUR') if acct is not None else 'EUR',
@@ -4229,7 +4247,7 @@ Aus `statement_of_funds.csv` werden Cash-Positionen nach `activityCode` zugeordn
 | `CFD` | CFD-Zinsen und -Gebühren | Habenzinsen in Topf 2, Finanzierungskosten wie `DINT` nur nachrichtlich |
 | `FRTAX` / `WHT` | Quellensteuer (Withholding Tax) | Zeile 41 (anrechenbar). Ausnahmen: deutsche Kapitalertragsteuer auf DE-Wertpapieren geht nach Zeile 37/38; liegt sie auf einem DE-Fonds, wird sie als Prüffall gemeldet, da §32d Abs. 5 EStG nur ausländische Steuern erfasst und die Formularzuordnung nicht automatisierbar ist |
 | `OFEE` / `STAX` | Gebühren, Umsatzsteuer | Nicht abziehbar (§20 Abs. 9), nur nachrichtlich |
-| `TTAX` | Transaktionssteuer | Nach §20 Abs. 4 EStG ergebniswirksam. Bei eindeutigem Match wird die Verkaufssteuer sofort und die Kaufsteuer über das geschlossene Lot anteilig im realisierten Ergebnis berücksichtigt. Bereits in `Trade.taxes` enthaltene Beträge werden nicht doppelt abgezogen; nicht eindeutige Fälle bleiben Prüffälle |
+| `TTAX` | Transaktionssteuer | Nach §20 Abs. 4 EStG ergebniswirksam. Bei eindeutigem Match wird die Verkaufssteuer sofort und die Kaufsteuer über das geschlossene Lot anteilig im realisierten Ergebnis berücksichtigt. Bereits in `Trade.taxes` enthaltene Beträge werden nicht doppelt abgezogen. Prüffall bleiben nicht eindeutige Zuordnungen, Steuern auf Stillhalter-Eröffnungen (Zufluss im Eröffnungsjahr, §11 EStG) sowie Instrumente mit eigenem Rechenweg (Anlage SO, Personengesellschaften) |
 | `BUY` / `SELL` / `ADJ` / `ASSIGN` / `EXE` | Trade- und Settlement-Buchungen | Übersprungen; das realisierte Ergebnis kommt aus den Trade-Daten |
 | `DEP` / `WITH` | Ein- und Auszahlungen | Übersprungen; kein eigener Kapitalertrag |
 | `FOREX` | Devisenumsatz | Übersprungen; das Ergebnis kommt aus der separaten FX-Rechnung |

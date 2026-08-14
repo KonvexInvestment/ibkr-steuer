@@ -37,6 +37,36 @@ def read_csv(path):
         return list(csv.DictReader(f))
 
 
+def test_mixed_period_formats_sort_and_normalize_quarterly_xmls():
+    with tempfile.TemporaryDirectory() as tmp:
+        q1 = write_xml(tmp, "q1.xml", "2025-01-01", "2025-03-31", """
+      <StmtFunds>
+        <StatementOfFunds transactionID="Q1" levelOfDetail="Detail"
+               activityCode="DIV" date="2025-02-15" reportDate="2025-02-15"
+               currency="EUR" amount="10" fxRateToBase="1" />
+      </StmtFunds>
+""")
+        q2 = write_xml(tmp, "q2.xml", "20250401", "20250630", """
+      <StmtFunds>
+        <StatementOfFunds transactionID="Q2" levelOfDetail="Detail"
+               activityCode="DIV" date="20250515" reportDate="20250515"
+               currency="EUR" amount="20" fxRateToBase="1" />
+      </StmtFunds>
+""")
+        out_dir = os.path.join(tmp, "out")
+        os.mkdir(out_dir)
+        with contextlib.redirect_stdout(io.StringIO()):
+            extract_quarterly_xmls([q2, q1], out_dir)
+
+        funds = read_csv(os.path.join(out_dir, "statement_of_funds.csv"))
+        assert [row["transactionID"] for row in funds] == ["Q1", "Q2"]
+        assert [row["reportDate"] for row in funds] == [
+            "2025-02-15", "2025-05-15",
+        ]
+        account_info = read_csv(os.path.join(out_dir, "account_info.csv"))
+        assert account_info[0]["tax_year"] == "2025"
+
+
 def test_quarterly_tax_year_with_history_keeps_tax_year_sections():
     with tempfile.TemporaryDirectory() as tmp:
         history = write_xml(tmp, "history_2024.xml", "2024-01-01", "2024-12-31", """
@@ -309,6 +339,8 @@ def test_parse_ibkr_xml_rejects_non_flex_xml():
 
 
 if __name__ == "__main__":
+    test_mixed_period_formats_sort_and_normalize_quarterly_xmls()
+    print("OK: gemischte Quartals-Datumsformate werden normalisiert")
     test_quarterly_tax_year_with_history_keeps_tax_year_sections()
     print("OK: quarterly-history extraction")
     test_repeated_transaction_id_keeps_every_ledger_row()
