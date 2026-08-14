@@ -1356,7 +1356,7 @@ def render_classification_catalog(
         'Nachweis': row['evidence_label'],
         'Kurzbegründung': row['decision_reason'],
     } for row in filtered_rows]
-    st.dataframe(table_rows, width="stretch", hide_index=True)
+    st.dataframe(table_rows, use_container_width=True, hide_index=True)
 
     row_by_isin = {row['isin']: row for row in filtered_rows}
     selected_isin = st.selectbox(
@@ -1686,7 +1686,7 @@ with st.sidebar:
             "Alle Daten entfernen",
             key="_ui_reset_all",
             on_click=_reset_all_data,
-            width="stretch",
+            use_container_width=True,
         )
     _nav_slot = st.container()
     st.markdown('<div class="eyebrow" style="margin-top:1.1rem;">Berechnung</div>',
@@ -2159,7 +2159,7 @@ with _nav_slot:
                 key=f"_ui_nav_{_page_id}",
                 icon=_nav_icons.get(_page_id),
                 type="primary" if _page_id == _nav_current else "tertiary",
-                width="stretch",
+                use_container_width=True,
                 on_click=_select_nav,
                 args=(_page_id,),
             )
@@ -3267,7 +3267,7 @@ def render_kap_inv():
                     'Anrechenbar': fmt_de(row['creditable_tax_eur']),
                     'Status': row['status_label'],
                 })
-            st.dataframe(review_df_rows, width="stretch",
+            st.dataframe(review_df_rows, use_container_width=True,
                          hide_index=True)
             st.caption("Alle Beträge in EUR.")
 
@@ -5100,7 +5100,7 @@ def render_export():
             file_name=f"steuerbericht_{steuerjahr}.xlsx",
             mime=("application/vnd.openxmlformats-officedocument."
                   "spreadsheetml.sheet"),
-            width="stretch",
+            use_container_width=True,
         )
 
     section_title("Textreport")
@@ -5109,7 +5109,7 @@ def render_export():
         data=exports['txt'],
         file_name=f"steuerbericht_{steuerjahr}.txt",
         mime="text/plain",
-        width="stretch",
+        use_container_width=True,
     )
     with st.expander("Report als Text anzeigen (zum Kopieren)"):
         st.code(exports['txt'], language=None)
