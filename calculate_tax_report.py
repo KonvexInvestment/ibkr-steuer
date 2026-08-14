@@ -2499,42 +2499,104 @@ def _correction_matches_row(corr, row):
     return not corr_close_date or corr_close_date == row_close_date
 
 
-def _put_assignment_lot_cost_correction_per_share(
-        closed_lots, det, underlying, shares, default_per_share,
-        require_match=False, matches=None, alias_map=None):
-    """Use realized STK lot cost to decide whether IBKR embedded the put premium.
+def _put_assignment_basis_correction_per_share(
+        det, actual_cost_per_share, default_per_share,
+        restore_full_basis=False):
+    """Return the per-share correction for a put-assigned stock lot.
 
-    `matches`: vorberechnete Lot-Matches durchreichen, wenn der Aufrufer bereits
-    mit geteiltem Konsum-State gematcht hat — ein interner Neu-Scan würde sonst
-    Lots doppelt konsumieren bzw. eine abweichende Zuordnung sehen. Der Aufrufer
-    reicht die Matches einzeln durch, weil ein Assignment sowohl Short-Lots
-    decken als auch Long-Lots eröffnen kann.
+    IBKR may reduce the stock basis by the embedded short-put premium.  For an
+    InvStG fund, the foreign basis can be reduced further (for example after a
+    Return-of-Capital classification) even though the distribution remains an
+    Ausschüttung in the German KAP-INV calculation.  The source export does not
+    identify that reduction reliably.  For an unambiguous fund assignment the
+    gross acquisition basis is nevertheless known from the put strike, so the
+    complete gap to the strike is restored.  Other instruments retain the
+    established premium-only correction; Issue #58 (ordinary-stock/REIT ROC)
+    is deliberately untouched.
     """
     if det.get('putCall') != 'P':
         return default_per_share
 
-    shares = abs(safe_float(shares, 0))
     strike = safe_float(det.get('strike'), 0)
-    if shares <= 0 or strike <= 0:
+    actual_cost_per_share = abs(safe_float(actual_cost_per_share, 0))
+    default_per_share = abs(safe_float(default_per_share, 0))
+    if strike <= 0 or actual_cost_per_share <= 0:
         return default_per_share
 
-    if matches is None:
-        matches = _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares,
-                                                     alias_map=alias_map)
-    lot_qty = sum(m['shares'] for m in matches)
-    lot_cost = sum(m['cost'] for m in matches)
-
-    if lot_qty <= 0 or lot_cost <= 0:
-        if require_match:
-            return None
-        return default_per_share
-
-    actual_cost_per_share = lot_cost / lot_qty
     reduction_per_share = strike - actual_cost_per_share
-    tolerance_per_share = max(0.01, abs(default_per_share) * 0.05)
+    tolerance_per_share = max(0.01, default_per_share * 0.05)
     if reduction_per_share <= tolerance_per_share:
         return 0.0
+    if restore_full_basis:
+        return reduction_per_share
     return default_per_share
+
+
+def _put_assignment_match_basis_corrections(
+        det, matches, default_per_share, restore_full_basis=False):
+    """Choose exact strike restores only for a material aggregate extra gap.
+
+    Several CLOSED_LOTs can belong to one assignment.  Their individual IBKR
+    basis gaps may sit above or below the assignment's average premium merely
+    because IBKR distributed that premium differently across partial lots.
+    Treating every positive per-lot difference as a foreign basis reduction
+    creates false positives (and needlessly rewrites otherwise unchanged
+    rows).  We therefore switch from the established premium-only correction
+    to exact strike bases only if the *aggregate* exact correction exceeds the
+    established correction by at least one cent.  That excess is then allocated
+    across the positive lot gaps for audit/display purposes; the actual
+    correction remains exact per lot.
+    """
+    evaluated = []
+    for match in matches:
+        shares = abs(safe_float(match.get('shares'), 0))
+        if shares <= 0:
+            continue
+        actual_cost_per_share = safe_float(match.get('cost'), 0) / shares
+        standard = _put_assignment_basis_correction_per_share(
+            det, actual_cost_per_share, default_per_share,
+            restore_full_basis=False,
+        )
+        exact = standard
+        if restore_full_basis and not match.get('is_short_lot'):
+            exact = _put_assignment_basis_correction_per_share(
+                det, actual_cost_per_share, default_per_share,
+                restore_full_basis=True,
+            )
+        evaluated.append({
+            'match': match,
+            'shares': shares,
+            'standard': standard,
+            'exact': exact,
+        })
+
+    standard_total = sum(
+        item['standard'] * item['shares'] for item in evaluated
+    )
+    exact_total = sum(item['exact'] * item['shares'] for item in evaluated)
+    additional_total = max(0.0, exact_total - standard_total)
+    use_exact = restore_full_basis and additional_total >= 0.01
+    positive_gap_total = sum(
+        max(0.0, item['exact'] - item['standard']) * item['shares']
+        for item in evaluated
+    )
+
+    result = {}
+    for item in evaluated:
+        correction = item['exact'] if use_exact else item['standard']
+        extra_raw = 0.0
+        if use_exact and positive_gap_total > 0:
+            positive_gap = max(
+                0.0, item['exact'] - item['standard']
+            ) * item['shares']
+            extra_raw = additional_total * positive_gap / positive_gap_total
+        result[id(item['match'])] = {
+            'correction_per_share_raw': correction,
+            'invstg_basis_extra_per_share_raw': (
+                extra_raw / item['shares'] if item['shares'] else 0.0
+            ),
+        }
+    return result
 
 
 def _apply_stillhalter_row_correction(row, total_correction_raw, base_currency,
@@ -2782,49 +2844,43 @@ def _detect_zufluss_unmatched(trades, tax_year, all_sell_open_keys):
     return zufluss_unmatched
 
 
-def _build_tageskurs_put_adjustments(stillhalter_details, xy_tageskurs_lots, alias_map=None):
-    """Baut die FIFO-Lots fuer den Put-Praemien-Restore der Aktien-Kostenbasis.
+def _build_tageskurs_put_adjustments(same_year_lots, xy_tageskurs_lots,
+                                     alias_map=None):
+    """Merge the exact put-basis corrections already proven by CLOSED_LOTs.
 
-    IBKR bettet bei Put-Andienungen die Stillhalterpraemie in die Aktien-
-    Kostenbasis ein (cost = (strike - praemie) * qty). Fuer die Tageskurs-
-    Formel muss die Praemie zurueckaddiert werden (cost_raw = strike * qty).
-    Quellen: Same-Year-Andienungen aus stillhalter_details (nur putCall='P')
-    und Cross-Year-Andienungen aus xy_tageskurs_lots (dort unter FIFO-Logik
-    gespeichert, Issue #54/#55). Pro Symbol nach Datum sortierte deque (FIFO).
+    Earlier this function rebuilt every adjustment from the option premium and
+    could therefore diverge from the trade-row correction: a strike-basis lot
+    was corrected twice, while an InvStG lot with an additional foreign basis
+    reduction was corrected only by the premium.  Both same- and cross-year
+    callers now pass the quantity-capped correction derived from the matched
+    CLOSED_LOT.  This keeps trade PnL and the Tageskurs cost on one basis.
 
-    Reine Funktion: liefert {underlying: deque of
-    {date, shares_remaining, premium_per_share_raw}}.
+    Input shape per symbol: ``{date_str, shares,
+    correction_per_share_raw, premium_per_share_raw,
+    invstg_basis_extra_per_share_raw, currency}``.
     """
     put_adj = {}
-    for det in stillhalter_details:
-        if det.get('putCall') != 'P':
-            continue  # Only put assignments embed premium in stock COST basis
-        underlying = _detail_underlying_symbol(det, alias_map)
-        if not underlying:
-            continue
-        mult = det.get('multiplier', 100)
-        shares = det['quantity'] * mult
-        if shares <= 0 or det['premium_raw'] <= 0:
-            continue
-        a_date = (det.get('assignment_date') or '')[:10]
-        put_adj.setdefault(underlying, deque()).append({
-            'date': a_date,
-            'shares_remaining': shares,
-            'premium_per_share_raw': det['premium_raw'] / shares,
-            # Review F1: Options-Waehrung fuer den Guard beim CLOSED_LOT-Konsum
-            # (Praemien-Restore mischt sonst Waehrungen bei Alias-Listings).
-            'currency': det.get('currency', ''),
-        })
-    for sym, snap_lots in xy_tageskurs_lots.items():
-        for snap in snap_lots:
-            if snap['shares'] <= 0:
+    for source in (same_year_lots or {}, xy_tageskurs_lots or {}):
+        for sym, snap_lots in source.items():
+            canonical_sym = _canon_symbol(sym, alias_map)
+            if not canonical_sym:
                 continue
-            put_adj.setdefault(sym, deque()).append({
-                'date': snap['date_str'],
-                'shares_remaining': snap['shares'],
-                'premium_per_share_raw': snap['premium_per_share_raw'],
-                'currency': snap.get('currency', ''),
-            })
+            for snap in snap_lots:
+                shares = safe_float(snap.get('shares'), 0)
+                correction_per_share = safe_float(
+                    snap.get('correction_per_share_raw'), 0)
+                if shares <= 0 or correction_per_share <= 0:
+                    continue
+                put_adj.setdefault(canonical_sym, deque()).append({
+                    'date': (snap.get('date_str') or '')[:10],
+                    'shares_remaining': shares,
+                    'correction_per_share_raw': correction_per_share,
+                    'premium_per_share_raw': safe_float(
+                        snap.get('premium_per_share_raw'), 0),
+                    'invstg_basis_extra_per_share_raw': safe_float(
+                        snap.get('invstg_basis_extra_per_share_raw'), 0),
+                    'currency': snap.get('currency', ''),
+                })
     # Sort each symbol's lots by date (FIFO)
     for sym in put_adj:
         put_adj[sym] = deque(sorted(put_adj[sym], key=lambda x: x['date']))
@@ -3859,6 +3915,31 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     stk_loss_corr_cy = 0.0
     etf_gain_corr_cy = 0.0
     etf_loss_corr_cy = 0.0
+    # Exact CLOSED_LOT-proven put-basis restores for the later Tageskurs pass.
+    # Kept separate from the option details because KAP-INV can require more
+    # than the embedded premium to reach the gross strike basis (Issue #88).
+    _cy_tageskurs_put_lots = {}
+    invstg_put_basis_adjustments = []
+    # A full strike restore needs an unambiguous assignment↔lot link.  Multiple
+    # puts of the same underlying on the same day share the same CLOSED_LOT open
+    # date; without a stable lot/series identifier their individual basis gaps
+    # cannot safely be interpreted as an additional KAP-INV reduction.
+    _cy_put_assignment_series = defaultdict(set)
+    for _det in stillhalter_details:
+        if _det.get('putCall') != 'P':
+            continue
+        _det_underlying = _detail_underlying_symbol(
+            _det, underlying_alias_map
+        )
+        _det_date = ((_det.get('assignment_date') or '')[:10]
+                     or (_det.get('assignment_trade_date') or '')[:10])
+        _series_identity = (
+            safe_float(_det.get('strike'), 0),
+            (_det.get('expiry') or '')[:10],
+        )
+        _cy_put_assignment_series[
+            (_det_underlying, _det_date)
+        ].add(_series_identity)
     # Anlage-SO-Overrides (Issue #51): Prämien-Lookup für Lot-Level-Matching im
     # Anlage-SO-Build. Key: (underlying_symbol, assignment_date_YYYY-MM-DD).
     # Wird aus Stillhalter-current-year und prior-put-assignments befüllt — getrennt
@@ -4007,14 +4088,24 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             if total_shares > 0:
                 premium_per_share_raw = det['premium_raw'] / total_shares
                 if det['putCall'] == 'P':
+                    basis_corrections = \
+                        _put_assignment_match_basis_corrections(
+                            det, put_lot_matches, premium_per_share_raw,
+                            restore_full_basis=(
+                                source_topf == 'KAP-INV'
+                                and len(_cy_put_assignment_series.get((
+                                    underlying,
+                                    ((det.get('assignment_date') or '')[:10]
+                                     or (det.get(
+                                         'assignment_trade_date') or '')[:10]),
+                                ), ())) == 1
+                            ),
+                        )
                     for match in put_lot_matches:
-                        match_premium_per_share_raw = \
-                            _put_assignment_lot_cost_correction_per_share(
-                                closed_lots_for_put_basis, det, underlying,
-                                match['shares'], premium_per_share_raw,
-                                require_match=True, matches=[match],
-                                alias_map=underlying_alias_map
-                            )
+                        basis_correction = basis_corrections.get(id(match), {})
+                        match_premium_per_share_raw = basis_correction.get(
+                            'correction_per_share_raw'
+                        )
                         exercise_backed_shares = \
                             _claim_long_put_exercise_short_shares(
                                 match, long_put_short_openings,
@@ -4049,6 +4140,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                                       f"eingebettet — bitte Trades pruefen.")
                                 continue
                             match_premium_per_share_raw = premium_per_share_raw
+                        invstg_basis_extra_per_share_raw = (
+                            safe_float(basis_correction.get(
+                                'invstg_basis_extra_per_share_raw'), 0.0)
+                        )
                         match_cost = match.get('cost')
                         if match_cost is not None and match['shares'] > 0:
                             match_cost *= correction_shares / match['shares']
@@ -4069,11 +4164,24 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                             'remaining_shares': correction_shares,
                             'close_date': match['close_date'],
                             'side': 'P',
+                            'invstg_basis_extra_per_share_raw':
+                                invstg_basis_extra_per_share_raw,
                             'row_oids': put_row_oids or None,
                             'target_buysell': match.get('target_buysell', 'SELL'),
                             'raw_underlying': underlying_raw,
                             'currency': det.get('currency', ''),
                         })
+                        _cy_tageskurs_put_lots.setdefault(
+                            underlying, []).append({
+                                'date_str': match.get('open_date', ''),
+                                'shares': correction_shares,
+                                'correction_per_share_raw':
+                                    match_premium_per_share_raw,
+                                'premium_per_share_raw': premium_per_share_raw,
+                                'invstg_basis_extra_per_share_raw':
+                                    invstg_basis_extra_per_share_raw,
+                                'currency': det.get('currency', ''),
+                            })
                 else:
                     # Anteilige Quellen-Kaskade statt binärer Gates (Audit F1 +
                     # Codex-Findings 1–3): Jede Call-Andienung wird quantity-genau
@@ -4149,6 +4257,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 continue
             original_pnl_eur = row['pnl_eur']
             total_correction_raw = 0.0
+            total_invstg_basis_extra_raw = 0.0
             # Put- (Kostenbasis-) und Call-Korrekturen (Erlösseite) zählen getrennte
             # Quantity-Budgets: dieselben Shares tragen legitim BEIDE Prämien, wenn
             # die Aktie per Put-Andienung gekauft und per Call-Andienung verkauft
@@ -4169,11 +4278,31 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     continue
                 shares = min(remaining_by_side[side], corr['remaining_shares'])
                 total_correction_raw += corr['premium_per_share_raw'] * shares
+                total_invstg_basis_extra_raw += safe_float(
+                    corr.get('invstg_basis_extra_per_share_raw'), 0.0
+                ) * shares
                 corr['remaining_shares'] -= shares
                 remaining_by_side[side] -= shares
             if total_correction_raw > 0:
                 correction_eur = _apply_stillhalter_row_correction(
                     row, total_correction_raw, base_currency, usd_to_eur_rates)
+                if total_invstg_basis_extra_raw > 0:
+                    row['invstg_basis_adjustment_raw'] = (
+                        safe_float(row.get('invstg_basis_adjustment_raw'), 0.0)
+                        + total_invstg_basis_extra_raw
+                    )
+                    invstg_put_basis_adjustments.append({
+                        'symbol': row.get('symbol', ''),
+                        'isin': row.get('isin', ''),
+                        'report_date': (row.get('reportDate')
+                                        or row.get('dateTime') or '')[:10],
+                        'amount_raw': total_invstg_basis_extra_raw,
+                        'amount_eur': correction_eur * (
+                            total_invstg_basis_extra_raw
+                            / total_correction_raw
+                        ),
+                        'source': 'same_year_put',
+                    })
 
                 # Per-trade gain/loss split (Issue #23 pattern)
                 row_isin = row.get('isin', '')
@@ -4501,36 +4630,19 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
 
     # Build FIFO lots per underlying symbol from prior-year put assignments
     from collections import deque
-    put_assignment_lots = {}  # {symbol: deque of (date, shares_remaining, premium_per_share_eur)}
-    # Issue #55: paralleles immutable Dict fuer _tageskurs_put_adj. Da
-    # put_assignment_lots durch die Apply-Schleife (popleft bei shares_remaining<=0)
-    # mutiert wird, koennen die Original-Werte spaeter nicht mehr abgerufen werden.
-    _xy_tageskurs_lots = {}  # {symbol: list of {date_str, shares, premium_per_share_raw}}
+    put_assignment_lots = {}  # {symbol: deque of quantity-capped basis corrections}
+    # Immutable snapshots for the later Tageskurs pass.  Both maps carry the
+    # exact correction derived from the matched CLOSED_LOT, not just a premium.
+    _xy_tageskurs_lots = {}
     cross_year_put_corrections = []
     cross_year_put_total = 0.0
-    _xy_closed_share_remaining = None
-    _xy_closed_path = os.path.join(ib_tax_dir, 'closed_lots.csv')
-    if os.path.exists(_xy_closed_path):
-        _xy_closed_share_remaining = {}
-        for lot in load_csv(_xy_closed_path):
-            if lot.get('assetCategory') != 'STK':
-                continue
-            report_date = parse_date(lot.get('reportDate') or lot.get('dateTime'))
-            if not report_date or report_date.year != tax_year:
-                continue
-            # Key-Ableitung identisch zum trades-Loop und put_assignment_lots:
-            # underlyingSymbol NICHT splitten (Klassen-Aktien wie 'BRK B'),
-            # nur der symbol-Fallback wird gesplittet. Kanonisierung (Issue #83)
-            # auf beiden Seiten, damit 'CONd'-Lots das Underlying 'CON' treffen.
-            sym = _canon_symbol(
-                _stock_symbol_for_matching(lot, underlying_alias_map),
-                underlying_alias_map)
-            open_date = (lot.get('openDateTime') or '')[:10]
-            qty = abs(safe_float(lot.get('quantity'), 0))
-            if not sym or not open_date or qty <= 0:
-                continue
-            key = (sym, open_date)
-            _xy_closed_share_remaining[key] = _xy_closed_share_remaining.get(key, 0) + qty
+    _xy_closed_lots = [
+        lot for lot in _alias_closed_lots
+        if lot.get('assetCategory') == 'STK'
+        and (d := parse_date(lot.get('reportDate') or lot.get('dateTime')))
+        and d.year == tax_year
+    ]
+    _xy_closed_lot_claims = {}
 
     # Issue #54: Bei mehreren Andienungen derselben Series werden die Original-Sells
     # FIFO konsumiert (aelteste zuerst), nicht als Durchschnitt verteilt. State pro
@@ -4541,6 +4653,23 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         prior_put_assignments,
         key=lambda t: (t.get('dateTime', '') or t.get('tradeDate', '') or t.get('reportDate', '') or '')
     )
+    _xy_put_assignment_series = defaultdict(set)
+    for _assignment in prior_put_assignments_sorted:
+        _assignment_underlying = _canon_symbol(
+            _assignment.get('underlyingSymbol', ''), underlying_alias_map
+        )
+        _assignment_date = (
+            _assignment.get('dateTime') or _assignment.get('tradeDate')
+            or _assignment.get('reportDate') or ''
+        )[:10]
+        _series_identity = (
+            _assignment.get('assetCategory', ''),
+            safe_float(_assignment.get('strike'), 0),
+            (_assignment.get('expiry') or '')[:10],
+        )
+        _xy_put_assignment_series[
+            (_assignment_underlying, _assignment_date)
+        ].add(_series_identity)
     # series_key umfasst die stabile Underlying-Aliasgruppe — verschiedene
     # Aktien mit gleicher strike/expiry-Kombination bleiben getrennt, ein
     # belegter Tickerwechsel (OLD→NEW) dagegen teilt denselben FIFO-State.
@@ -4601,55 +4730,78 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # Options-Underlying nicht ('CON'). Auch die Options-Seite verwendet
         # dieselbe belegte Aliasgruppe, damit Renames den Original-SELL finden.
         underlying_stk = _canon_symbol(underlying, underlying_alias_map)
-        lot_open_dates = [
-            ((a.get('dateTime') or a.get('tradeDate') or '')[:10]),
-            ((a.get('reportDate') or '')[:10]),
+        match_det = dict(a)
+        match_det['assignment_date'] = (
+            a.get('dateTime') or a.get('tradeDate') or '')[:10]
+        match_det['assignment_trade_date'] = (
+            a.get('tradeDate') or a.get('reportDate')
+            or a.get('dateTime') or '')[:10]
+        put_lot_matches = [
+            match for match in _put_assignment_closed_lot_matches(
+                _xy_closed_lots, match_det, underlying_stk,
+                assignment_shares, consumed=_xy_closed_lot_claims,
+                alias_map=underlying_alias_map,
+            )
+            if not match.get('is_short_lot')
         ]
-        lot_open_dates = [d for i, d in enumerate(lot_open_dates) if d and d not in lot_open_dates[:i]]
-        matched_open_date = lot_open_dates[0] if lot_open_dates else ''
-        shares = assignment_shares
-        if _xy_closed_share_remaining is not None:
-            closed_key = None
-            closed_shares = 0
-            for candidate_date in lot_open_dates:
-                candidate_key = (underlying_stk, candidate_date)
-                candidate_shares = _xy_closed_share_remaining.get(candidate_key, 0)
-                if candidate_shares > 0:
-                    closed_key = candidate_key
-                    closed_shares = candidate_shares
-                    matched_open_date = candidate_date
-                    break
-            if closed_shares <= 0:
-                continue
-            shares = min(assignment_shares, closed_shares)
-            _xy_closed_share_remaining[closed_key] = closed_shares - shares
+        if not put_lot_matches:
+            continue
+
+        shares = sum(match['shares'] for match in put_lot_matches)
+        u_isin_xy = symbol_to_isin.get(underlying_stk, '')
+        u_cls_xy = _effective_classification(u_isin_xy) if u_isin_xy else None
+        restore_full_basis = bool(
+            u_isin_xy and u_isin_xy in etf_isins
+            and u_cls_xy not in ('no_invstg', 'anlage_so')
+            and len(_xy_put_assignment_series.get((
+                underlying_stk,
+                (match_det.get('assignment_date') or '')[:10],
+            ), ())) == 1
+        )
+        basis_corrections = _put_assignment_match_basis_corrections(
+            match_det, put_lot_matches, premium_per_share_raw,
+            restore_full_basis=restore_full_basis,
+        )
         if underlying_stk not in put_assignment_lots:
             put_assignment_lots[underlying_stk] = deque()
-        put_assignment_lots[underlying_stk].append({
-            'date': a_date,
-            'shares_remaining': shares,
-            'premium_per_share_eur': premium_per_share_eur,
-            'premium_per_share_raw': premium_per_share_raw,
-            'strike': strike,
-            'year': a_date.year if a_date else 0,
-            # Review F1: fuer den Waehrungs-Guard bei Alias-vermittelten
-            # Matches (Praemie ist in Options-Waehrung).
-            'currency': a.get('currency', ''),
-            'raw_underlying': underlying,
-        })
-        # Issue #55: Snapshot fuer _tageskurs_put_adj — bleibt erhalten auch wenn
-        # put_assignment_lots durch Apply-Schleife geleert wird.
-        # date_str nutzt das tatsaechlich in closed_lots gematchte Open-Datum.
-        # IBKR kann bei Andienungen je nach Buchung tradeDate oder reportDate
-        # als openDateTime fuehren.
-        _xy_tageskurs_lots.setdefault(underlying_stk, []).append({
-            'date_str': matched_open_date,
-            'shares': shares,
-            'premium_per_share_raw': premium_per_share_raw,
-            'currency': a.get('currency', ''),
-        })
+        for match in put_lot_matches:
+            basis_correction = basis_corrections.get(id(match), {})
+            correction_per_share_raw = basis_correction.get(
+                'correction_per_share_raw', 0.0
+            )
+            if correction_per_share_raw <= 0:
+                continue
+            invstg_basis_extra_per_share_raw = safe_float(
+                basis_correction.get(
+                    'invstg_basis_extra_per_share_raw'), 0.0
+            )
+            entry = {
+                'date': a_date,
+                'shares_remaining': match['shares'],
+                'premium_per_share_eur': premium_per_share_eur,
+                'premium_per_share_raw': premium_per_share_raw,
+                'correction_per_share_raw': correction_per_share_raw,
+                'invstg_basis_extra_per_share_raw':
+                    invstg_basis_extra_per_share_raw,
+                'strike': strike,
+                'year': a_date.year if a_date else 0,
+                # Review F1: fuer den Waehrungs-Guard bei Alias-vermittelten
+                # Matches (Praemie ist in Options-Waehrung).
+                'currency': a.get('currency', ''),
+                'raw_underlying': underlying,
+            }
+            put_assignment_lots[underlying_stk].append(entry)
+            # Immutable snapshot for the later Tageskurs pass.
+            _xy_tageskurs_lots.setdefault(underlying_stk, []).append({
+                'date_str': match.get('open_date', ''),
+                'shares': match['shares'],
+                'correction_per_share_raw': correction_per_share_raw,
+                'premium_per_share_raw': premium_per_share_raw,
+                'invstg_basis_extra_per_share_raw':
+                    invstg_basis_extra_per_share_raw,
+                'currency': a.get('currency', ''),
+            })
         # Anlage-SO-Lookup für cross-year (Issue #51)
-        u_isin_xy = symbol_to_isin.get(underlying_stk, '')
         if u_isin_xy and _effective_classification(u_isin_xy) == 'anlage_so' and a_date:
             so_key = (underlying_stk, a_date.strftime('%Y-%m-%d'))
             _so_premium_lookup.setdefault(so_key, {'shares': 0, 'premium_eur': 0.0})
@@ -4704,6 +4856,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     'shares': consumed,
                     'premium_per_share': lot['premium_per_share_eur'],
                     'premium_per_share_raw': lot['premium_per_share_raw'],
+                    'correction_per_share_raw':
+                        lot['correction_per_share_raw'],
+                    'invstg_basis_extra_per_share_raw':
+                        lot['invstg_basis_extra_per_share_raw'],
                     'correction_eur': 0.0,
                     'currency': lot.get('currency', ''),
                     'raw_underlying': lot.get('raw_underlying', ''),
@@ -4733,10 +4889,13 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             nv_loss_corr = 0.0
             _etf_by_isin_corr_xy = {}
 
-            _xy_pending = {}  # {symbol: [{premium_per_share_raw, remaining_shares, corr_ref}]}
+            _xy_pending = {}  # {symbol: [{correction_per_share_raw, remaining_shares, corr_ref}]}
             for c in cross_year_put_corrections:
                 _xy_pending.setdefault(c['symbol'], []).append({
-                    'premium_per_share_raw': c['premium_per_share_raw'],
+                    'correction_per_share_raw':
+                        c['correction_per_share_raw'],
+                    'invstg_basis_extra_per_share_raw':
+                        c['invstg_basis_extra_per_share_raw'],
                     'remaining_shares': c['shares'],
                     'corr_ref': c,
                 })
@@ -4761,6 +4920,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     continue
                 original_pnl_eur = row['pnl_eur']
                 total_correction_raw = 0.0
+                total_invstg_basis_extra_raw = 0.0
                 remaining = qty
                 _row_corr_refs = []  # [(cross_year_put_corrections-Eintrag, chunk_raw)]
                 for corr in _xy_pending[row_symbol]:
@@ -4774,8 +4934,11 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                                                        _corr_ref.get('currency'))):
                         continue
                     consumed = min(remaining, corr['remaining_shares'])
-                    chunk_raw = consumed * corr['premium_per_share_raw']
+                    chunk_raw = consumed * corr['correction_per_share_raw']
                     total_correction_raw += chunk_raw
+                    total_invstg_basis_extra_raw += consumed * safe_float(
+                        corr.get('invstg_basis_extra_per_share_raw'), 0.0
+                    )
                     _row_corr_refs.append((corr['corr_ref'], chunk_raw))
                     corr['remaining_shares'] -= consumed
                     remaining -= consumed
@@ -4786,6 +4949,24 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     # (gain/loss-Split-Logik identisch zum Same-Year-Block).
                     correction_eur = _apply_stillhalter_row_correction(
                         row, total_correction_raw, base_currency, usd_to_eur_rates)
+                    if total_invstg_basis_extra_raw > 0:
+                        row['invstg_basis_adjustment_raw'] = (
+                            safe_float(
+                                row.get('invstg_basis_adjustment_raw'), 0.0
+                            ) + total_invstg_basis_extra_raw
+                        )
+                        invstg_put_basis_adjustments.append({
+                            'symbol': row.get('symbol', ''),
+                            'isin': row.get('isin', ''),
+                            'report_date': (row.get('reportDate')
+                                            or row.get('dateTime') or '')[:10],
+                            'amount_raw': total_invstg_basis_extra_raw,
+                            'amount_eur': correction_eur * (
+                                total_invstg_basis_extra_raw
+                                / total_correction_raw
+                            ),
+                            'source': 'cross_year_put',
+                        })
                     # Tatsaechlichen EUR-Korrekturbetrag (stock_fx) anteilig auf die
                     # konsumierten cross_year_put_corrections-Eintraege verteilen, damit
                     # Box-Gesamt, Einzelzeilen, Pool-Reduktion und Plausibilitaetscheck-
@@ -5665,14 +5846,15 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     # Delta per lot = cost_trade_ccy × (fxRate_close - fxRate_open)
     # IBKR CLOSED_LOT: cost > 0 bei Longs (Kaufpreis), cost < 0 bei Shorts (Verkaufserlös)
 
-    # Build lookup for Stillhalter put assignment cost corrections:
-    # IBKR embeds the premium in the stock's cost basis (cost = strike - premium).
-    # The Tageskurs formula needs the corrected cost (= strike), so we add the
-    # premium back per share for stock CLOSED_LOTs acquired through put assignments.
-    # Same-Year- + Cross-Year-Put-Praemien als FIFO-Lots (Issue #54/#55; Doku:
+    # Build lookup for CLOSED_LOT-proven put assignment basis corrections.
+    # Usually this is the embedded premium.  For KAP-INV it may additionally be
+    # a foreign basis reduction (for example ROC) that must not reduce the
+    # German fund basis (Issue #88).
+    # Same-Year- + Cross-Year-Korrekturen als FIFO-Lots (Issue #54/#55; Doku:
     # _build_tageskurs_put_adjustments).
     _tageskurs_put_adj = _build_tageskurs_put_adjustments(
-        stillhalter_details, _xy_tageskurs_lots, alias_map=underlying_alias_map)
+        _cy_tageskurs_put_lots, _xy_tageskurs_lots,
+        alias_map=underlying_alias_map)
 
     # Per-Share-Korrektur-Maps fuer die Bruttozuordnung (Mechanik + Doku:
     # _build_tageskurs_pnl_adjustment_maps / _consume_tageskurs_pnl_adjustment).
@@ -5780,6 +5962,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
 
             cost_raw = safe_float(lot.get('cost'), 0)
             cost_basis_adjustment_raw = 0.0
+            invstg_basis_adjustment_raw = 0.0
 
             # dateTime = actual trade date; reportDate = settlement/booking date.
             # Use trade date for FX lookup (§20 Abs. 4 S. 1 EStG: "Veräußerungszeitpunkt").
@@ -5799,9 +5982,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             if fx_close <= 0 or fx_open <= 0:
                 continue
 
-            # For STK lots from put assignments: IBKR embeds premium in cost basis
-            # (cost = strike×qty - premium). Restore correct cost (= strike×qty)
-            # so the Tageskurs formula uses the right basis.
+            # For STK lots from put assignments, restore the same exact basis
+            # adjustment already applied to the tax trade.  That is normally the
+            # premium and, for an unambiguous KAP-INV assignment, the additional
+            # foreign basis gap to the gross strike basis (Issue #88).
             if category == 'STK' and _tageskurs_put_adj:
                 lot_sym = _canon_symbol(
                     _stock_symbol_for_matching(
@@ -5823,11 +6007,18 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                                                   adj_lot.get('currency')):
                             continue
                         consumed = min(remaining, adj_lot['shares_remaining'])
-                        premium_adjustment = (
-                            consumed * adj_lot['premium_per_share_raw']
+                        basis_adjustment = (
+                            consumed * adj_lot['correction_per_share_raw']
                         )
-                        cost_raw += premium_adjustment
-                        cost_basis_adjustment_raw += premium_adjustment
+                        if cost_raw >= 0:
+                            cost_raw += basis_adjustment
+                        else:
+                            cost_raw -= basis_adjustment
+                        cost_basis_adjustment_raw += basis_adjustment
+                        invstg_basis_adjustment_raw += consumed * safe_float(
+                            adj_lot.get(
+                                'invstg_basis_extra_per_share_raw'), 0.0
+                        )
                         adj_lot['shares_remaining'] -= consumed
                         remaining -= consumed
                         if remaining <= 0:
@@ -5846,7 +6037,11 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 cls = _effective_classification(isin)
                 if cls == 'anlage_so':
                     continue  # Gold-ETCs excluded from KAP entirely
-                if cls not in ('no_invstg', None):
+                # Keep routing identical to the main STK calculation above:
+                # an IBKR ETF without a verified classification remains in
+                # KAP-INV (0% TFS and blocked for form export), rather than
+                # silently moving its Tageskurs delta to Topf 2.
+                if cls != 'no_invstg':
                     topf = 'KAP-INV'
                     kap_inv_tfs_rate = get_teilfreistellung(isin)
                     kap_inv_classification = cls
@@ -5897,6 +6092,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             if topf == 'KAP-INV':
                 detail['tfs_rate'] = kap_inv_tfs_rate if kap_inv_tfs_rate is not None else get_teilfreistellung(isin)
                 detail['taxable_delta_eur'] = round(delta * (1 - detail['tfs_rate']), 5)
+            if invstg_basis_adjustment_raw > 0:
+                detail['invstg_basis_adjustment_raw'] = round(
+                    invstg_basis_adjustment_raw, 5
+                )
             fx_correction_details.append(detail)
 
             # Track gain/loss shift per lot for consistent Zeilen 20/22/23
@@ -6361,6 +6560,12 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             "occ_rename_matches": occ_rename_matches,
         }
     }
+
+    # Keep unchanged reports byte-for-byte stable: the audit key only exists
+    # when an additional KAP-INV basis reduction was actually repaired.
+    if invstg_put_basis_adjustments:
+        report_data['audit']['invstg_put_basis_adjustments'] = \
+            invstg_put_basis_adjustments
 
     if unrouted_asset_categories:
         total_unrouted = sum(e['pnl_eur'] for e in unrouted_asset_categories.values())

@@ -43,6 +43,7 @@ SYNTHETIC_TESTS = [
     ("Quarterly-History-Extraction", "tests/test_quarterly_history_extraction.py"),
     ("KAP-INV-WHT", "tests/test_kap_inv_wht.py"),
     ("KAP-INV-Tageskurs-TFS", "tests/test_kap_inv_tageskurs.py"),
+    ("KAP-INV-Put-ROC-Basis", "tests/test_kap_inv_put_roc_basis.py"),
     ("QYLD-und-Sonderprodukte", "tests/test_qyld_and_special_products.py"),
     ("German-Dividend-Tax", "-m unittest tests/test_german_dividend_tax.py"),
     ("FX-Margin-Negative-Balance", "tests/test_fx_negative_balance.py"),

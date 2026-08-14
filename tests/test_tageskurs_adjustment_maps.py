@@ -112,38 +112,55 @@ def test_missing_side_derived_from_quantity_sign():
     print("  OK  Consume: fehlende Side aus Quantity-Vorzeichen abgeleitet")
 
 
-def test_put_adjustments_only_puts_with_per_share_premium():
-    """Nur Put-Andienungen (Call-Praemien liegen im Erloes, nicht im Cost)."""
-    details = [
-        {'putCall': 'P', 'symbol': 'TLT 240126P00095000', 'multiplier': 100,
-         'quantity': 2, 'premium_raw': 300.0, 'assignment_date': '2025-06-20 16:20:00'},
-        {'putCall': 'C', 'symbol': 'TLT 240126C00095000', 'multiplier': 100,
-         'quantity': 1, 'premium_raw': 100.0, 'assignment_date': '2025-06-20'},
-    ]
-    put_adj = _build_tageskurs_put_adjustments(details, {})
+def test_put_adjustments_use_proven_per_share_correction():
+    """Der Tageskurs-Pfad uebernimmt die zuvor lot-genau belegte Korrektur."""
+    same_year_lots = {
+        'TLT': [{
+            'date_str': '2025-06-20 16:20:00',
+            'shares': 200,
+            'correction_per_share_raw': 1.5,
+            'premium_per_share_raw': 1.5,
+            'invstg_basis_extra_per_share_raw': 0.0,
+        }],
+        'EMPTY': [{
+            'date_str': '2025-06-20',
+            'shares': 0,
+            'correction_per_share_raw': 9.9,
+        }],
+    }
+    put_adj = _build_tageskurs_put_adjustments(same_year_lots, {})
     assert list(put_adj.keys()) == ['TLT']
     lot = put_adj['TLT'][0]
     assert lot['shares_remaining'] == 200
+    assert abs(lot['correction_per_share_raw'] - 1.5) < 1e-12
     assert abs(lot['premium_per_share_raw'] - 1.5) < 1e-12
     assert lot['date'] == '2025-06-20'
-    print("  OK  Put-Adj: nur Puts, Per-Share-Praemie, Datum gekuerzt")
+    print("  OK  Put-Adj: belegte Per-Share-Korrektur, Datum gekuerzt")
 
 
 def test_put_adjustments_merge_cross_year_and_sort_fifo():
     """Cross-Year-Lots werden gemerged und pro Symbol nach Datum sortiert."""
-    details = [
-        {'putCall': 'P', 'symbol': 'TLT X', 'multiplier': 100, 'quantity': 1,
-         'premium_raw': 100.0, 'assignment_date': '2025-06-20'},
-    ]
+    same_year_lots = {'TLT': [{
+        'date_str': '2025-06-20',
+        'shares': 100,
+        'correction_per_share_raw': 1.0,
+        'premium_per_share_raw': 1.0,
+        'invstg_basis_extra_per_share_raw': 0.0,
+    }]}
     xy_lots = {'TLT': [
-        {'date_str': '2024-11-15', 'shares': 100, 'premium_per_share_raw': 2.0},
-        {'date_str': '2024-01-19', 'shares': 0, 'premium_per_share_raw': 9.9},  # leer
+        {'date_str': '2024-11-15', 'shares': 100,
+         'correction_per_share_raw': 4.5, 'premium_per_share_raw': 2.0,
+         'invstg_basis_extra_per_share_raw': 2.5},
+        {'date_str': '2024-01-19', 'shares': 0,
+         'correction_per_share_raw': 9.9, 'premium_per_share_raw': 9.9},  # leer
     ]}
-    put_adj = _build_tageskurs_put_adjustments(details, xy_lots)
+    put_adj = _build_tageskurs_put_adjustments(same_year_lots, xy_lots)
     lots = list(put_adj['TLT'])
     assert len(lots) == 2
     assert [l['date'] for l in lots] == ['2024-11-15', '2025-06-20'], "FIFO-Sortierung"
     assert lots[0]['premium_per_share_raw'] == 2.0
+    assert lots[0]['correction_per_share_raw'] == 4.5
+    assert lots[0]['invstg_basis_extra_per_share_raw'] == 2.5
     print("  OK  Put-Adj: Cross-Year-Merge + FIFO-Sortierung, leere Lots raus")
 
 
@@ -155,6 +172,6 @@ if __name__ == '__main__':
     test_same_day_fallback_for_consolidated_lot()
     test_sides_are_separated()
     test_missing_side_derived_from_quantity_sign()
-    test_put_adjustments_only_puts_with_per_share_premium()
+    test_put_adjustments_use_proven_per_share_correction()
     test_put_adjustments_merge_cross_year_and_sort_fifo()
     print("Alle Tests bestanden.")

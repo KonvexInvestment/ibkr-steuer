@@ -630,6 +630,7 @@ def merge_report_data(reports):
         'cross_year_premium_eur': sum(r.get('audit', {}).get('cross_year_premium_eur', 0) for r in reports),
         'cross_year_by_year': {},
         'cross_year_put_corrections': [],
+        'invstg_put_basis_adjustments': [],
         'cross_year_put_total': sum(r.get('audit', {}).get('cross_year_put_total', 0) for r in reports),
         'no_invstg_gain': sum(r.get('audit', {}).get('no_invstg_gain', 0) for r in reports),
         'no_invstg_loss': sum(r.get('audit', {}).get('no_invstg_loss', 0) for r in reports),
@@ -699,6 +700,9 @@ def merge_report_data(reports):
         merged_audit['stillhalter_unmatched'].extend(a.get('stillhalter_unmatched', []))
         merged_audit['stillhalter_details'].extend(a.get('stillhalter_details', []))
         merged_audit['cross_year_put_corrections'].extend(a.get('cross_year_put_corrections', []))
+        merged_audit['invstg_put_basis_adjustments'].extend(
+            a.get('invstg_put_basis_adjustments', [])
+        )
         merged_audit['zufluss_details'].extend(a.get('zufluss_details', []))
         merged_audit['prior_zufluss_details'].extend(a.get('prior_zufluss_details', []))
         merged_audit['zufluss_unmatched'].extend(a.get('zufluss_unmatched', []))
@@ -1527,12 +1531,26 @@ st.markdown(
 cross_put_corrections = d.get('audit', {}).get('cross_year_put_corrections', [])
 cross_put_total = d.get('audit', {}).get('cross_year_put_total', 0)
 if cross_put_corrections:
+    has_invstg_basis_extra = any(
+        c.get('invstg_basis_extra_per_share_raw', 0) > 0
+        for c in cross_put_corrections
+    )
+    cross_put_explanation = (
+        f"Die Kostenbasis-Korrektur ({fmt_de(cross_put_total)} EUR) stellt den "
+        "Einstandskurs auf den Put-Ausübungspreis. Sie umfasst die bereits im "
+        "Assignment-Jahr versteuerte Prämie und eine zusätzliche, für KAP-INV "
+        "nicht übernommene zusätzliche ausländische Basisreduktion "
+        "(z. B. ROC)."
+        if has_invstg_basis_extra else
+        f"Die Prämie ({fmt_de(cross_put_total)} EUR) wurde bereits im "
+        "Assignment-Jahr versteuert und wird hier vom Aktien-PnL abgezogen "
+        "(Einstandskurs = Strike, nicht Strike minus Prämie)."
+    )
     st.markdown(f"""
 <div style="background: rgba(168,85,247,0.08); border: 1px solid rgba(168,85,247,0.25); border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #94a3b8;">
     <strong style="color: #a855f7;">Put-Assignment Korrektur (BMF Rn. 33):</strong>
     {len(cross_put_corrections)} Aktienverkäufe stammen aus Put-Assignments früherer Jahre.
-    Die Prämie ({fmt_de(cross_put_total)} EUR) wurde bereits im Assignment-Jahr versteuert und wird
-    hier vom Aktien-PnL abgezogen (Einstandskurs = Strike, nicht Strike minus Prämie).
+    {cross_put_explanation}
 </div>
 """, unsafe_allow_html=True)
     with st.expander(f"Details: {len(cross_put_corrections)} Cross-Year Put-Korrekturen"):
@@ -2378,6 +2396,9 @@ if trade_details and tageskurs_aktiv:
         close_dt = lot.get('reportDate', '')
         delta_eur = lot['delta_eur']
         note = f'Tageskurs-Korrektur (Kauf {open_dt}, Kurs {lot["fx_open"]:.5f} → {lot["fx_close"]:.5f})'
+        if lot.get('invstg_basis_adjustment_raw', 0) > 0:
+            note += (' · KAP-INV-AK inkl. zusätzlicher ausländischer '
+                     'Basisreduktion (z. B. ROC) auf Put-Strike normalisiert')
         if lot.get('topf') == 'KAP-INV' and invstg_aktiv:
             isin = lot.get('isin', '')
             tfs_rate = etf_by_isin.get(isin, {}).get('tfs_rate', lot.get('tfs_rate', 0))
@@ -2732,6 +2753,8 @@ if d:
                     elif source == 'cross_year_put_korrektur': anmerkung = r.get('description', 'Cross-Year Put-Korrektur')
                     elif source == 'trades' and r.get('stillhalter_adjusted'):
                         anmerkung = 'Korrigiert: Prämie separiert (s. Stillhalterprämie Topf 2)'
+                        if r.get('invstg_basis_adjustment_raw'):
+                            anmerkung += '; KAP-INV-AK auf Ausübungspreis normalisiert'
                     bs = r.get('buySell', ''); oc = r.get('openClose', '')
                     if bs == 'SELL' and oc == 'O': bs_label = 'STO'
                     elif bs == 'BUY' and oc == 'C': bs_label = 'BTC'
