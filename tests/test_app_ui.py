@@ -269,7 +269,7 @@ def test_failed_compute_commits_no_snapshot():
     assert "Berechnung nicht möglich" in rendered
 
 
-def test_incompatible_fx_currency_blocks_entire_snapshot():
+def test_incompatible_fx_currency_keeps_marked_partial_snapshot():
     body = SYNTHETIC_BODY + """
       <FxTransactions>
         <FxTransaction reportDate="2025-06-01" dateTime="2025-06-01 10:00:00"
@@ -278,18 +278,101 @@ def test_incompatible_fx_currency_blocks_entire_snapshot():
       </FxTransactions>
     """
     dataset = make_dataset([
-        ("valid.xml", make_xml(account="U111")),
+        ("valid.xml", make_xml(account="U111", body=SYNTHETIC_BODY + '''
+            <FxTransactions><FxTransaction reportDate="2025-06-01"
+              functionalCurrency="EUR" fxCurrency="USD" quantity="-100"
+              realizedPL="22" code="C" levelOfDetail="TRANSACTION" />
+            </FxTransactions>''')),
         ("wrong-fx.xml", make_xml(body=body, account="U222")),
     ])
     at = run_app(dataset)
-    assert_no_exception(at, "F2 wird als Eingabefehler behandelt")
-    assert 'snapshot' not in at.session_state, "Kein unvollstaendiger Konten-Merge"
+    assert_no_exception(at, "F2 erlaubt gekennzeichnete Teilberechnung")
+    report = at.session_state['snapshot']['payload']['merged']
+    final = ui_model.build_final_values(report, ui_model.default_toggles())
+    assert final['fx_incomplete']
+    assert report['fx_total_gain'] == 22, 'FX des kompatiblen Kontos bleibt enthalten'
+    assert report['dividends_eur'] == 200
+    assert report['stocks_gain_eur'] == 360
+    assert final['zeile_19'] == 582
+    assert len(report['fx_unresolved']) == 1
+    assert report['fx_unresolved'][0]['account_id'] == 'U222'
     rendered = all_markdown(at)
-    assert "Berechnung nicht möglich" in rendered
-    assert "FX-Ergebniswährung nicht kompatibel" in rendered
+    assert "Berechnung nicht möglich" not in rendered
+    assert "Vorläufige Teilberechnung" in rendered
+    assert 'vorläufig · FX fehlt' in rendered
+    assert 'Die Formularwerte zum Übertragen' not in rendered
+
+    at.session_state['nav'] = 'kap'
+    at.run()
+    assert_no_exception(at, 'FX-Sektion mit Warnhinweis')
+    rendered = all_markdown(at)
     assert "functionalCurrency=USD" in rendered
     assert "Kontobasiswährung EUR" in rendered
-    assert not at.get('download_button'), "Keine Exporte falscher Steuerwerte"
+    assert "nicht zwingend fehlerhaft" in rendered
+    assert "ursprünglichen Anschaffungskosten in EUR" in rendered
+    assert 'keine automatische Ersatzberechnung' in rendered
+    assert 'Berechneter FX-Anteil der übrigen Konten' in rendered
+    assert 'Konto 2 (Synthetic) · FX ungeklärt' in rendered
+    assert "<br><br>" in rendered, "Erklaerung in lesbare Absaetze gliedern"
+
+    at.session_state['nav'] = 'export'
+    at.run()
+    assert_no_exception(at, 'Teilbericht exportierbar')
+    exports = at.session_state['export_cache']
+    assert at.get('download_button'), 'Exporte bleiben verfuegbar'
+    assert 'Vorläufige Teilberechnung' in exports['txt']
+    assert 'Konto U222' in exports['txt']
+    assert 'Nicht ermittelt bedeutet nicht null' in exports['txt']
+    assert 'Zeile 19 (Netto):' in exports['txt']
+    assert '582,00 EUR (vorläufig · FX fehlt)' in exports['txt']
+    import io
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(exports['xlsx']))
+    assert wb.active.title == 'FX-Prüfhinweis'
+    assert 'Vorläufige Teilberechnung' in wb.active['A1'].value
+    assert 'Konto U222' in wb.active['A2'].value
+    z19 = next(row for row in wb['Zusammenfassung'].values
+               if row[1] == 'Zeile 19 - ausländische Kapitalerträge netto')
+    assert z19[2] == 582
+    assert 'Vorläufig' in z19[3]
+    assert 'Vorläufig' in wb['Trade-Details 2025']['A2'].value
+
+    # Ein neuer, kompatibler Datensatz darf weder Warnung noch alten Export behalten.
+    at.session_state['dataset'] = make_dataset([('fixed.xml', make_xml())])
+    at.session_state['nav'] = 'overview'
+    at.run()
+    assert_no_exception(at, 'Datensatzwechsel entfernt FX-Prueffall')
+    assert 'FX ungeklärt' not in all_markdown(at)
+    assert not at.session_state['snapshot']['payload']['merged']['fx_unresolved']
+
+
+def test_fx_partial_single_account_has_no_zero_fx_result():
+    body = SYNTHETIC_BODY + '''<FxTransactions>
+      <FxTransaction reportDate="2025-06-01" functionalCurrency="USD"
+        fxCurrency="EUR" quantity="-100" realizedPL="0" code="O"
+        levelOfDetail="TRANSACTION" /></FxTransactions>'''
+    at = run_app(make_dataset([('partial.xml', make_xml(body=body))]), nav='kap')
+    assert_no_exception(at, 'Einzelkonto mit Null-PnL in abweichender Waehrung')
+    rendered = all_markdown(at)
+    assert 'Fremdwährungs-Gewinne/Verluste · ungeklärt' in rendered
+    assert 'FX Netto' not in rendered
+    assert 'FX Gewinne' not in rendered
+    assert 'functionalCurrency=USD' in rendered
+    assert at.session_state['snapshot']['payload']['merged']['fx_results'] == {}
+
+
+def test_fx_currency_guidance_escapes_xml_content():
+    body = '''<FxTransactions>
+        <FxTransaction reportDate="2025-06-01" dateTime="2025-06-01 10:00:00"
+          functionalCurrency="&lt;img src=x&gt;" fxCurrency="EUR" quantity="-100"
+          realizedPL="10" code="C" levelOfDetail="TRANSACTION" />
+      </FxTransactions>'''
+    at = run_app(make_dataset([('untrusted-currency.xml', make_xml(body=body))]))
+    assert_no_exception(at, 'Waehrungstext aus XML wird escaped')
+    rendered = all_markdown(at)
+    assert '&lt;IMG SRC=X&gt;' in rendered
+    assert '<IMG SRC=X>' not in rendered
+    assert 'snapshot' not in at.session_state
 
 
 def test_quarterly_fx_fills_reach_final_values():
@@ -457,7 +540,9 @@ if __name__ == '__main__':
         test_compute_cache_hits_on_navigation_and_recomputes_on_compute_toggle,
         test_dataset_switch_resets_domain_state_and_nav,
         test_failed_compute_commits_no_snapshot,
-        test_incompatible_fx_currency_blocks_entire_snapshot,
+        test_incompatible_fx_currency_keeps_marked_partial_snapshot,
+        test_fx_partial_single_account_has_no_zero_fx_result,
+        test_fx_currency_guidance_escapes_xml_content,
         test_quarterly_fx_fills_reach_final_values,
         test_mixed_valid_and_non_flex_xml_is_a_hard_error,
         test_multi_statement_xml_is_a_hard_error,

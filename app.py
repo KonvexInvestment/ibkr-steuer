@@ -677,6 +677,9 @@ def notice_html(notice: dict, show_target: bool = True) -> str:
     css = cls if cls in ('prueffall', 'transparenz', 'fehler') else 'transparenz'
     if cls == 'prueffall' and severity == 'kritisch':
         css += ' kritisch'
+    body_html = '<br><br>'.join(
+        esc(paragraph) for paragraph in notice.get('body', '').split('\n\n')
+    )
     target_html = ''
     if show_target and notice.get('target'):
         target_label = ui_model.page_label(notice['target'])
@@ -686,7 +689,7 @@ def notice_html(notice: dict, show_target: bool = True) -> str:
     return (
         f'<div class="notice {css}">'
         f'<div class="notice-title">{esc(notice.get("title", ""))}</div>'
-        f'{esc(notice.get("body", ""))}'
+        f'{body_html}'
         f'{target_html}'
         f'</div>'
     )
@@ -713,6 +716,10 @@ def build_tax_result_summary_html(
     kap_inv_lines = list(kap_inv_lines or [])
     review_items = list(review_items or [])
     so_rows = list(so_rows or [])
+    fx_incomplete = final.get('fx_incomplete', False)
+    fx_status = 'vorläufig · FX fehlt' if fx_incomplete else ''
+    if fx_incomplete:
+        kap_status, kap_status_tone = 'Vorläufig · FX ungeklärt', 'warning'
 
     status_html = (
         f'<span class="status-chip {kap_status_tone}">KAP · '
@@ -734,10 +741,11 @@ def build_tax_result_summary_html(
         )
     rows_html += (
         kap_row("Z. 19", "Ausländische Kapitalerträge (Netto)",
-                final['zeile_19'], highlight=True)
+                final['zeile_19'], highlight=True,
+                status=fx_status, status_tone='warning')
         + kap_row("Z. 20", "Davon: Aktiengewinne", final['zeile_20'])
         + kap_row("Z. 22", "Verluste ohne Aktien", final['zeile_22'],
-                  force_positive=True)
+                  force_positive=True, status=fx_status, status_tone='warning')
         + kap_row("Z. 23", "Aktienverluste", final['zeile_23'],
                   force_positive=True)
         + kap_row("Z. 41", "Anrechenbare ausländische Quellensteuer",
@@ -795,7 +803,7 @@ def build_tax_result_summary_html(
         <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:0.75rem;flex-wrap:wrap;margin-bottom:0.6rem;">
             <div>
                 <div class="card-title">Eintragungsübersicht {steuerjahr}</div>
-                <div class="card-sub">Die Formularwerte zum Übertragen; Rechenwege und Nachweise stehen in den Bereichen links.</div>
+                <div class="card-sub">{'Vorläufige Teilwerte: Zeile 19 und 22 erst nach Klärung der fehlenden FX-Sektion übernehmen.' if fx_incomplete else 'Die Formularwerte zum Übertragen; Rechenwege und Nachweise stehen in den Bereichen links.'}</div>
             </div>
             <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">{status_html}</div>
         </div>
@@ -939,6 +947,9 @@ def merge_report_data(reports):
     # FX source
     sources = set(r.get('fx_source', 'none') for r in reports)
     merged['fx_source'] = sources.pop() if len(sources) == 1 else 'mixed'
+    merged['fx_unresolved'] = [
+        copy.deepcopy(item) for r in reports for item in r.get('fx_unresolved', [])
+    ]
 
     # fx_results (by currency)
     merged_fx = {}
@@ -2050,6 +2061,8 @@ def build_plausibility(d, toggles):
         ("FX (Devisen) Netto", ibkr_fx.get('net', 0),
          fx_total_gain + fx_total_loss),
     ]
+    if d.get('fx_unresolved'):
+        rows = [row for row in rows if row[0] != 'FX (Devisen) Netto']
     csv_income = d.get('csv_income_totals', {})
     if 'dividends_eur' in csv_income:
         rows.append(("Dividenden", csv_income['dividends_eur'], our_div))
@@ -2351,6 +2364,8 @@ kritisch_notices = [
 transparenz_notices = [
     n for n in vm['notices'] if n['class'] == 'transparenz'
 ]
+fx_partial_suffix = ' (vorläufig · FX fehlt)' if final['fx_incomplete'] else ''
+fx_review_text = ui_model.fx_review_note(d)
 
 
 def _inline_marker(page_id):
@@ -2460,7 +2475,7 @@ def render_overview():
 
     # Status-Streifen
     chips = []
-    if plaus:
+    if plaus and not final['fx_incomplete']:
         if plaus['all_match']:
             chips.append('<span class="status-chip ok">Plausibilitätscheck ok</span>')
         else:
@@ -2488,7 +2503,7 @@ def render_overview():
     # Sekundärkarten
     secondary = [
         metric_card("Topf 1 · Aktien", final['topf_1'], "saldo"),
-        metric_card("Topf 2 · Sonstiges", final['topf_2'], "saldo"),
+        metric_card("Topf 2 · Sonstiges" + fx_partial_suffix, final['topf_2'], "saldo"),
     ]
     if has_etf_data and invstg_aktiv:
         secondary.append(metric_card(
@@ -2580,9 +2595,9 @@ def render_kap():
         (metric_card("Gebühren (nachrichtl.)", d.get('other_fees_eur', 0),
                      "info")
          if abs(d.get('other_fees_eur', 0)) > 0.01 else ''),
-        metric_card("Sonstige Gewinne", final['options_gain'], "gain"),
-        metric_card("Sonstige Verluste", final['options_loss'], "loss"),
-        metric_card("Saldo Sonstiges", final['topf_2'], "saldo"),
+        metric_card("Sonstige Gewinne" + fx_partial_suffix, final['options_gain'], "gain"),
+        metric_card("Sonstige Verluste" + fx_partial_suffix, final['options_loss'], "loss"),
+        metric_card("Saldo Sonstiges" + fx_partial_suffix, final['topf_2'], "saldo"),
     ), unsafe_allow_html=True)
 
     if topf2_breakdown:
@@ -2619,12 +2634,17 @@ def render_kap():
 
 
 def _render_kap_fx_section():
+    if final['fx_incomplete']:
+        section_title('Fremdwährungs-Gewinne/Verluste · ungeklärt')
+        render_notices([n for n in vm['notices']
+                        if n['id'] == 'fx_currency_unresolved'], show_target=False)
     if not fx_results:
         return
     src_label = {
         'csv': 'IBKR-Bericht', 'xml': 'XML FxTransactions',
     }.get(fx_source, 'FIFO-Approximation')
-    section_title(f"Fremdwährungs-Gewinne/Verluste ({src_label})")
+    section_title('Berechneter FX-Anteil der übrigen Konten' if final['fx_incomplete']
+                  else f"Fremdwährungs-Gewinne/Verluste ({src_label})")
     st.markdown(metric_grid(
         metric_card("FX Gewinne", fx_total_gain, "gain"),
         metric_card("FX Verluste", fx_total_loss, "loss"),
@@ -2942,8 +2962,9 @@ def _render_kap_multi_account():
             "------:|\n")
         for idx, (name, acct_final) in enumerate(
                 zip(account_names, per_account_finals)):
+            acct_status = ' · FX ungeklärt' if acct_final['fx_incomplete'] else ''
             acct_table += (
-                f"| Konto {idx + 1} ({name}) | "
+                f"| Konto {idx + 1} ({name}){acct_status} | "
                 f"{fmt_de(acct_final['topf_1'])} | "
                 f"{fmt_de(acct_final['topf_2'])} | "
                 f"{fmt_de(acct_final['zeile_7'])} | "
@@ -2952,15 +2973,15 @@ def _render_kap_multi_account():
                 f"{fmt_de(acct_final['zeile_38'])} | "
                 f"{fmt_de(acct_final['quellensteuer'])} |\n")
         acct_table += (
-            f"| **Gesamt** | **{fmt_de(final['topf_1'])}** | "
+            f"| **Gesamt{fx_partial_suffix}** | **{fmt_de(final['topf_1'])}** | "
             f"**{fmt_de(final['topf_2'])}** | **{fmt_de(final['zeile_7'])}** | "
             f"**{fmt_de(final['zeile_19'])}** | **{fmt_de(final['zeile_37'])}** | "
             f"**{fmt_de(final['zeile_38'])}** | "
             f"**{fmt_de(final['quellensteuer'])}** |\n")
         st.markdown(acct_table)
         st.caption(
-            "Jedes Konto wurde vollständig separat berechnet (Trades, "
-            "Dividenden, FX, Stillhalter); die Einzelergebnisse wurden "
+            "Jedes Konto wurde separat berechnet (Trades, Dividenden, "
+            "Stillhalter sowie auswertbare FX-Sektionen); die Einzelergebnisse wurden "
             "anschließend addiert. Konto- und Gesamtzeile enthalten dieselben "
             "aktiven Methoden (Zufluss, InvStG, Tageskurs und gegebenenfalls "
             "Variante B). Abweichungen von einem Cent können ausschließlich "
@@ -3839,7 +3860,10 @@ def _render_plausibility():
             f"| {row['label']} | {fmt_de(row['ibkr'])} | "
             f"{fmt_de(row['ours'])} | {fmt_de(row['diff'])}{icon} |\n")
     st.markdown(check_table)
-    if plaus['all_match'] and not (plaus['zinsen_fx_diff']
+    if final['fx_incomplete']:
+        st.warning('FX ist ungeklärt und aus diesem Vergleich ausgenommen. '
+                   'Der Abgleich der übrigen Kategorien bestätigt keinen vollständigen Steuerbericht.')
+    elif plaus['all_match'] and not (plaus['zinsen_fx_diff']
                                    or plaus['fx_saldo_diff']):
         st.success("Alle Kategorien stimmen mit dem IBKR-Bericht überein.")
     elif plaus['all_match']:
@@ -4111,7 +4135,7 @@ Da Interactive Brokers ein **ausländischer Broker ohne inländischen Steuerabzu
 
 ### Währungsumrechnung
 
-{"**Das Konto hat EUR als Basiswährung.** Alle Beträge in der IBKR-Abrechnung sind bereits in EUR umgerechnet. Bei USD-Trades nutzt IBKR den Tageskurs (`fxRateToBase`), der direkt in EUR umrechnet, kein zusätzlicher FX-Lookup erforderlich." if base_curr == "EUR" else "**Das Konto hat USD als Basiswährung.** Beträge werden in zwei Schritten umgerechnet: (1) Trade-Währung → USD über `fxRateToBase`, (2) USD → EUR über den Tageskurs des vorherigen Geschäftstags. Die täglichen USD/EUR-Kurse werden aus den IBKR-Daten extrahiert."}
+{"**Das Konto hat EUR als Basiswährung.** Bei USD-Trades nutzt IBKR den Tageskurs (`fxRateToBase`), der direkt in EUR umrechnet. Die Ergebniswährung der separaten FX-Sektion wird unabhängig davon geprüft; sie muss nicht mit der Kontobasis übereinstimmen." if base_curr == "EUR" else "**Das Konto hat USD als Basiswährung.** Beträge werden in zwei Schritten umgerechnet: (1) Trade-Währung → USD über `fxRateToBase`, (2) USD → EUR über den Tageskurs des vorherigen Geschäftstags. Die täglichen USD/EUR-Kurse werden aus den IBKR-Daten extrahiert."}
 
 ---
 
@@ -4408,6 +4432,18 @@ def _build_excel(trade_details, trades_by_topf, export_context):
     num_fmt_eur = '#,##0.00'; num_fmt_4d = '#,##0.0000'
 
     f = export_context['final']
+    fx_note = export_context.get('fx_review_note', '')
+    partial_note = 'Vorläufig: FX-Sektion betroffener Konten fehlt' if f.get('fx_incomplete') else ''
+    if partial_note:
+        ws_fx = wb.create_sheet('FX-Prüfhinweis', 0)
+        ws_fx.column_dimensions['A'].width = 115
+        for i, paragraph in enumerate(fx_note.split('\n\n'), 1):
+            cell = ws_fx.cell(row=i, column=1, value=paragraph)
+            cell.alignment = Alignment(wrap_text=True, vertical='top')
+            cell.font = Font(size=11, bold=(i == 1), color='9c0006' if i == 1 else '000000')
+            cell.fill = loss_fill if i == 1 else korr_fill
+            ws_fx.row_dimensions[i].height = max(45, 15 * (len(paragraph) // 100 + 2))
+        wb.active = 0
     has_etf = export_context['has_etf_data'] and export_context['invstg_aktiv']
     kap_inv_form_export = export_context.get('kap_inv_form', {})
     has_so = export_context['has_so_data']
@@ -4441,6 +4477,8 @@ def _build_excel(trade_details, trades_by_topf, export_context):
         ("Basiswährung", export_context['base_currency']),
         ("Quelle", "final (GUI/Textreport Single Source of Truth)"),
     ]
+    if partial_note:
+        meta_rows.insert(0, ('Status', partial_note + '; Details im Blatt FX-Prüfhinweis'))
     for label, value in meta_rows:
         ws.cell(row=row_num, column=1, value=label)
         ws.cell(row=row_num, column=2, value=value)
@@ -4457,13 +4495,13 @@ def _build_excel(trade_details, trades_by_topf, export_context):
         ("Topf 1", "Saldo Aktien", f['topf_1'], ""),
         ("Topf 2", "Dividenden", f['dividends'], ""),
         ("Topf 2", "Zinsen netto", f['interest'], ""),
-        ("Topf 2", "Sonstige Gewinne", f['options_gain'], ""),
-        ("Topf 2", "Sonstige Verluste", f['options_loss'], ""),
-        ("Topf 2", "Saldo Sonstiges", f['topf_2'], ""),
+        ("Topf 2", "Sonstige Gewinne", f['options_gain'], partial_note),
+        ("Topf 2", "Sonstige Verluste", f['options_loss'], partial_note),
+        ("Topf 2", "Saldo Sonstiges", f['topf_2'], partial_note),
         ("Anlage KAP", "Zeile 7 - inländischer Steuerabzug", f['zeile_7'], ""),
-        ("Anlage KAP", "Zeile 19 - ausländische Kapitalerträge netto", f['zeile_19'], ""),
+        ("Anlage KAP", "Zeile 19 - ausländische Kapitalerträge netto", f['zeile_19'], partial_note),
         ("Anlage KAP", "Zeile 20 - Aktiengewinne", f['zeile_20'], ""),
-        ("Anlage KAP", "Zeile 22 - Verluste ohne Aktien", f['zeile_22'], "positiver Eintrag"),
+        ("Anlage KAP", "Zeile 22 - Verluste ohne Aktien", f['zeile_22'], partial_note or "positiver Eintrag"),
         ("Anlage KAP", "Zeile 23 - Aktienverluste", f['zeile_23'], "positiver Eintrag"),
         ("Anlage KAP", "Zeile 37 - Kapitalertragsteuer", f['zeile_37'], ""),
         ("Anlage KAP", "Zeile 38 - Solidaritätszuschlag", f['zeile_38'], ""),
@@ -4557,6 +4595,8 @@ def _build_excel(trade_details, trades_by_topf, export_context):
             cell = ws.cell(row=row_num, column=ci, value=val)
             cell.font = normal_font
             cell.border = thin_border
+            if ci == 4:
+                cell.alignment = Alignment(wrap_text=True, vertical='top')
             if ci == 3 and isinstance(val, (int, float)):
                 cell.number_format = num_fmt_eur
                 if val > 0.005:
@@ -4634,6 +4674,11 @@ def _build_excel(trade_details, trades_by_topf, export_context):
     notice.font = Font(italic=True, size=9, color="7f6000")
     notice.fill = korr_fill
     row_num = 3
+    if partial_note:
+        ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(cols))
+        cell = ws.cell(row=2, column=1, value=partial_note + '; siehe FX-Prüfhinweis')
+        cell.font = Font(bold=True, size=11, color='9c0006')
+        cell.fill = loss_fill
     for topf_key in EXPORT_TOPF_ORDER:
         topf_rows = trades_by_topf.get(topf_key, [])
         if not topf_rows: continue
@@ -4729,9 +4774,11 @@ def _build_text_report():
     zeile_38 = d.get("zeile_38_solidaritaetszuschlag_eur", 0)
     classification_review_items = d.get("classification_review_items", []) or []
     partnership_tax_items = d.get("partnership_tax_items", {}) or {}
-    fx_export = ""
+    fx_export = ('\nFREMDWÄHRUNGS-GEWINNE/VERLUSTE: NICHT VOLLSTÄNDIG ERMITTELT\n'
+                 if final['fx_incomplete'] else '')
     if fx_results:
-        fx_export = "\nFREMDWÄHRUNGS-GEWINNE/VERLUSTE (FIFO)\n"
+        fx_export += ('Berechneter FX-Anteil der übrigen Konten:\n' if final['fx_incomplete']
+                      else '\nFREMDWÄHRUNGS-GEWINNE/VERLUSTE (FIFO)\n')
         for curr, data in sorted(fx_results.items()):
             fx_export += f"  {curr}: Gewinn {fmt_de(data['gain']):>10}  Verlust {fmt_de(data['loss']):>10}  Netto {fmt_de(data['net']):>10} EUR\n"
         fx_net = fx_total_gain + fx_total_loss
@@ -4934,6 +4981,7 @@ def _build_text_report():
     report_text = f"""ANLAGE KAP {steuerjahr} - Steuerbericht
 Erstellt: {created_at}
 Basiswährung: {d.get('base_currency', 'USD')}
+{fx_review_text}
 {multi_acct_export}
 {classification_review_export}
 {partnership_export}
@@ -4944,7 +4992,7 @@ TOPF 1: AKTIEN (ohne ETF-Fonds)
   ─────────────────────────────────────────────────
   Saldo Aktien:          {fmt_de(final['topf_1']):>14} EUR
 
-TOPF 2: SONSTIGES (inkl. Termingeschäfte)
+TOPF 2: SONSTIGES (inkl. Termingeschäfte){fx_partial_suffix}
   Dividenden:            {fmt_de(final['dividends']):>14} EUR
   Zinsen (netto):        {fmt_de(final['interest']):>14} EUR
   Sonstige Gewinne:     {fmt_de(final['options_gain']):>14} EUR
@@ -4955,9 +5003,9 @@ TOPF 2: SONSTIGES (inkl. Termingeschäfte)
 ═══════════════════════════════════════════════════
 ANLAGE KAP EINTRAGUNGEN
 {"" if abs(final['zeile_7']) <= 0.01 else f"  Zeile 7 (inländischer Steuerabzug): {fmt_de(final['zeile_7']):>7} EUR" + chr(10) + f"  Zeile 37 (Kapitalertragsteuer): {fmt_de(final['zeile_37']):>10} EUR" + chr(10) + f"  Zeile 38 (Solidaritätszuschlag): {fmt_de(final['zeile_38']):>9} EUR" + chr(10)}
-  Zeile 19 (Netto):      {fmt_de(final['zeile_19']):>14} EUR
+  Zeile 19 (Netto):      {fmt_de(final['zeile_19']):>14} EUR{fx_partial_suffix}
   Zeile 20 (Aktiengewinne): {fmt_de(final['zeile_20']):>11} EUR
-  Zeile 22 (Verluste o. Aktien): {fmt_de(final['zeile_22']):>8} EUR
+  Zeile 22 (Verluste o. Aktien): {fmt_de(final['zeile_22']):>8} EUR{fx_partial_suffix}
   Zeile 23 (Aktienverluste): {fmt_de(final['zeile_23']):>11} EUR
   Zeile 41 (ausl. Quellensteuer): {fmt_de(final['quellensteuer']):>8} EUR
 {de_kest_export}{kap_inv_entries_export}{"" if not has_so_data else chr(10) + "ANLAGE SO (§23 EStG): PRIVATE VERÄUSSERUNGSGESCHÄFTE" + chr(10) + f"  Physische Gold-ETCs (BFH VIII R 35/14, VIII R 4/15)" + chr(10) + f"  Steuerpflichtig (≤ 1J): {fmt_de(so_taxable):>12} EUR  → Anlage SO" + chr(10) + f"  Steuerfrei (> 1J):      {fmt_de(so_free):>12} EUR" + chr(10)}═══════════════════════════════════════════════════
@@ -5033,6 +5081,7 @@ def _build_exports():
 
     export_context = {
         'final': final,
+        'fx_review_note': fx_review_text,
         'base_currency': d.get('base_currency', 'USD'),
         'created_at': created_at,
         'has_etf_data': has_etf_data,
@@ -5087,7 +5136,7 @@ def render_export():
         '<div class="notice transparenz">'
         '<div class="notice-title">Formularwerte und Detailwerte sind zwei '
         'verschiedene Ebenen</div>'
-        '<strong>Für die Steuererklärung</strong> gelten die Werte aus der '
+        '<strong>Nach Klärung offener Prüffälle</strong> gelten die Werte aus der '
         'Übersicht, dem Excel-Blatt „Zusammenfassung“ und dem Textreport. '
         '<strong>Für die Kontrolle</strong> folgen darunter die Summen der '
         'einzelnen Trades, Korrekturen und Zuflüsse. Diese Detail-Summen '
@@ -5130,10 +5179,10 @@ def render_export():
         st.warning(exports['xlsx_error'])
     elif exports['xlsx'] is not None:
         st.download_button(
-            label=(f"Steuerbericht als Excel herunterladen "
+            label=(f"{'Vorläufigen Teilbericht' if final['fx_incomplete'] else 'Steuerbericht'} als Excel herunterladen "
                    f"({exports['n_details']} Detailpositionen)"),
             data=exports['xlsx'],
-            file_name=f"steuerbericht_{steuerjahr}.xlsx",
+            file_name=f"steuerbericht_{steuerjahr}{'_vorlaeufig_fx_offen' if final['fx_incomplete'] else ''}.xlsx",
             mime=("application/vnd.openxmlformats-officedocument."
                   "spreadsheetml.sheet"),
             use_container_width=True,
@@ -5141,9 +5190,9 @@ def render_export():
 
     section_title("Textreport")
     st.download_button(
-        label="Textreport herunterladen",
+        label='Vorläufigen Textreport herunterladen' if final['fx_incomplete'] else 'Textreport herunterladen',
         data=exports['txt'],
-        file_name=f"steuerbericht_{steuerjahr}.txt",
+        file_name=f"steuerbericht_{steuerjahr}{'_vorlaeufig_fx_offen' if final['fx_incomplete'] else ''}.txt",
         mime="text/plain",
         use_container_width=True,
     )
@@ -5162,5 +5211,17 @@ _PAGE_RENDERERS = {
     'rechenwege': render_rechenwege,
     'export': render_export,
 }
+
+if final['fx_incomplete']:
+    st.markdown(notice_html({
+        'class': 'prueffall', 'severity': 'kritisch',
+        'title': 'Vorläufige Teilberechnung – FX ungeklärt',
+        'body': ('Die übrigen Bereiche wurden berechnet. Die FX-Sektion betroffener '
+                 'Konten fehlt in Topf 2, Zeile 19 und Zeile 22. Diese Werte sind '
+                 'vorläufig und vor der Steuerabgabe zu ergänzen – nicht ermittelt '
+                 'bedeutet nicht null. Details und nächste Schritte stehen in der '
+                 'FX-Sektion unter Anlage KAP sowie in den Prüffällen und Exporten.'),
+        'target': 'kap',
+    }), unsafe_allow_html=True)
 
 _PAGE_RENDERERS[_nav_current]()

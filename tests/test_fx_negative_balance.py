@@ -815,16 +815,12 @@ def tc28_missing_balance_column_falls_back_to_cumulation():
 
 
 def tc30_incompatible_fx_currency_stops_computation():
-    """F2: Weder Teilwerte noch ungepruefter FIFO-Fallback bei falscher Einheit."""
+    """Fehlende/unplausible Waehrungsfelder bleiben harte Eingabefehler."""
     invalid_rows = [
-        dict(fx_pnl_row("2025-06-01", -13000, 1051.17),
-             functionalCurrency="USD", fxCurrency="EUR"),
-        dict(fx_pnl_row("2025-06-01", -100, 10),
-             functionalCurrency="USD", fxCurrency="GBP"),
-        dict(fx_pnl_row("2025-06-01", -100, 0),
-             functionalCurrency="USD"),
+        dict(fx_pnl_row("2025-06-01", -100, 10), functionalCurrency="CAD"),
         dict(fx_pnl_row("2025-06-01", -100, 10),
              functionalCurrency=""),
+        dict(fx_pnl_row("2025-06-01", -100, 10), fxCurrency=""),
         dict(fx_pnl_row("2025-06-01", -100, 10), fxCurrency="EUR"),
     ]
     for invalid in invalid_rows:
@@ -845,8 +841,20 @@ def tc30_incompatible_fx_currency_stops_computation():
                         calculate_tax(tmp, tax_year=TAX_YEAR,
                                       fx_margin_correction_enabled=correction_enabled)
                 except ValueError as exc:
-                    assert "FX-Ergebniswährung" in str(exc), str(exc)
-                    assert "functionalCurrency" in str(exc), str(exc)
+                    message = str(exc)
+                    assert "FX-Ergebniswährung" in message, message
+                    assert "functionalCurrency" in message, message
+                    assert "Kein automatischer FIFO-Fallback" in message
+                    if not invalid['functionalCurrency'] or not invalid['fxCurrency']:
+                        assert "Währungsangaben fehlen" in message
+                        assert "vollständig ausgewählten Währungsfeldern" in message
+                    elif invalid['functionalCurrency'] != 'EUR':
+                        assert "nicht zwingend fehlerhaft" in message
+                        assert "ursprünglichen Anschaffungskosten in EUR" in message
+                        assert "Stichtagskurs" in message
+                        assert "hebt diese Sperre nicht automatisch auf" in message
+                    else:
+                        assert "dieselbe Währung wie die Kontobasis" in message
                 else:
                     raise AssertionError(f"F2 muss Berechnung sperren: {invalid}")
     print("TC30 OK — falsche/fehlende FX-Ergebniswaehrung sperrt die Berechnung")
@@ -888,6 +896,55 @@ def tc32_usd_functional_currency_keeps_existing_conversion():
     print("TC32 OK — passendes USD-Konto behaelt seine USD/EUR-Umrechnung")
 
 
+def tc33_usd_fx_section_is_excluded_but_other_income_survives():
+    """EUR/USD-Sonderfall: ganze Konto-FX-Sektion offen, kein B/C-Fallback."""
+    for pnl in (1051.17, 0):
+        for correction_enabled in (True, False):
+            with tempfile.TemporaryDirectory() as tmp:
+                write_csv(os.path.join(tmp, 'account_info.csv'), [
+                    {'currency': 'EUR', 'accountId': 'SYNTHETIC',
+                     'tax_year': '2025', 'fx_transactions_count': '3'},
+                ])
+                write_csv(os.path.join(tmp, 'statement_of_funds.csv'), [
+                    {'currency': 'EUR', 'date': '2025-06-01', 'amount': '100',
+                     'activityCode': 'DIV', 'activityDescription': 'AAPL Dividend',
+                     'assetCategory': 'STK', 'symbol': 'AAPL',
+                     'isin': 'US0378331005', 'fxRateToBase': '1'},
+                ])
+                write_csv(os.path.join(tmp, 'fx_realized_pnl.csv'), [
+                    fx_pnl_row('2025-05-01', -100, 10),
+                    dict(fx_pnl_row('2025-06-01', -13000, pnl),
+                         functionalCurrency='USD', fxCurrency='EUR'),
+                    dict(fx_pnl_row('2025-06-02', -100, -3),
+                         functionalCurrency='USD', fxCurrency='GBP'),
+                ])
+                write_csv(os.path.join(tmp, 'fx_transactions.csv'), [
+                    make_tx('2025-06-01', -100, 1.1, 'BUY', balance=-100),
+                ])
+                csv_path = os.path.join(tmp, 'broker.csv')
+                write_csv(csv_path, [{'placeholder': 'synthetic'}])
+                with contextlib.redirect_stdout(io.StringIO()), patch(
+                        'calculate_tax_report.calculate_fx_gains',
+                        side_effect=AssertionError('Kein FIFO-Fallback')), patch(
+                        'calculate_tax_report.parse_ibkr_csv_report', return_value={
+                            'category_totals': {}, 'fx_results': {'USD': {'gain': 999}},
+                            'fx_total_gain': 999, 'fx_total_loss': 0}):
+                    report = calculate_tax(tmp, tax_year=TAX_YEAR,
+                                           fx_csv_path=csv_path,
+                                           fx_margin_correction_enabled=correction_enabled)
+                assert report['fx_source'] == 'unresolved'
+                assert report['fx_results'] == {}, 'Keine falschen EUR-Detailwerte'
+                assert report['fx_total_gain'] == report['fx_total_loss'] == 0
+                assert report['dividends_eur'] == report['zeile_19_netto_eur'] == 100
+                assert 'Devisen' not in report['topf2_by_category']
+                issue, = report['fx_unresolved']
+                assert issue['account_id'] == 'SYNTHETIC'
+                assert issue['row_count'] == 2
+                assert issue['excluded_row_count'] == 3
+                assert issue['functional_currency'] == 'USD'
+    print('TC33 OK — restliche Rechnung bleibt nutzbar, FX explizit ungeklärt')
+
+
 def run_all():
     tests = [tc1_margin_tilgung, tc2_dauerhaft_margin_via_aktienkauf,
              tc3_voll_im_plus, tc4_negative_starting_balance,
@@ -914,7 +971,8 @@ def run_all():
              tc29_opening_row_with_pnl_is_reported,
              tc30_incompatible_fx_currency_stops_computation,
              tc31_fx_currency_gate_only_checks_tax_year,
-             tc32_usd_functional_currency_keeps_existing_conversion]
+             tc32_usd_functional_currency_keeps_existing_conversion,
+             tc33_usd_fx_section_is_excluded_but_other_income_survives]
     failed = 0
     for tc in tests:
         try:

@@ -65,6 +65,31 @@ def all_toggles_off():
     return {key: False for key in ui_model.default_toggles()}
 
 
+def test_fx_unresolved_is_explicit_in_finals_and_notice_inventory():
+    issue = {
+        'account_id': 'SYNTHETIC', 'base_currency': 'EUR',
+        'functional_currency': 'USD', 'fx_currencies': ['EUR', 'GBP'],
+        'tax_year': 2025, 'first_report_date': '2025-01-10',
+        'row_count': 3, 'excluded_row_count': 4,
+    }
+    report = make_report(fx_unresolved=[issue], xml_has_fx_data=False)
+    original = copy.deepcopy(report)
+    for toggles in (all_toggles_off(), ui_model.default_toggles()):
+        final = ui_model.build_final_values(report, toggles)
+        assert final['fx_incomplete'] is True
+        assert final['zeile_19'] == 1310
+        assert not ui_model.build_final_values(make_report(), toggles)['fx_incomplete']
+    notices = ui_model.collect_notices(report)
+    notice, = [n for n in notices if n['id'] == 'fx_currency_unresolved']
+    assert notice['severity'] == 'kritisch'
+    assert notice['target'] == 'kap'
+    assert 'Nicht ermittelt bedeutet nicht null' in notice['body']
+    assert 'Konto SYNTHETIC' in notice['body']
+    assert 'Stichtagskurs' in notice['body']
+    assert 'missing_fx_transactions' not in {n['id'] for n in notices}
+    assert report == original
+
+
 # ── Upload-Identitaet ────────────────────────────────────────────────────────
 
 def test_dataset_id_order_independent_and_deduplicated():

@@ -28,7 +28,7 @@ import calculate_tax_report
 
 # Bump when the snapshot payload layout changes; stale session_state snapshots
 # from an older code version are then recomputed instead of rendered.
-SCHEMA_VERSION = 2  # F1/F2/F4: alte Rechenergebnisse nicht weiterverwenden.
+SCHEMA_VERSION = 3  # F2: Teilbericht mit explizit ungeklaerter Konto-FX-Sektion.
 # Bump when the view-model/export layout changes (part of the view key).
 VIEW_SCHEMA_VERSION = 1
 
@@ -640,6 +640,7 @@ def build_final_values(report, toggles, kap_inv_override=None,
         'tageskurs_kapinv_corr_raw': tageskurs_kapinv_corr_raw,
         'tageskurs_kapinv_corr': tageskurs_kapinv_corr,
         'adj_cross': adj_cross,
+        'fx_incomplete': bool(d.get('fx_unresolved')),
     }
 
     if variante_b_on:
@@ -692,6 +693,47 @@ def _notice(notice_id, cls, severity, title, body, target, count=1,
     }
 
 
+def fx_review_note(report):
+    """Gemeinsame Erklaerung fuer FX-Sektion, Prueffaelle und Exporte."""
+    issues = report.get('fx_unresolved') or []
+    if not issues:
+        return ''
+    accounts = '; '.join(
+        f"Konto {item.get('account_id') or '?'}: Kontobasiswährung "
+        f"{item['base_currency']}, functionalCurrency={item['functional_currency']}, "
+        f"betroffene FX-Währungen {', '.join(item['fx_currencies'])}; "
+        f"{item['row_count']} abweichende Zeilen im Steuerjahr "
+        f"{item['tax_year']} (erste: {item['first_report_date']})"
+        for item in issues
+    )
+    return (
+        "Vorläufige Teilberechnung – FX ungeklärt. Die übrigen Bereiche wurden "
+        "berechnet. Die gesamte FX-Sektion der unten genannten Konten ist "
+        "nicht in den Summen enthalten. Topf 2, Zeile 19 und Zeile 22 sind "
+        "deshalb vorläufig: Vor Übernahme in die Steuererklärung muss das "
+        "fehlende FX-Ergebnis gesondert ermittelt und berücksichtigt werden. "
+        "Nicht ermittelt bedeutet nicht null. Es kann ein Gewinn oder Verlust "
+        "fehlen. FX-Werte anderer, kompatibler Konten bleiben enthalten.\n\n"
+        + accounts + ".\n\n"
+        "Was nicht passt: Der Export ist nicht zwingend fehlerhaft. IBKR weist "
+        "realizedPL in der Ergebniswährung USD aus, während die Kontobasis EUR "
+        "ist. Eine unveränderte Übernahme würde USD-Beträge fälschlich als EUR "
+        "ausgeben. Auch eine einfache Umrechnung reicht nicht: Die "
+        "Währungsbestände und Anschaffungen müssen aus EUR-Sicht ermittelt "
+        "werden. Daher werden weder diese Rohwerte noch ein ungeprüfter "
+        "FIFO-/CSV-Fallback als Steuerwerte eingesetzt. Die Tageskurs-Umrechnung "
+        "der Wertpapiergeschäfte ist davon getrennt und läuft weiter.\n\n"
+        "Was benötigt wird: Ein Export mit zur Kontobasis passender "
+        "FX-Ergebniswährung oder eine fachlich geprüfte EUR-FIFO-Ermittlung aus "
+        "vollständigen Kontobewegungen. Für Anfangsbestände braucht man die "
+        "ursprünglichen Anschaffungskosten in EUR (Vorjahresexporte oder "
+        "belegte Anschaffungslose). Ein Stichtagskurs ersetzt diese Historie "
+        "nicht. Bitte beim Ersteller bzw. Steuerberater klären; Währungsfelder "
+        "nicht im XML umbenennen. Ein Vorjahres-Upload allein aktiviert derzeit "
+        "keine automatische Ersatzberechnung."
+    )
+
+
 def collect_notices(report, context=None):
     """The complete notice inventory derived from a compute snapshot.
 
@@ -711,6 +753,13 @@ def collect_notices(report, context=None):
     ctx = context or {}
     audit = report.get('audit', {}) or {}
     notices = []
+    fx_note = fx_review_note(report)
+    if fx_note:
+        notices.append(_notice(
+            'fx_currency_unresolved', 'prueffall', 'kritisch',
+            'FX ungeklärt – übrige Bereiche berechnet', fx_note,
+            'kap', len(report['fx_unresolved']), report['fx_unresolved'],
+        ))
 
     unmatched = audit.get('stillhalter_unmatched', []) or []
     cy_unmatched = [u for u in unmatched if u.get('type') != 'cross_year']
@@ -937,7 +986,7 @@ def collect_notices(report, context=None):
 
     xml_has_fx = report.get('xml_has_fx_data', True)
     fx_source = report.get('fx_source', 'none')
-    if not xml_has_fx and fx_source != 'csv':
+    if not xml_has_fx and fx_source != 'csv' and not fx_note:
         notices.append(_notice(
             'missing_fx_transactions', 'prueffall', 'normal',
             'Keine FX-Transaktionsdaten',

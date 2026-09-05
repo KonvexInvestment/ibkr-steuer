@@ -4359,12 +4359,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                   dba_wht_beta_enabled=False):
     # 0. Detect base currency and tax year from account_info.csv
     base_currency = 'EUR'  # default — most IBKR accounts for German tax filers are EUR-based
+    account_id = ''
     xml_has_fx_data = False
     acct_path = os.path.join(ib_tax_dir, 'account_info.csv')
     if os.path.exists(acct_path):
         acct_rows = load_csv(acct_path)
         if acct_rows:
             base_currency = acct_rows[0].get('currency', 'EUR')
+            account_id = acct_rows[0].get('accountId', '')
             fx_count = int(acct_rows[0].get('fx_transactions_count', '-1'))
             xml_has_fx_data = fx_count > 0
             if tax_year is None:
@@ -6870,8 +6872,35 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     # Betrags; sie ist zusammen mit dem Saldo-Matching entfallen.
     fx_pnl_path = os.path.join(ib_tax_dir, 'fx_realized_pnl.csv')
     fx_option_a_meta = {}
+    fx_unresolved = []  # Offene Konto-FX-Sektion; Nullen unten sind nur Summanden.
     if not fx_results and os.path.exists(fx_pnl_path):
         fx_pnl_rows = load_csv(fx_pnl_path)
+        tax_fx_rows = [row for row in fx_pnl_rows
+                       if (parse_date(row.get('reportDate')) or date.min).year == tax_year]
+        usd_fx_rows = [row for row in tax_fx_rows
+                       if base_currency == 'EUR'
+                       and (row.get('functionalCurrency') or '').strip().upper() == 'USD'
+                       and (row.get('fxCurrency') or '').strip().upper() not in ('', 'USD')]
+        if usd_fx_rows:
+            # Vorab pruefen, damit auch fruehere kompatible Zeilen desselben
+            # Kontos nicht als vermeintlich vollstaendiger FX-Teilwert bleiben.
+            fx_unresolved.append({
+                'account_id': account_id,
+                'base_currency': base_currency,
+                'functional_currency': 'USD',
+                'fx_currencies': sorted({
+                    row['fxCurrency'].strip().upper() for row in usd_fx_rows}),
+                'row_count': len(usd_fx_rows),
+                'excluded_row_count': len(tax_fx_rows),
+                'first_report_date': min(str(parse_date(row['reportDate']))
+                                         for row in usd_fx_rows),
+                'tax_year': tax_year,
+            })
+            fx_source = 'unresolved'
+            print('WARNUNG: Konto-FX-Sektion nicht ermittelt (EUR-Konto, '
+                  'FX-Ergebniswaehrung USD). Uebrige Berechnung laeuft weiter; '
+                  'Topf 2 / Zeile 19 / Zeile 22 bleiben vorlaeufig. '
+                  'Kein automatischer FIFO- oder CSV-Fallback.')
         fx_by_curr = {}
         debt_repayments = 0       # verworfene Zeilen (Schuldtilgung)
         debt_repayment_pnl = 0.0  # deren IBKR-Ergebnis, für die UI-Transparenz
@@ -6882,23 +6911,69 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 continue
             curr = (row.get('fxCurrency') or '').strip().upper()
             functional_currency = (row.get('functionalCurrency') or '').strip().upper()
+            if (fx_unresolved and functional_currency == 'USD'
+                    and curr not in ('', 'USD')):
+                continue
             # IBKR realizedPL ist in functionalCurrency, nicht zwingend in der
             # Kontobasiswaehrung. Auch Null-/Opening-Zeilen pruefen: Eine andere
             # Referenzwaehrung bedeutet einen anderen FIFO-Bestand. Weder eine
             # blosse Umrechnung noch ein stiller Option-C-Fallback behebt das.
             if (functional_currency != base_currency or not curr
                     or curr == base_currency):
+                if not functional_currency or not curr:
+                    explanation = (
+                        "Währungsangaben fehlen in der FX-Sektion. Ohne "
+                        "functionalCurrency (Ergebniswährung) und fxCurrency "
+                        "(betroffene Währung) lassen sich die Beträge nicht "
+                        "verlässlich zuordnen. Bitte beim Ersteller einen "
+                        "Flex-Export mit vollständig ausgewählten Währungsfeldern "
+                        "anfordern; die Angaben nicht im XML ergänzen oder umbenennen."
+                    )
+                elif functional_currency != base_currency:
+                    explanation = (
+                        f"Der Export ist deshalb nicht zwingend fehlerhaft: IBKR "
+                        f"weist die FX-Gewinne und -Verluste hier in "
+                        f"{functional_currency} aus, die übrige Kontorechnung "
+                        f"verwendet {base_currency}. Diese Konstellation kann die "
+                        "App derzeit nicht zuverlässig berechnen. Den FX-Gewinn "
+                        "einfach in EUR umzurechnen reicht nicht: Auch die "
+                        "zugrunde liegenden Währungsbestände und Anschaffungen "
+                        "müssen aus EUR-Sicht ermittelt werden.\n\n"
+                        "Was für eine verlässliche Berechnung benötigt wird: "
+                        "ein Export mit zur Kontobasis passender FX-Ergebniswährung "
+                        "oder eine gesonderte EUR-FIFO-Ermittlung aus vollständigen "
+                        "Kontobewegungen. Für bereits vorhandene Anfangsbestände "
+                        "werden dabei die ursprünglichen Anschaffungskosten in EUR "
+                        "benötigt, etwa aus Vorjahresexporten oder einem belegten "
+                        "Anfangsbestand je Anschaffung. Ein Stichtagskurs ersetzt "
+                        "diese Historie nicht.\n\n"
+                        "Bitte diese Unterlagen beim Ersteller des Exports "
+                        "anfordern und die FX-Ermittlung gegebenenfalls fachlich "
+                        "prüfen lassen. Währungsfelder nicht im XML umbenennen. "
+                        "Weitere Daten allein genügen derzeit nicht: Das Hochladen "
+                        "zusätzlicher Vorjahre hebt diese Sperre nicht automatisch "
+                        "auf; ein solcher Ersatzrechenweg ist noch nicht implementiert."
+                    )
+                else:
+                    explanation = (
+                        "Die FX-Zeile nennt dieselbe Währung wie die Kontobasis "
+                        "als Fremdwährung. Die Währungsangaben sind damit für "
+                        "diesen Rechenweg nicht schlüssig. Bitte den Ersteller "
+                        "des Exports die Felder functionalCurrency und fxCurrency "
+                        "prüfen lassen; die Angaben nicht im XML umbenennen."
+                    )
                 raise FxCurrencyError(
                     f"FX-Ergebniswährung nicht kompatibel: FxTransactions "
                     f"({rd}) meldet functionalCurrency="
                     f"{functional_currency or 'fehlend'}, fxCurrency="
-                    f"{curr or 'fehlend'} bei Kontobasiswährung {base_currency}. "
+                    f"{curr or 'fehlend'} bei Kontobasiswährung {base_currency}.\n\n"
                     "Die Berechnung wurde gestoppt, damit keine falschen "
-                    "EUR-Steuerwerte ausgegeben werden. Bitte einen passenden "
-                    "Flex-Export mit vollständiger FX-Ergebniswährung verwenden "
-                    "oder die FX-Ermittlung gesondert prüfen. Kein automatischer "
-                    "FIFO-Fallback."
+                    "EUR-Steuerwerte ausgegeben werden. Das bedeutet nicht, "
+                    "dass das FX-Ergebnis null ist. Kein automatischer FIFO-Fallback."
+                    f"\n\n{explanation}"
                 )
+            if fx_unresolved:
+                continue
             pnl_raw = safe_float(row.get('realizedPL'), 0)
             qty = safe_float(row.get('quantity'), 0)
             if not curr or abs(pnl_raw) < 0.001:
@@ -6958,6 +7033,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # Negative-Tage-Counter pro Währung aus Timeline ableiten. Currencies mit
         # Margin-Phasen, aber ohne eigene PnL-Zeile, bleiben so in der UI sichtbar.
         for curr in set(fx_by_curr.keys()) | set(fx_balance_timeline.keys()):
+            if fx_unresolved:
+                continue
             final_bal = 0.0
             for d, txid, amt, prev, after in fx_balance_timeline.get(curr, []):
                 final_bal = after
@@ -7024,7 +7101,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     # kann er nicht saldogetreu korrigiert werden. Standard: Option B ueberspringen
     # und Option C nutzen. Opt-out: CSV-Rohwert bewusst uebernehmen, aber die
     # Margin-Metadaten fuer die UI sichtbar halten.
-    if not fx_results and fx_csv_path and os.path.exists(fx_csv_path) and base_currency == 'EUR':
+    if (not fx_unresolved and not fx_results and fx_csv_path
+            and os.path.exists(fx_csv_path) and base_currency == 'EUR'):
         if fx_has_negative_balance and fx_margin_correction_enabled:
             print(f"FX: IBKR-CSV-Bericht übersprungen — negativer Währungssaldo im Steuerjahr erkannt, "
                   f"Fallback auf FIFO mit Saldo-Korrektur (Issue #59).")
@@ -7085,7 +7163,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
 
     # Option C: FIFO approximation from fx_transactions.csv (mit Saldo-Korrektur)
     fx_path = os.path.join(ib_tax_dir, 'fx_transactions.csv')
-    if not fx_results and os.path.exists(fx_path) and base_currency == 'EUR':
+    if (not fx_unresolved and not fx_results and os.path.exists(fx_path)
+            and base_currency == 'EUR'):
         fx_transactions = load_csv(fx_path)
         fx_results, fx_total_gain, fx_total_loss, fx_has_prior_data = calculate_fx_gains(
             trades, fx_transactions, tax_year, base_currency
@@ -7864,6 +7943,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         "fx_translation": fx_translation,
         "fx_has_prior_data": fx_has_prior_data,
         "fx_source": fx_source,
+        "fx_unresolved": fx_unresolved,
         # Issue #59: Saldo-Korrektur-Metadaten (Margin-Schulden)
         "fx_option_a_meta": fx_option_a_meta,
         "fx_has_negative_balance": fx_has_negative_balance,
@@ -7995,6 +8075,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     print("\n" + "="*60)
     print(f"GERMAN TAX REPORT - ANLAGE KAP {tax_year}")
     print("="*60)
+    if fx_unresolved:
+        print('VORLAEUFIGER TEILBERICHT: Konto-FX-Sektion nicht ermittelt, '
+              'nicht als null bewertet. Topf 2, Zeile 19 und Zeile 22 '
+              'enthalten diesen Anteil nicht; vor Steuerabgabe klaeren.')
     print(f"Base Currency: {base_currency}")
     print("-" * 60)
     
