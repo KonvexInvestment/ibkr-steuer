@@ -269,6 +269,61 @@ def test_failed_compute_commits_no_snapshot():
     assert "Berechnung nicht möglich" in rendered
 
 
+def test_incompatible_fx_currency_blocks_entire_snapshot():
+    body = SYNTHETIC_BODY + """
+      <FxTransactions>
+        <FxTransaction reportDate="2025-06-01" dateTime="2025-06-01 10:00:00"
+          functionalCurrency="USD" fxCurrency="EUR" quantity="-13000"
+          realizedPL="1051.17" code="C" levelOfDetail="TRANSACTION" />
+      </FxTransactions>
+    """
+    dataset = make_dataset([
+        ("valid.xml", make_xml(account="U111")),
+        ("wrong-fx.xml", make_xml(body=body, account="U222")),
+    ])
+    at = run_app(dataset)
+    assert_no_exception(at, "F2 wird als Eingabefehler behandelt")
+    assert 'snapshot' not in at.session_state, "Kein unvollstaendiger Konten-Merge"
+    rendered = all_markdown(at)
+    assert "Berechnung nicht möglich" in rendered
+    assert "FX-Ergebniswährung nicht kompatibel" in rendered
+    assert "functionalCurrency=USD" in rendered
+    assert "Kontobasiswährung EUR" in rendered
+    assert not at.get('download_button'), "Keine Exporte falscher Steuerwerte"
+
+
+def test_quarterly_fx_fills_reach_final_values():
+    def body(day):
+        row = f'''<FxTransaction levelOfDetail="TRANSACTION"
+            reportDate="{day}" dateTime="{day} 10:00:00"
+            functionalCurrency="EUR" fxCurrency="USD" quantity="-200"
+            realizedPL="13.22" code="C" />'''
+        return '<FxTransactions>' + row * 2 + '</FxTransactions>'
+
+    dataset = make_dataset([
+        ('q1.xml', make_xml(body=body('2025-02-03'), to_date='2025-03-31')),
+        ('q2.xml', make_xml(body=body('2025-05-03'),
+                            from_date='2025-04-01', to_date='2025-06-30')),
+    ])
+    at = run_app(dataset)
+    assert_no_exception(at, 'F4 Quartals-Upload')
+    report = at.session_state['snapshot']['payload']['merged']
+    assert abs(report['fx_total_gain'] - 52.88) < 1e-9
+    final = ui_model.build_final_values(report, ui_model.default_toggles())
+    assert abs(final['zeile_19'] - 52.88) < 1e-9
+
+    # Ein Snapshot von vor den Rechenfixes darf auch bei gleichen Uploads
+    # nicht weiterverwendet werden.
+    old_generation = at.session_state['compute_generation']
+    snapshot = dict(at.session_state['snapshot'])
+    snapshot['schema_version'] = ui_model.SCHEMA_VERSION - 1
+    at.session_state['snapshot'] = snapshot
+    at.run()
+    assert_no_exception(at, 'F4 veralteter Snapshot wird neu berechnet')
+    assert at.session_state['compute_generation'] == old_generation + 1
+    assert at.session_state['snapshot']['schema_version'] == ui_model.SCHEMA_VERSION
+
+
 def test_mixed_valid_and_non_flex_xml_is_a_hard_error():
     dataset = make_dataset([
         ("valid.xml", make_xml()),
@@ -402,6 +457,8 @@ if __name__ == '__main__':
         test_compute_cache_hits_on_navigation_and_recomputes_on_compute_toggle,
         test_dataset_switch_resets_domain_state_and_nav,
         test_failed_compute_commits_no_snapshot,
+        test_incompatible_fx_currency_blocks_entire_snapshot,
+        test_quarterly_fx_fills_reach_final_values,
         test_mixed_valid_and_non_flex_xml_is_a_hard_error,
         test_multi_statement_xml_is_a_hard_error,
         test_overlapping_periods_are_a_hard_error,

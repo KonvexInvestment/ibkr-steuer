@@ -2550,6 +2550,567 @@ def test_correction_stage3_respects_target_direction():
     print("  TC43 Stufe-3-Richtungs-Gate: OK")
 
 
+def _future_option_sell(date, symbol, future_symbol, future_conid, pc,
+                        price, multiplier, strike="100", expiry="2025-06-20"):
+    row = make_sell(
+        date, 1, price, strike=strike, expiry=expiry, pc=pc,
+        underlying=future_symbol, a_cat="FOP", multiplier=str(multiplier),
+        commission=0,
+    )
+    row.update({
+        "accountId": "TEST_ACCOUNT",
+        "tradeID": f"sell_{symbol}",
+        "conid": f"opt_{symbol}",
+        "underlyingConid": str(future_conid),
+        "symbol": symbol,
+        "currency": "EUR",
+        "cost": str(-price * multiplier),
+    })
+    return row
+
+
+def _future_option_assignment(date, symbol, future_symbol, future_conid, pc,
+                              premium, multiplier, strike="100",
+                              expiry="2025-06-20"):
+    row = make_assignment(
+        date, 1, strike=strike, expiry=expiry, pc=pc,
+        underlying=future_symbol, a_cat="FOP", multiplier=str(multiplier),
+    )
+    row.update({
+        "accountId": "TEST_ACCOUNT",
+        "tradeID": f"assignment_{symbol}",
+        "conid": f"opt_{symbol}",
+        "underlyingConid": str(future_conid),
+        "symbol": symbol,
+        "currency": "EUR",
+        "cost": str(premium),
+        "openCloseIndicator": "C",
+    })
+    return row
+
+
+def _future_trade(date_time, trade_id, symbol, conid, side, quantity,
+                  multiplier, cost, proceeds, pnl, transaction_type,
+                  open_close):
+    date = date_time[:10]
+    return {
+        "accountId": "TEST_ACCOUNT",
+        "tradeID": trade_id,
+        "transactionID": trade_id,
+        "assetCategory": "FUT",
+        "transactionType": transaction_type,
+        "buySell": side,
+        "openCloseIndicator": open_close,
+        "conid": str(conid),
+        "symbol": symbol,
+        "underlyingSymbol": symbol,
+        "quantity": str(quantity),
+        "tradePrice": "100",
+        "multiplier": str(multiplier),
+        "ibCommission": "0",
+        "fxRateToBase": "1",
+        "currency": "EUR",
+        "dateTime": date_time,
+        "tradeDate": date,
+        "reportDate": date,
+        "fifoPnlRealized": str(pnl),
+        "cost": str(cost),
+        "proceeds": str(proceeds),
+    }
+
+
+def _future_closed_lot(open_date_time, close_date_time, symbol, conid, side,
+                       quantity, multiplier, cost, pnl,
+                       opening_transaction_id=""):
+    row = {
+        "accountId": "TEST_ACCOUNT",
+        "assetCategory": "FUT",
+        "buySell": side,
+        "conid": str(conid),
+        "symbol": symbol,
+        "underlyingSymbol": symbol,
+        "quantity": str(quantity),
+        "multiplier": str(multiplier),
+        "currency": "EUR",
+        "openDateTime": open_date_time,
+        "dateTime": close_date_time,
+        "reportDate": close_date_time[:10],
+        "cost": str(cost),
+        "fifoPnlRealized": str(pnl),
+    }
+    if opening_transaction_id:
+        row["transactionID"] = opening_transaction_id
+    return row
+
+
+def test_future_option_assignments_correct_only_embedded_future_pnl():
+    """TC47: FOP-Put deferred + FOP-Call direct close landen exakt in Topf 2."""
+    put_sell = _future_option_sell(
+        "2025-06-01", "FUTP P100", "FUTP", 7001, "P", 2, 100)
+    put_assignment = _future_option_assignment(
+        "2025-06-20", "FUTP P100", "FUTP", 7001, "P", 200, 100)
+    put_delivery = _future_trade(
+        "2025-06-20 16:20:00", "put_delivery", "FUTP", 7001,
+        "BUY", 1, 100, 10000, -10000, 0, "BookTrade", "O")
+    put_close = _future_trade(
+        "2025-08-01 10:00:00", "put_close", "FUTP", 7001,
+        "SELL", -1, 100, -9800, 9850, 50, "ExchTrade", "C")
+    put_lot = _future_closed_lot(
+        "2025-06-20 16:20:00", "2025-08-01 10:00:00",
+        "FUTP", 7001, "SELL", 1, 100, 9800, 50)
+
+    call_sell = _future_option_sell(
+        "2025-06-01", "FUTC C100", "FUTC", 7002, "C", 3, 50)
+    call_assignment = _future_option_assignment(
+        "2025-06-20", "FUTC C100", "FUTC", 7002, "C", 150, 50)
+    call_sell["assetCategory"] = "FSFOP"
+    call_assignment["assetCategory"] = "FSFOP"
+    call_direct_close = _future_trade(
+        "2025-06-20 16:20:00", "call_direct", "FUTC", 7002,
+        "SELL", -1, 50, -5050, 5000, 100, "BookTrade", "C")
+
+    rd = calculate_for_trades(
+        [
+            put_sell, put_assignment, put_delivery, put_close,
+            call_sell, call_assignment, call_direct_close,
+        ],
+        tax_year=2025,
+        closed_lots=[put_lot],
+    )
+    future_rows = {
+        row["symbol"]: row for row in rd["trade_details"]
+        if row.get("assetCategory") == "FUT"
+    }
+    put_row = future_rows["FUTP"]
+    call_row = future_rows["FUTC"]
+    assert_close(put_row["fifoPnlRealized"], -150,
+                 label="TC47 Put-FUT-PnL")
+    assert_close(put_row["cost"], -10000,
+                 label="TC47 Put-FUT-Kostenbasis")
+    assert_close(call_row["fifoPnlRealized"], -50,
+                 label="TC47 Call-FUT-PnL")
+    assert_close(call_row["cost"], -5050,
+                 label="TC47 Direct-Close-Kosten unveraendert")
+    assert_close(rd["options_gain_eur"], 350,
+                 label="TC47 Stillhalter-Gewinn")
+    assert_close(rd["options_loss_eur"], -200,
+                 label="TC47 Futures-Verlust")
+    assert_close(rd["zeile_19_netto_eur"], 150,
+                 label="TC47 Zeile 19")
+    assert_close(rd["zeile_22_other_losses_eur"], 200,
+                 label="TC47 Zeile 22")
+    assert_close(rd["topf2_by_category"]["Futures"]["gain"], 0,
+                 label="TC47 Futures-Gewinne")
+    assert_close(rd["topf2_by_category"]["Futures"]["loss"], -200,
+                 label="TC47 Futures-Verluste")
+    assert_close(rd["audit"]["put_nosell_premium_eur"], 0,
+                 label="TC47 FOP ist kein put_nosell")
+    corrections = rd["audit"]["future_assignment_corrections"]
+    assert len(corrections) == 2
+    assert {item["mode"] for item in corrections} == {
+        "deferred_close", "direct_close",
+    }
+    assert {item["target_trade_id"] for item in corrections} == {
+        "put_close", "call_direct",
+    }
+    assert sorted(item["amount_raw"] for item in corrections) == [150, 200]
+    assert_close(put_row["stillhalter_adjustment_raw"], 200,
+                 label="TC47 Put-Korrekturbetrag")
+    assert_close(call_row["stillhalter_adjustment_raw"], 150,
+                 label="TC47 Call-Korrekturbetrag")
+    assert put_row["stillhalter_adjusted"]
+    assert call_row["stillhalter_adjusted"]
+    assert not rd["audit"]["stillhalter_corrections_dropped"]
+
+    print("  TC47 FOP-Put/Call korrigieren nur belegten FUT-PnL: OK")
+
+
+def test_future_assignment_requires_exact_open_timestamp():
+    """TC48: Ein fremdes Same-Day-FUT-Lot darf nicht konsumiert werden."""
+    sell = _future_option_sell(
+        "2025-06-01", "SAFE P100", "SAFE", 7101, "P", 2, 100)
+    assignment = _future_option_assignment(
+        "2025-06-20", "SAFE P100", "SAFE", 7101, "P", 200, 100)
+    delivery = _future_trade(
+        "2025-06-20 16:20:00", "safe_delivery", "SAFE", 7101,
+        "BUY", 1, 100, 10000, -10000, 0, "BookTrade", "O")
+    unrelated_close = _future_trade(
+        "2025-08-01 10:00:00", "safe_close", "SAFE", 7101,
+        "SELL", -1, 100, -9800, 9850, 50, "ExchTrade", "C")
+    unrelated_lot = _future_closed_lot(
+        "2025-06-20 10:00:00", "2025-08-01 10:00:00",
+        "SAFE", 7101, "SELL", 1, 100, 9800, 50)
+
+    rd = calculate_for_trades(
+        [sell, assignment, delivery, unrelated_close],
+        tax_year=2025,
+        closed_lots=[unrelated_lot],
+    )
+    row = next(
+        item for item in rd["trade_details"]
+        if item.get("symbol") == "SAFE" and item.get("source") == "trades"
+    )
+    assert_close(row["fifoPnlRealized"], 50,
+                 label="TC48 fremder FUT-PnL")
+    assert_close(row["cost"], -9800,
+                 label="TC48 fremde FUT-Kosten")
+    assert not row.get("stillhalter_adjusted")
+    assert_close(rd["options_gain_eur"], 250,
+                 label="TC48 Praemie plus fremder FUT-Gewinn")
+    assert_close(rd["options_loss_eur"], 0,
+                 label="TC48 kein FUT-Verlust")
+    assert not rd["audit"]["future_assignment_corrections"]
+    assert not rd["audit"]["stillhalter_corrections_dropped"]
+
+    print("  TC48 FUT-Matching verlangt exakten Assignment-Timestamp: OK")
+
+
+def test_cross_year_future_assignment_corrects_only_current_close():
+    """TC49: Vorjahres-FOP-Praemie wird nicht erneut erfasst, FUT-Close schon korrigiert."""
+    sell = _future_option_sell(
+        "2024-06-01", "XYF P100", "XYF", 7201, "P", 2, 100,
+        expiry="2024-06-20")
+    assignment = _future_option_assignment(
+        "2024-06-20", "XYF P100", "XYF", 7201, "P", 200, 100,
+        expiry="2024-06-20")
+    delivery = _future_trade(
+        "2024-06-20 16:20:00", "xy_delivery", "XYF", 7201,
+        "BUY", 1, 100, 10000, -10000, 0, "BookTrade", "O")
+    close = _future_trade(
+        "2025-08-01 10:00:00", "xy_close", "XYF", 7201,
+        "SELL", -1, 100, -9800, 9850, 50, "ExchTrade", "C")
+    lot = _future_closed_lot(
+        "2024-06-20 16:20:00", "2025-08-01 10:00:00",
+        "XYF", 7201, "SELL", 1, 100, 9800, 50)
+
+    rd = calculate_for_trades(
+        [sell, assignment, delivery, close],
+        tax_year=2025,
+        closed_lots=[lot],
+    )
+    row = next(
+        item for item in rd["trade_details"]
+        if item.get("symbol") == "XYF" and item.get("source") == "trades"
+    )
+    assert_close(row["fifoPnlRealized"], -150,
+                 label="TC49 Cross-Year-FUT-PnL")
+    assert_close(row["cost"], -10000,
+                 label="TC49 Cross-Year-FUT-Kostenbasis")
+    assert_close(rd["options_gain_eur"], 0,
+                 label="TC49 keine erneute Vorjahrespraemie")
+    assert_close(rd["options_loss_eur"], -150,
+                 label="TC49 aktueller FUT-Verlust")
+    assert_close(rd["zeile_19_netto_eur"], -150,
+                 label="TC49 Zeile 19")
+    assert_close(rd["zeile_22_other_losses_eur"], 150,
+                 label="TC49 Zeile 22")
+    assert_close(rd["audit"]["stillhalter_premium_eur"], 0,
+                 label="TC49 Stillhalterpraemie bleibt im Vorjahr")
+    corrections = rd["audit"]["future_assignment_corrections"]
+    assert len(corrections) == 1
+    assert corrections[0]["mode"] == "deferred_close"
+    assert corrections[0]["target_trade_id"] == "xy_close"
+    assert_close(corrections[0]["amount_raw"], 200,
+                 label="TC49 Korrekturbetrag")
+    assert not rd["audit"]["stillhalter_corrections_dropped"]
+
+    print("  TC49 Cross-Year-FOP korrigiert nur aktuellen FUT-Close: OK")
+
+
+def test_future_assignment_without_closed_lot_warns_and_stays_unchanged():
+    """TC50: Ein spaeterer FUT-Close ohne Lot-Beleg darf nicht still bleiben."""
+    sell = _future_option_sell(
+        "2025-06-01", "NOLOT P100", "NOLOT", 7301, "P", 2, 100)
+    assignment = _future_option_assignment(
+        "2025-06-20", "NOLOT P100", "NOLOT", 7301, "P", 200, 100)
+    delivery = _future_trade(
+        "2025-06-20 16:20:00", "nolot_delivery", "NOLOT", 7301,
+        "BUY", 1, 100, 10000, -10000, 0, "BookTrade", "O")
+    close = _future_trade(
+        "2025-08-01 10:00:00", "nolot_close", "NOLOT", 7301,
+        "SELL", -1, 100, -9800, 9850, 50, "ExchTrade", "C")
+
+    rd = calculate_for_trades(
+        [sell, assignment, delivery, close],
+        tax_year=2025,
+        closed_lots=[],
+    )
+    row = next(
+        item for item in rd["trade_details"]
+        if item.get("symbol") == "NOLOT" and item.get("source") == "trades"
+    )
+    assert_close(row["fifoPnlRealized"], 50,
+                 label="TC50 unbelegter FUT-PnL bleibt unveraendert")
+    assert_close(row["cost"], -9800,
+                 label="TC50 unbelegte Kostenbasis bleibt unveraendert")
+    assert not row.get("stillhalter_adjusted")
+    assert not rd["audit"]["future_assignment_corrections"]
+    dropped = rd["audit"]["stillhalter_corrections_dropped"]
+    assert len(dropped) == 1
+    assert dropped[0]["reason"] == "future_assignment_close_unproven"
+    assert_close(dropped[0]["leftover_raw"], 200,
+                 label="TC50 gemeldeter Risikobetrag")
+
+    print("  TC50 FUT-Close ohne CLOSED_LOT wird als Prueffall gemeldet: OK")
+
+
+def test_cross_year_future_assignment_without_sell_history_warns():
+    """TC51: Fehlende Vorjahres-FOP-Historie wird nicht still uebergangen."""
+    assignment = _future_option_assignment(
+        "2024-06-20", "NOHISTF P100", "NOHISTF", 7401, "P", 200, 100,
+        expiry="2024-06-20")
+    delivery = _future_trade(
+        "2024-06-20 16:20:00", "nohistf_delivery", "NOHISTF", 7401,
+        "BUY", 1, 100, 10000, -10000, 0, "BookTrade", "O")
+    close = _future_trade(
+        "2025-08-01 10:00:00", "nohistf_close", "NOHISTF", 7401,
+        "SELL", -1, 100, -9800, 9850, 50, "ExchTrade", "C")
+    lot = _future_closed_lot(
+        "2024-06-20 16:20:00", "2025-08-01 10:00:00",
+        "NOHISTF", 7401, "SELL", 1, 100, 9800, 50)
+
+    rd = calculate_for_trades(
+        [assignment, delivery, close],
+        tax_year=2025,
+        closed_lots=[lot],
+    )
+    row = next(
+        item for item in rd["trade_details"]
+        if item.get("symbol") == "NOHISTF"
+        and item.get("source") == "trades"
+    )
+    assert_close(row["fifoPnlRealized"], 50,
+                 label="TC51 FUT-PnL ohne Praemienhistorie")
+    assert_close(row["cost"], -9800,
+                 label="TC51 Kosten ohne Praemienhistorie")
+    assert not rd["audit"]["future_assignment_corrections"]
+    dropped = rd["audit"]["stillhalter_corrections_dropped"]
+    assert len(dropped) == 1
+    assert dropped[0]["reason"] == "future_assignment_history_missing"
+    assert not rd["audit"]["stillhalter_unmatched"]
+
+    print("  TC51 Fehlende Cross-Year-FOP-Historie wird gemeldet: OK")
+
+
+def test_historical_direct_future_close_not_reported_in_current_audit():
+    """TC52: Ein vollstaendiger 2024-Direct-Close gehoert nicht ins Audit 2025."""
+    sell = _future_option_sell(
+        "2024-06-01", "OLD C100", "OLD", 7501, "C", 3, 50,
+        expiry="2024-06-20")
+    assignment = _future_option_assignment(
+        "2024-06-20", "OLD C100", "OLD", 7501, "C", 150, 50,
+        expiry="2024-06-20")
+    direct_close = _future_trade(
+        "2024-06-20 16:20:00", "old_direct", "OLD", 7501,
+        "SELL", -1, 50, -5050, 5000, 100, "BookTrade", "C")
+
+    rd = calculate_for_trades(
+        [sell, assignment, direct_close],
+        tax_year=2025,
+        closed_lots=[],
+    )
+    assert_close(rd["options_gain_eur"], 0,
+                 label="TC52 kein historischer Gewinn")
+    assert_close(rd["options_loss_eur"], 0,
+                 label="TC52 kein historischer Verlust")
+    assert not rd["audit"]["future_assignment_corrections"]
+    assert not rd["audit"]["stillhalter_corrections_dropped"]
+
+    # Auch fehlerhafte historische Evidenz darf keinen kritischen Prueffall
+    # im aktuellen Steuerjahr erzeugen.
+    assignment["cost"] = "999"
+    mismatch_rd = calculate_for_trades(
+        [sell, assignment, direct_close],
+        tax_year=2025,
+        closed_lots=[],
+    )
+    assert not mismatch_rd["audit"]["future_assignment_corrections"]
+    assert not mismatch_rd["audit"]["stillhalter_corrections_dropped"]
+
+    print("  TC52 Historischer Direct-Close bleibt aus aktuellem Audit: OK")
+
+
+def test_future_assignment_rejects_conflicting_lot_transaction_id():
+    """TC53: Gleicher Timestamp reicht bei widerspruechlicher Opening-ID nicht."""
+    sell = _future_option_sell(
+        "2025-06-01", "TXID P100", "TXID", 7601, "P", 2, 100)
+    assignment = _future_option_assignment(
+        "2025-06-20", "TXID P100", "TXID", 7601, "P", 200, 100)
+    delivery = _future_trade(
+        "2025-06-20 16:20:00", "txid_delivery", "TXID", 7601,
+        "BUY", 1, 100, 10000, -10000, 0, "BookTrade", "O")
+    close = _future_trade(
+        "2025-08-01 10:00:00", "txid_close", "TXID", 7601,
+        "SELL", -1, 100, -9800, 9850, 50, "ExchTrade", "C")
+    conflicting_lot = _future_closed_lot(
+        "2025-06-20 16:20:00", "2025-08-01 10:00:00",
+        "TXID", 7601, "SELL", 1, 100, 9800, 50,
+        opening_transaction_id="different_opening")
+
+    rd = calculate_for_trades(
+        [sell, assignment, delivery, close],
+        tax_year=2025,
+        closed_lots=[conflicting_lot],
+    )
+    row = next(
+        item for item in rd["trade_details"]
+        if item.get("symbol") == "TXID" and item.get("source") == "trades"
+    )
+    assert_close(row["fifoPnlRealized"], 50,
+                 label="TC53 PnL bei widerspruechlicher Opening-ID")
+    assert_close(row["cost"], -9800,
+                 label="TC53 Kosten bei widerspruechlicher Opening-ID")
+    assert not rd["audit"]["future_assignment_corrections"]
+    dropped = rd["audit"]["stillhalter_corrections_dropped"]
+    assert len(dropped) == 1
+    assert dropped[0]["reason"] == "future_assignment_close_unproven"
+
+    print("  TC53 Widerspruechliche FUT-Opening-ID wird abgelehnt: OK")
+
+
+def test_deferred_fsfop_call_corrects_future_cover():
+    """TC54: Reale FSFOP-Richtung SELL/O -> spaeterer BUY-Cover."""
+    sell = _future_option_sell(
+        "2025-06-01", "DCALL C100", "DCALL", 7701, "C", 3, 50)
+    assignment = _future_option_assignment(
+        "2025-06-20", "DCALL C100", "DCALL", 7701, "C", 150, 50)
+    sell["assetCategory"] = "FSFOP"
+    assignment["assetCategory"] = "FSFOP"
+    delivery = _future_trade(
+        "2025-06-20 16:20:00", "dcall_delivery", "DCALL", 7701,
+        "SELL", -1, 50, -5000, 5000, 0, "BookTrade", "O")
+    cover = _future_trade(
+        "2025-08-01 10:00:00", "dcall_cover", "DCALL", 7701,
+        "BUY", 1, 50, 5150, -5100, 50, "ExchTrade", "C")
+    lot = _future_closed_lot(
+        "2025-06-20 16:20:00", "2025-08-01 10:00:00",
+        "DCALL", 7701, "BUY", -1, 50, 5150, 50,
+        opening_transaction_id="dcall_delivery")
+
+    rd = calculate_for_trades(
+        [sell, assignment, delivery, cover],
+        tax_year=2025,
+        closed_lots=[lot],
+    )
+    row = next(
+        item for item in rd["trade_details"]
+        if item.get("symbol") == "DCALL" and item.get("source") == "trades"
+    )
+    assert_close(row["fifoPnlRealized"], -100,
+                 label="TC54 Call-FUT-Cover-PnL")
+    assert_close(row["cost"], 5000,
+                 label="TC54 Call-FUT-Cover-Kosten")
+    assert_close(rd["options_gain_eur"], 150,
+                 label="TC54 FSFOP-Praemie")
+    assert_close(rd["options_loss_eur"], -100,
+                 label="TC54 FUT-Cover-Verlust")
+    corrections = rd["audit"]["future_assignment_corrections"]
+    assert len(corrections) == 1
+    assert corrections[0]["mode"] == "deferred_close"
+    assert corrections[0]["target_trade_id"] == "dcall_cover"
+    assert_close(corrections[0]["amount_raw"], 150,
+                 label="TC54 Call-Korrekturbetrag")
+    assert not rd["audit"]["stillhalter_corrections_dropped"]
+
+    print("  TC54 Deferred FSFOP-Call korrigiert belegten FUT-Cover: OK")
+
+
+def test_partial_future_assignment_warns_only_for_realized_remainder():
+    """TC55: Quantity-2 warnt fuer unbelegten Close, nicht fuer offenen Rest."""
+    sell = _future_option_sell(
+        "2025-06-01", "PART P100", "PART", 7801, "P", 2, 100)
+    sell["quantity"] = "-2"
+    assignment = _future_option_assignment(
+        "2025-06-20", "PART P100", "PART", 7801, "P", 400, 100)
+    assignment["quantity"] = "2"
+    delivery = _future_trade(
+        "2025-06-20 16:20:00", "part_delivery", "PART", 7801,
+        "BUY", 2, 100, 20000, -20000, 0, "BookTrade", "O")
+    close_one = _future_trade(
+        "2025-08-01 10:00:00", "part_close_one", "PART", 7801,
+        "SELL", -1, 100, -9800, 9850, 50, "ExchTrade", "C")
+    close_two = _future_trade(
+        "2025-08-02 10:00:00", "part_close_two", "PART", 7801,
+        "SELL", -1, 100, -9800, 9850, 50, "ExchTrade", "C")
+    lot_one = _future_closed_lot(
+        "2025-06-20 16:20:00", "2025-08-01 10:00:00",
+        "PART", 7801, "SELL", 1, 100, 9800, 50,
+        opening_transaction_id="part_delivery")
+
+    rd = calculate_for_trades(
+        [sell, assignment, delivery, close_one, close_two],
+        tax_year=2025,
+        closed_lots=[lot_one],
+    )
+    rows = {
+        row["dateTime"]: row for row in rd["trade_details"]
+        if row.get("symbol") == "PART" and row.get("source") == "trades"
+    }
+    assert_close(rows["2025-08-01 10:00:00"]["fifoPnlRealized"], -150,
+                 label="TC55 belegter erster Slice")
+    assert_close(rows["2025-08-02 10:00:00"]["fifoPnlRealized"], 50,
+                 label="TC55 unbelegter zweiter Slice")
+    assert len(rd["audit"]["future_assignment_corrections"]) == 1
+    dropped = rd["audit"]["stillhalter_corrections_dropped"]
+    assert len(dropped) == 1
+    assert dropped[0]["reason"] == "future_assignment_close_unproven"
+    assert_close(dropped[0]["leftover_shares"], 1,
+                 label="TC55 ungeklärte Menge")
+    assert_close(dropped[0]["leftover_raw"], 200,
+                 label="TC55 ungeklärter Praemienanteil")
+
+    # Ist der zweite Kontrakt noch offen, ist der belegte erste Slice korrekt
+    # und es gibt keinen Grund fuer einen Prueffall.
+    open_remainder_rd = calculate_for_trades(
+        [sell, assignment, delivery, close_one],
+        tax_year=2025,
+        closed_lots=[lot_one],
+    )
+    assert len(open_remainder_rd["audit"]["future_assignment_corrections"]) == 1
+    assert not open_remainder_rd["audit"]["stillhalter_corrections_dropped"]
+
+    print("  TC55 Partielle FUT-Andienung warnt nur fuer realisierten Rest: OK")
+
+
+def test_cross_year_future_assignment_missing_delivery_warns_from_lot():
+    """TC56: Aktuelles Lot macht Vorjahresfall trotz fehlender Delivery relevant."""
+    sell = _future_option_sell(
+        "2024-06-01", "NODEL P100", "NODEL", 7901, "P", 2, 100,
+        expiry="2024-06-20")
+    assignment = _future_option_assignment(
+        "2024-06-20", "NODEL P100", "NODEL", 7901, "P", 200, 100,
+        expiry="2024-06-20")
+    close = _future_trade(
+        "2025-08-01 10:00:00", "nodel_close", "NODEL", 7901,
+        "SELL", -1, 100, -9800, 9850, 50, "ExchTrade", "C")
+    lot = _future_closed_lot(
+        "2024-06-20 16:20:00", "2025-08-01 10:00:00",
+        "NODEL", 7901, "SELL", 1, 100, 9800, 50)
+
+    rd = calculate_for_trades(
+        [sell, assignment, close],
+        tax_year=2025,
+        closed_lots=[lot],
+    )
+    row = next(
+        item for item in rd["trade_details"]
+        if item.get("symbol") == "NODEL" and item.get("source") == "trades"
+    )
+    assert_close(row["fifoPnlRealized"], 50,
+                 label="TC56 PnL ohne Delivery-Beleg")
+    assert_close(row["cost"], -9800,
+                 label="TC56 Kosten ohne Delivery-Beleg")
+    assert not rd["audit"]["future_assignment_corrections"]
+    dropped = rd["audit"]["stillhalter_corrections_dropped"]
+    assert len(dropped) == 1
+    assert dropped[0]["reason"] == \
+        "future_assignment_delivery_missing_or_ambiguous"
+    assert_close(dropped[0]["leftover_raw"], 200,
+                 label="TC56 gemeldeter Praemienanteil")
+
+    print("  TC56 Fehlende FUT-Delivery wird aus aktuellem Lot erkannt: OK")
+
+
 if __name__ == "__main__":
     test_cross_year_put_series()
     test_cross_year_call_series()
@@ -2597,4 +3158,14 @@ if __name__ == "__main__":
     test_long_put_exercise_evidence_is_quantity_capped()
     test_long_put_exercise_override_requires_embedded_premium()
     test_correction_stage3_respects_target_direction()
-    print("\nOK: alle 46 TCs gruen")
+    test_future_option_assignments_correct_only_embedded_future_pnl()
+    test_future_assignment_requires_exact_open_timestamp()
+    test_cross_year_future_assignment_corrects_only_current_close()
+    test_future_assignment_without_closed_lot_warns_and_stays_unchanged()
+    test_cross_year_future_assignment_without_sell_history_warns()
+    test_historical_direct_future_close_not_reported_in_current_audit()
+    test_future_assignment_rejects_conflicting_lot_transaction_id()
+    test_deferred_fsfop_call_corrects_future_cover()
+    test_partial_future_assignment_warns_only_for_realized_remainder()
+    test_cross_year_future_assignment_missing_delivery_warns_from_lot()
+    print("\nOK: alle 56 TCs gruen")

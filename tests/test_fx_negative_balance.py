@@ -24,6 +24,8 @@ import csv
 import io
 import contextlib
 import tempfile
+from datetime import date
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -812,6 +814,80 @@ def tc28_missing_balance_column_falls_back_to_cumulation():
     print("TC28 OK — Fallback auf Kumulation ohne balance-Spalte")
 
 
+def tc30_incompatible_fx_currency_stops_computation():
+    """F2: Weder Teilwerte noch ungepruefter FIFO-Fallback bei falscher Einheit."""
+    invalid_rows = [
+        dict(fx_pnl_row("2025-06-01", -13000, 1051.17),
+             functionalCurrency="USD", fxCurrency="EUR"),
+        dict(fx_pnl_row("2025-06-01", -100, 10),
+             functionalCurrency="USD", fxCurrency="GBP"),
+        dict(fx_pnl_row("2025-06-01", -100, 0),
+             functionalCurrency="USD"),
+        dict(fx_pnl_row("2025-06-01", -100, 10),
+             functionalCurrency=""),
+        dict(fx_pnl_row("2025-06-01", -100, 10), fxCurrency="EUR"),
+    ]
+    for invalid in invalid_rows:
+        for correction_enabled in (True, False):
+            with tempfile.TemporaryDirectory() as tmp:
+                write_csv(os.path.join(tmp, "account_info.csv"), [
+                    {"currency": "EUR", "tax_year": str(TAX_YEAR)}
+                ])
+                write_csv(os.path.join(tmp, "fx_realized_pnl.csv"), [
+                    fx_pnl_row("2025-05-01", -100, 10), invalid,
+                ])
+                # Ein verfuegbarer Option-C-Pfad darf die Sperre nicht umgehen.
+                write_csv(os.path.join(tmp, "fx_transactions.csv"), [
+                    make_tx("2025-06-01", -100, 1.1, "BUY"),
+                ])
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        calculate_tax(tmp, tax_year=TAX_YEAR,
+                                      fx_margin_correction_enabled=correction_enabled)
+                except ValueError as exc:
+                    assert "FX-Ergebniswährung" in str(exc), str(exc)
+                    assert "functionalCurrency" in str(exc), str(exc)
+                else:
+                    raise AssertionError(f"F2 muss Berechnung sperren: {invalid}")
+    print("TC30 OK — falsche/fehlende FX-Ergebniswaehrung sperrt die Berechnung")
+
+
+def tc31_fx_currency_gate_only_checks_tax_year():
+    with tempfile.TemporaryDirectory() as tmp:
+        write_csv(os.path.join(tmp, "account_info.csv"), [
+            {"currency": "EUR", "tax_year": str(TAX_YEAR)}
+        ])
+        write_csv(os.path.join(tmp, "fx_realized_pnl.csv"), [
+            dict(fx_pnl_row("2024-06-01", -100, 999), functionalCurrency="USD"),
+            fx_pnl_row("2025-06-01", -100, 10),
+            dict(fx_pnl_row("2025-06-02", -100, -3), fxCurrency="GBP"),
+        ])
+        with contextlib.redirect_stdout(io.StringIO()):
+            report = calculate_tax(tmp, tax_year=TAX_YEAR)
+    assert report["fx_source"] == "xml"
+    assert approx(report["fx_total_gain"], 10)
+    assert approx(report["fx_total_loss"], -3)
+    print("TC31 OK — passende Ergebniswaehrung unveraendert, Vorjahr ignoriert")
+
+
+def tc32_usd_functional_currency_keeps_existing_conversion():
+    with tempfile.TemporaryDirectory() as tmp:
+        write_csv(os.path.join(tmp, "account_info.csv"), [
+            {"currency": "USD", "tax_year": str(TAX_YEAR)}
+        ])
+        write_csv(os.path.join(tmp, "fx_realized_pnl.csv"), [
+            dict(fx_pnl_row("2025-06-02", -100, 10),
+                 functionalCurrency="USD", fxCurrency="EUR"),
+        ])
+        with contextlib.redirect_stdout(io.StringIO()), patch(
+                'calculate_tax_report.fetch_ecb_rates',
+                return_value={date(2025, 6, 2): 0.8}):
+            report = calculate_tax(tmp, tax_year=TAX_YEAR)
+    assert report["fx_source"] == "xml"
+    assert approx(report["fx_total_gain"], 8)
+    print("TC32 OK — passendes USD-Konto behaelt seine USD/EUR-Umrechnung")
+
+
 def run_all():
     tests = [tc1_margin_tilgung, tc2_dauerhaft_margin_via_aktienkauf,
              tc3_voll_im_plus, tc4_negative_starting_balance,
@@ -835,7 +911,10 @@ def run_all():
              tc26_opt_out_keeps_debt_repayment,
              tc27_margin_days_use_ibkr_balance_column,
              tc28_missing_balance_column_falls_back_to_cumulation,
-             tc29_opening_row_with_pnl_is_reported]
+             tc29_opening_row_with_pnl_is_reported,
+             tc30_incompatible_fx_currency_stops_computation,
+             tc31_fx_currency_gate_only_checks_tax_year,
+             tc32_usd_functional_currency_keeps_existing_conversion]
     failed = 0
     for tc in tests:
         try:

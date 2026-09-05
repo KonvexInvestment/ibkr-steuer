@@ -1,5 +1,6 @@
 """Regression tests for quarterly tax-year XMLs with prior-year history."""
 import contextlib
+from collections import Counter
 import csv
 import io
 import os
@@ -306,6 +307,116 @@ def test_pure_quarterly_merge_keeps_repeated_transaction_id_rows():
         assert abs(total - 52.19) < 0.01, f"Saldo-Kumulation: erwartet 52.19, ist {total}"
 
 
+def test_quarterly_merge_preserves_fill_and_lot_multiplicity():
+    """F4: gleicher Zeitstempel/Menge ist keine eindeutige Buchungs-ID."""
+    trade = '''<Trade levelOfDetail="EXECUTION" assetCategory="STK"
+        symbol="TEST" isin="US0000000001" currency="USD" buySell="SELL"
+        dateTime="2025-02-03 10:00:00" quantity="-2" closePrice="100"
+        fifoPnlRealized="10" ibCommission="-1" />'''
+    lot = '''<Lot levelOfDetail="CLOSED_LOT" assetCategory="STK"
+        symbol="TEST" openDateTime="2025-01-02 10:00:00"
+        dateTime="2025-02-03 10:00:00" quantity="2"
+        transactionID="L1" cost="-190" fifoPnlRealized="10" />'''
+    fx = '''<FxTransaction levelOfDetail="TRANSACTION"
+        reportDate="2025-02-03" dateTime="2025-02-03 10:00:00"
+        functionalCurrency="EUR" fxCurrency="USD" quantity="-200"
+        realizedPL="13.22" cost="-190" proceeds="200" code="C" />'''
+    body = (
+        '<Trades>' + trade * 2
+        + trade.replace('fifoPnlRealized="10"', 'fifoPnlRealized="11"')
+        + trade.replace('ibCommission="-1"', 'ibCommission="-2"')
+        + lot * 2 + lot.replace('transactionID="L1"', 'transactionID="L2"')
+        + '</Trades><FxTransactions>' + fx * 2
+        + fx.replace('realizedPL="13.22"', 'realizedPL="15"')
+        + '</FxTransactions>'
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        xml = write_xml(tmp, 'q1.xml', '2025-01-01', '2025-03-31', body)
+        single, quarterly = (os.path.join(tmp, n) for n in ('single', 'quarterly'))
+        os.mkdir(single)
+        os.mkdir(quarterly)
+        with contextlib.redirect_stdout(io.StringIO()):
+            parse_ibkr_xml(xml, single)
+            extract_quarterly_xmls([xml], quarterly)
+        for name, expected in [('trades.csv', 4), ('closed_lots.csv', 3),
+                               ('fx_realized_pnl.csv', 3)]:
+            original = read_csv(os.path.join(single, name))
+            merged = read_csv(os.path.join(quarterly, name))
+            assert len(merged) == expected, (name, len(merged), expected)
+            assert Counter(tuple(sorted(r.items())) for r in merged) == Counter(
+                tuple(sorted(r.items())) for r in original), name
+
+
+def test_quarterly_pnl_summary_separates_security_ids():
+    def summary(isin, conid, pnl, currency='EUR'):
+        return f'''<FIFOPerformanceSummaryUnderlying assetCategory="STK"
+            symbol="SAME" isin="{isin}" conid="{conid}" currency="{currency}"
+            realizedSTProfit="{pnl}" totalRealizedPnl="{pnl}" />'''
+
+    with tempfile.TemporaryDirectory() as tmp:
+        q1 = write_xml(tmp, 'q1.xml', '2025-01-01', '2025-03-31',
+                       '<FIFOPerformanceSummaryInBase>'
+                       + summary('OLD', '1', 0) + summary('NEW', '2', 20)
+                       + summary('NEW', '3', 5)
+                       + '</FIFOPerformanceSummaryInBase>')
+        q2 = write_xml(tmp, 'q2.xml', '2025-04-01', '2025-06-30',
+                       '<FIFOPerformanceSummaryInBase>'
+                       + summary('NEW', '2', 10) + summary('NEW', '2', 7, 'USD')
+                       + '</FIFOPerformanceSummaryInBase>')
+        output = os.path.join(tmp, 'out')
+        os.mkdir(output)
+        with contextlib.redirect_stdout(io.StringIO()):
+            extract_quarterly_xmls([q2, q1], output)
+        rows = read_csv(os.path.join(output, 'pnl_summary.csv'))
+        expected = {('OLD', '1', 'EUR'): 0, ('NEW', '2', 'EUR'): 30,
+                    ('NEW', '3', 'EUR'): 5, ('NEW', '2', 'USD'): 7}
+        assert len(rows) == len(expected), rows
+        for row in rows:
+            key = (row['isin'], row['conid'], row['currency'])
+            assert float(row['realizedSTProfit']) == expected[key], row
+            assert float(row['totalRealizedPnl']) == expected[key], row
+
+
+def test_quarterly_fx_totals_match_single_and_history_paths():
+    """F4: gleiche Fills bleiben zahlungswirksam; Dateikopien zaehlen nicht doppelt."""
+    from calculate_tax_report import calculate_tax
+    from run_tests import compute_user_facing
+
+    def fx_body(day):
+        row = f'''<FxTransaction levelOfDetail="TRANSACTION"
+            reportDate="{day}" dateTime="{day} 10:00:00"
+            functionalCurrency="EUR" fxCurrency="USD" quantity="-200"
+            realizedPL="13.22" code="C" />'''
+        return '<FxTransactions>' + row * 2 + '</FxTransactions>'
+
+    with tempfile.TemporaryDirectory() as tmp:
+        q1 = write_xml(tmp, 'q1.xml', '2025-01-01', '2025-03-31', fx_body('2025-02-03'))
+        q2 = write_xml(tmp, 'q2.xml', '2025-04-01', '2025-06-30', fx_body('2025-05-03'))
+        copy_q1 = write_xml(tmp, 'copy.xml', '2025-01-01', '2025-03-31', fx_body('2025-02-03'))
+        annual_body = (fx_body('2025-02-03')[:-len('</FxTransactions>')]
+                       + fx_body('2025-05-03')[len('<FxTransactions>'):])
+        annual = write_xml(tmp, 'annual.xml', '2025-01-01', '2025-06-30', annual_body)
+        history = write_xml(tmp, 'history.xml', '2024-01-01', '2024-12-31', '')
+        reports = []
+        for mode, paths in [('single', [annual]), ('quarters', [q2, q1]),
+                            ('copies', [q2, q1, copy_q1]),
+                            ('history', [history, q2, q1])]:
+            out = os.path.join(tmp, mode)
+            os.mkdir(out)
+            with contextlib.redirect_stdout(io.StringIO()):
+                if mode == 'single':
+                    parse_ibkr_xml(paths[0], out)
+                elif mode == 'history':
+                    extract_fx_multi_xml(paths, out)
+                else:
+                    extract_quarterly_xmls(paths, out)
+                report = calculate_tax(out)
+            assert len(read_csv(os.path.join(out, 'fx_realized_pnl.csv'))) == 4, mode
+            assert abs(report['fx_total_gain'] - 52.88) < 1e-9, mode
+            reports.append(compute_user_facing(report))
+        assert all(r == reports[0] for r in reports), reports
+
+
 def test_parse_ibkr_xml_rejects_malformed_xml():
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "malformed.xml")
@@ -347,6 +458,12 @@ if __name__ == "__main__":
     print("OK: wiederholte transactionID verliert keine Ledgerzeile")
     test_pure_quarterly_merge_keeps_repeated_transaction_id_rows()
     print("OK: reiner Quartals-Merge verliert keine Ledgerzeile")
+    test_quarterly_merge_preserves_fill_and_lot_multiplicity()
+    print("OK: F4 identische Fills und verschiedene Lots bleiben erhalten")
+    test_quarterly_pnl_summary_separates_security_ids()
+    print("OK: F4 PnL-Summary trennt ISIN, conid und Waehrung")
+    test_quarterly_fx_totals_match_single_and_history_paths()
+    print("OK: F4 Steuerwerte identisch bei Einzel-, Quartals- und History-Import")
     test_parse_ibkr_xml_rejects_malformed_xml()
     print("OK: kaputtes XML wird sichtbar abgewiesen")
     test_parse_ibkr_xml_rejects_non_flex_xml()

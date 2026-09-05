@@ -2,6 +2,8 @@ import xml.etree.ElementTree as ET
 import csv
 import os
 import sys
+import hashlib
+from collections import Counter
 
 from ibkr_dates import (
     is_supported_ibkr_date,
@@ -343,6 +345,16 @@ def extract_quarterly_xmls(xml_files, output_dir):
     tax_year = None
     acct_data = None
     fx_trans_count = 0
+    documents_seen = set()
+
+    def occurrence_key(attrib, occurrences, period):
+        # Ohne eindeutige ID sind auch zwei vollstaendig identische Zeilen
+        # innerhalb eines Exports zwei Fills. Nur wiederholte Vorkommen aus
+        # derselben Exportperiode deduplizieren, nicht echte Mehrfachausfuehrungen.
+        fingerprint = tuple(sorted(attrib.items()))
+        occurrences[fingerprint] += 1
+        return period, fingerprint, occurrences[fingerprint]
+
     for xml_path in xml_files:
         try:
             root = ET.parse(xml_path).getroot()
@@ -352,6 +364,14 @@ def extract_quarterly_xmls(xml_files, output_dir):
 
         stmt = root.find('.//FlexStatement')
         from_date, to_date = get_statement_period(stmt)
+        document_key = hashlib.sha256(ET.tostring(root)).digest()
+        if document_key in documents_seen:
+            continue
+        documents_seen.add(document_key)
+        period = (from_date, to_date)
+        trade_occurrences = Counter()
+        lot_occurrences = Counter()
+        fx_occurrences = Counter()
         print(f"  {os.path.basename(xml_path)}: {from_date} – {to_date}")
 
         # AccountInfo (from first XML)
@@ -371,8 +391,7 @@ def extract_quarterly_xmls(xml_files, output_dir):
 
                 # Lot / CLOSED_LOT
                 if lod == 'CLOSED_LOT' or row.tag == 'Lot':
-                    key = (attrib.get('symbol', ''), attrib.get('openDateTime', ''),
-                           attrib.get('dateTime', ''), attrib.get('quantity', ''))
+                    key = occurrence_key(attrib, lot_occurrences, period)
                     lots_headers.update(attrib.keys())
                     if key not in lots_seen:
                         lots_seen.add(key)
@@ -386,9 +405,8 @@ def extract_quarterly_xmls(xml_files, output_dir):
                     continue
 
                 tid = attrib.get('tradeID', '')
-                key = tid if tid else (attrib.get('dateTime', ''), attrib.get('isin', ''),
-                                       attrib.get('buySell', ''), attrib.get('quantity', ''),
-                                       attrib.get('closePrice', ''))
+                key = ('tradeID', tid) if tid else occurrence_key(
+                    attrib, trade_occurrences, period)
                 if key not in trades_seen:
                     trades_seen.add(key)
                     trades_headers.update(attrib.keys())
@@ -470,9 +488,13 @@ def extract_quarterly_xmls(xml_files, output_dir):
             for row in pnl_node:
                 attrib = normalize_ibkr_row(row.attrib)
                 pnl_headers.update(attrib.keys())
-                ac = attrib.get('assetCategory', '')
-                sym = attrib.get('symbol', '')
-                key = (ac, sym)
+                # Ein Symbol kann nach Splits/Umstrukturierungen mehrere
+                # Wertpapiere bezeichnen. Deren Ergebnisse nicht der ersten
+                # ISIN zuschlagen (sonst erneute Buchung im Core-Fallback).
+                key = tuple(attrib.get(field, '') for field in (
+                    'accountId', 'assetCategory', 'conid', 'isin', 'symbol',
+                    'currency', 'levelOfDetail',
+                ))
                 if key not in pnl_agg:
                     pnl_agg[key] = attrib.copy()
                 else:
@@ -495,11 +517,11 @@ def extract_quarterly_xmls(xml_files, output_dir):
             fx_trans_count += len(list(fxt))
             for elem in fxt:
                 if elem.get('levelOfDetail') == 'TRANSACTION' and elem.get('realizedPL'):
-                    key = (elem.get('dateTime', ''), elem.get('fxCurrency', ''),
-                           elem.get('quantity', ''))
+                    attrib = normalize_ibkr_row(elem.attrib)
+                    key = occurrence_key(attrib, fx_occurrences, period)
                     if key not in fx_pnl_seen:
                         fx_pnl_seen.add(key)
-                        fx_pnl_rows.append({f: elem.get(f, '') for f in
+                        fx_pnl_rows.append({f: attrib.get(f, '') for f in
                             ['reportDate', 'dateTime', 'functionalCurrency', 'fxCurrency',
                              'activityDescription', 'quantity', 'proceeds', 'cost',
                              'realizedPL', 'code', 'levelOfDetail']})

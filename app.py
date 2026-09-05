@@ -1197,6 +1197,7 @@ def merge_report_data(reports):
         'zufluss_unmatched': [],
         'occ_rename_matches': [],
         'stillhalter_corrections_dropped': [],
+        'future_assignment_corrections': [],
         'stillhalter_open_short': [],
         'stk_correction_cy': sum(r.get('audit', {}).get('stk_correction_cy', 0) for r in reports),
         'etf_correction_cy': sum(r.get('audit', {}).get('etf_correction_cy', 0) for r in reports),
@@ -1279,6 +1280,8 @@ def merge_report_data(reports):
         merged_audit['zufluss_unmatched'].extend(a.get('zufluss_unmatched', []))
         merged_audit['occ_rename_matches'].extend(a.get('occ_rename_matches', []))
         merged_audit['stillhalter_corrections_dropped'].extend(a.get('stillhalter_corrections_dropped', []))
+        merged_audit['future_assignment_corrections'].extend(
+            a.get('future_assignment_corrections', []))
         merged_audit['stillhalter_open_short'].extend(a.get('stillhalter_open_short', []))
         merged_audit['transaction_tax'].setdefault('details', []).extend(
             a.get('transaction_tax', {}).get('details', [])
@@ -1944,7 +1947,7 @@ if not _cache_hit:
             _computed = _run_compute(
                 _dataset, _csv_entry, _dom, _requested_key, _generation,
             )
-    except UploadValidationError as exc:
+    except (UploadValidationError, calculate_tax_report.FxCurrencyError) as exc:
         st.markdown(notice_html({
             'class': 'fehler', 'severity': 'kritisch',
             'title': 'Berechnung nicht möglich', 'body': str(exc),
