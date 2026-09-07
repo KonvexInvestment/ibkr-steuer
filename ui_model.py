@@ -23,12 +23,13 @@ Immutability contract: no function in this module mutates its inputs.
 import copy
 import hashlib
 import threading
+from collections import Counter
 
 import calculate_tax_report
 
 # Bump when the snapshot payload layout changes; stale session_state snapshots
 # from an older code version are then recomputed instead of rendered.
-SCHEMA_VERSION = 4  # F3b: alte Snapshots mit verlorenen Trade-Fills neu berechnen.
+SCHEMA_VERSION = 5  # TTAX: unvollstaendige Lot-Zuordnungen erneut pruefen.
 # Bump when the view-model/export layout changes (part of the view key).
 VIEW_SCHEMA_VERSION = 1
 
@@ -821,23 +822,40 @@ def collect_notices(report, context=None):
             'prueffaelle', len(unrouted), unrouted,
         ))
 
+    transaction_tax = audit.get('transaction_tax', {}) or {}
     unhandled = audit.get('unhandled_activity_codes', []) or []
     if unhandled:
         total = sum(e.get('amount_eur', 0) for e in unhandled)
         codes = ", ".join(str(e.get('code', '?')) for e in unhandled)
+        # TTAX-Prueffaelle tragen einen Grund; ohne ihn kann der Nutzer die
+        # Meldung nicht einordnen (Issue #89: "mehrere Trades am selben Tag").
+        ttax_reasons = Counter(
+            item.get('reason') or ''
+            for item in transaction_tax.get('details', []) or []
+            if item.get('status') == 'unmatched'
+        )
+        reason_text = ''
+        if ttax_reasons:
+            reason_text = " TTAX-Gründe: " + "; ".join(
+                f"{count}× "
+                f"{calculate_tax_report.get_transaction_tax_reason_label(reason)}"
+                for reason, count in sorted(
+                    ttax_reasons.items(), key=lambda kv: (-kv[1], kv[0]))
+            ) + ". Einzelbuchungen im Bereich Rechenwege."
         notices.append(_notice(
             'unhandled_activity_codes', 'prueffall', 'normal',
             'Cash-Buchungen ohne automatische Zuordnung',
             f"Buchungsarten ohne sichere automatische Behandlung ({codes}), "
             f"Saldo {total:,.2f} EUR. Diese Beträge sind in keiner Zeile "
-            "enthalten; anhand der IBKR-Abrechnung manuell zuordnen.",
+            "enthalten; anhand der IBKR-Abrechnung manuell zuordnen."
+            + reason_text,
             'prueffaelle', len(unhandled), unhandled,
         ))
 
-    transaction_tax = audit.get('transaction_tax', {}) or {}
     ttax_applied = transaction_tax.get('applied_count', 0)
     ttax_deferred = transaction_tax.get('deferred_count', 0)
     ttax_embedded = transaction_tax.get('already_in_trade_count', 0)
+    ttax_distributed = transaction_tax.get('distributed_count', 0)
     if ttax_applied or ttax_deferred or ttax_embedded:
         parts = []
         if ttax_applied:
@@ -855,11 +873,16 @@ def collect_notices(report, context=None):
             parts.append(
                 f"{ttax_embedded} Buchung(en) waren bereits im Trade enthalten"
             )
+        if ttax_distributed:
+            parts.append(
+                f"{ttax_distributed} Tagesbuchung(en) wurden auf mehrere "
+                "Teilausführungen desselben Tages verteilt"
+            )
         notices.append(_notice(
             'transaction_tax_processed', 'transparenz', 'normal',
             'Transaktionssteuer berücksichtigt',
-            "; ".join(parts) + ".",
-            'methodik',
+            "; ".join(parts) + ". Einzelbuchungen im Bereich Rechenwege.",
+            'rechenwege',
             ttax_applied + ttax_deferred + ttax_embedded,
             transaction_tax.get('details', []),
         ))

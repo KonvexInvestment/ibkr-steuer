@@ -1227,7 +1227,7 @@ def merge_report_data(reports):
                 'found_count', 'applied_count', 'applied_eur',
                 'deferred_count', 'deferred_eur',
                 'already_in_trade_count', 'historical_count',
-                'unmatched_count',
+                'distributed_count', 'unmatched_count',
             )
         },
         'unhandled_activity_codes': [],
@@ -3700,6 +3700,45 @@ def _render_transparency_details():
                     f"{esc(calculate_tax_report.get_stillhalter_review_reason_label(item.get('reason')))} |\n")
             st.markdown(drop_table)
 
+    ttax_audit = audit.get('transaction_tax', {}) or {}
+    ttax_details = ttax_audit.get('details', []) or []
+    if ttax_details:
+        ttax_unmatched = [
+            item for item in ttax_details if item.get('status') == 'unmatched']
+        with st.expander(
+                f"Transaktionssteuer (TTAX) · {len(ttax_details)} Buchung(en), "
+                f"{fmt_de(ttax_audit.get('applied_eur', 0))} EUR im Ergebnis, "
+                f"{len(ttax_unmatched)} Prüffall/-fälle",
+                expanded=False):
+            st.caption(
+                "Transaktionssteuern sind nach §20 Abs. 4 EStG "
+                "ergebniswirksam. IBKR bucht Finanztransaktionssteuern "
+                "(z. B. French oder Spanish Daily Trade Charge Tax) als "
+                "Tagesaggregat pro Wertpapier; die Stückzahl am Ende des "
+                "Buchungstexts entspricht der Summe der Teilausführungen des "
+                "Tages. Der Betrag wird nach Transaktionswert auf diese Fills "
+                "verteilt: Verkaufssteuer mindert den Schluss-Trade sofort, "
+                "Kaufsteuer wird über die CLOSED_LOTs bis zum Verkauf "
+                "getragen. Nicht belegbare Buchungen bleiben Prüffall und "
+                "sind in keiner Zeile enthalten."
+            )
+            ttax_table = (
+                "| Datum | Symbol | Betrag (EUR) | Status | berücksichtigt | "
+                "offen | Fills | Grund |\n"
+                "|-------|--------|-------------:|--------|---------------:|"
+                "------:|------:|-------|\n")
+            for item in ttax_details:
+                ttax_table += (
+                    f"| {esc(str(item.get('date', ''))[:10])} | "
+                    f"{esc(str(item.get('symbol', '')))} | "
+                    f"{fmt_de(float(item.get('amount_eur') or 0))} | "
+                    f"{esc(calculate_tax_report.get_transaction_tax_status_label(item.get('status')))} | "
+                    f"{fmt_de(float(item.get('applied_eur') or 0))} | "
+                    f"{fmt_de(float(item.get('deferred_eur') or 0))} | "
+                    f"{int(item.get('fills') or 1)} | "
+                    f"{esc(calculate_tax_report.get_transaction_tax_reason_label(item.get('reason')))} |\n")
+            st.markdown(ttax_table)
+
 
 def _render_stillhalter_zufluss():
     if not (cross_year_details or zufluss_details or prior_zufluss_details):
@@ -4353,7 +4392,7 @@ Aus `statement_of_funds.csv` werden Cash-Positionen nach `activityCode` zugeordn
 | `CFD` | CFD-Zinsen und -Gebühren | Habenzinsen in Topf 2, Finanzierungskosten wie `DINT` nur nachrichtlich |
 | `FRTAX` / `WHT` | Quellensteuer (Withholding Tax) | Zeile 41 (anrechenbar). Ausnahmen: deutsche Kapitalertragsteuer auf DE-Wertpapieren geht nach Zeile 37/38; liegt sie auf einem DE-Fonds, wird sie als Prüffall gemeldet, da §32d Abs. 5 EStG nur ausländische Steuern erfasst und die Formularzuordnung nicht automatisierbar ist |
 | `OFEE` / `STAX` | Gebühren, Umsatzsteuer | Nicht abziehbar (§20 Abs. 9), nur nachrichtlich |
-| `TTAX` | Transaktionssteuer | Nach §20 Abs. 4 EStG ergebniswirksam. Bei eindeutigem Match wird die Verkaufssteuer sofort und die Kaufsteuer über das geschlossene Lot anteilig im realisierten Ergebnis berücksichtigt. Bereits in `Trade.taxes` enthaltene Beträge werden nicht doppelt abgezogen. Prüffall bleiben nicht eindeutige Zuordnungen, Steuern auf Stillhalter-Eröffnungen (Zufluss im Eröffnungsjahr, §11 EStG) sowie Instrumente mit eigenem Rechenweg (Anlage SO, Personengesellschaften) |
+| `TTAX` | Transaktionssteuer | Nach §20 Abs. 4 EStG ergebniswirksam. IBKR bucht Finanztransaktionssteuern (z. B. French oder Spanish Daily Trade Charge Tax) als Tagesaggregat pro Wertpapier, die Stückzahl im Buchungstext ist die Summe der Teilausführungen des Tages; der Betrag wird nach Transaktionswert auf diese Fills verteilt. Verkaufssteuer mindert den Schluss-Trade sofort, Kaufsteuer wird über das geschlossene Lot anteilig bis zum Verkauf getragen; mehrere Schluss-Fills zur selben Sekunde teilen sich ein Lot mengenproportional. Bereits in `Trade.taxes` enthaltene Beträge werden nicht doppelt abgezogen. Prüffall bleiben Buchungen ohne konsistente Zuordnung (Stückzahl passt nicht, gemischte Richtungen, Verkauf ohne CLOSED_LOT-Beleg), Steuern auf Stillhalter-Eröffnungen (Zufluss im Eröffnungsjahr, §11 EStG) sowie Instrumente mit eigenem Rechenweg (Anlage SO, Personengesellschaften). Jede Buchung steht mit Status und Grund im Bereich Rechenwege |
 | `BUY` / `SELL` / `ADJ` / `ASSIGN` / `EXE` | Trade- und Settlement-Buchungen | Übersprungen; das realisierte Ergebnis kommt aus den Trade-Daten |
 | `DEP` / `WITH` | Ein- und Auszahlungen | Übersprungen; kein eigener Kapitalertrag |
 | `FOREX` | Devisenumsatz | Übersprungen; das Ergebnis kommt aus der separaten FX-Rechnung |
@@ -4914,6 +4953,27 @@ def _build_text_report():
                 f"({len(future_assignment_corrections)} Korrektur(en); die Prämie war in der "
                 "Future-Kostenbasis eingebettet, Andienungsgebühren bleiben Anschaffungsnebenkosten)\n")
 
+    ttax_export = ""
+    ttax_details = (audit.get('transaction_tax', {}) or {}).get('details', []) or []
+    if ttax_details:
+        ttax_audit = audit.get('transaction_tax', {}) or {}
+        ttax_export = "\nTRANSAKTIONSSTEUER (TTAX, §20 Abs. 4 EStG)\n"
+        ttax_export += (
+            f"  {len(ttax_details)} Buchung(en); im Ergebnis berücksichtigt: "
+            f"{fmt_de(ttax_audit.get('applied_eur', 0)):>10} EUR; "
+            f"auf offene Positionen: {fmt_de(ttax_audit.get('deferred_eur', 0))} EUR; "
+            f"Prüffälle: {ttax_audit.get('unmatched_count', 0)}\n")
+        for item in ttax_details:
+            line = (
+                f"  {str(item.get('date', ''))[:10]} {str(item.get('symbol', '')):<20} "
+                f"{fmt_de(float(item.get('amount_eur') or 0)):>10} EUR  "
+                f"{calculate_tax_report.get_transaction_tax_status_label(item.get('status'))}")
+            if int(item.get('fills') or 1) > 1:
+                line += f" (auf {int(item.get('fills'))} Teilausführungen verteilt)"
+            if item.get('reason'):
+                line += (": " + calculate_tax_report.get_transaction_tax_reason_label(
+                    item.get('reason')))
+            ttax_export += line + "\n"
 
     inv_export = ""
     kap_inv_entries_export = ""
@@ -5091,7 +5151,7 @@ TOPF 2: SONSTIGES (inkl. Termingeschäfte){fx_partial_suffix}
   Sonstige Verluste:    {fmt_de(final['options_loss']):>14} EUR
   ─────────────────────────────────────────────────
   Saldo Sonstiges:       {fmt_de(final['topf_2']):>14} EUR
-{topf2_detail_export}{special_products_export}{fx_export}{sh_export}{inv_export}
+{topf2_detail_export}{special_products_export}{fx_export}{sh_export}{ttax_export}{inv_export}
 ═══════════════════════════════════════════════════
 ANLAGE KAP EINTRAGUNGEN
 {"" if abs(final['zeile_7']) <= 0.01 else f"  Zeile 7 (inländischer Steuerabzug): {fmt_de(final['zeile_7']):>7} EUR" + chr(10) + f"  Zeile 37 (Kapitalertragsteuer): {fmt_de(final['zeile_37']):>10} EUR" + chr(10) + f"  Zeile 38 (Solidaritätszuschlag): {fmt_de(final['zeile_38']):>9} EUR" + chr(10)}

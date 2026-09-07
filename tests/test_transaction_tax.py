@@ -17,6 +17,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from calculate_tax_report import calculate_tax  # noqa: E402
+from ui_model import build_final_values, collect_notices  # noqa: E402
 
 
 def _write_csv(path, rows):
@@ -279,19 +280,200 @@ def test_kap_inv_tax_reduces_raw_gain_before_partial_exemption():
 
 
 def test_ambiguous_same_day_match_stays_manual_review():
+    """Gemischte Richtungen oder mehrere TTAX-Zeilen pro Tag ohne
+    identifizierende Stueckzahl bleiben Prueffall."""
     symbol = "AMB"
-    trades = [
+    mixed = [
+        _trade("O1", "A1", symbol, "2025-10-01", "BUY", "O", 0, 1),
+        _trade("C2", "A1", symbol, "2025-10-01", "SELL", "C", 60, -1),
+    ]
+    report = _run(mixed, [_ttax("DAILY", "A1", symbol, "2025-10-01", -1)])
+    _assert_close(report["options_gain_eur"], 60.0, "kein unsicherer Abzug")
+    review = report["audit"]["unhandled_activity_codes"]
+    assert len(review) == 1 and review[0]["code"] == "TTAX"
+    audit = report["audit"]["transaction_tax"]
+    assert audit["unmatched_count"] == 1
+    assert audit["details"][0]["reason"] == "mehrere_trades_am_selben_tag"
+    assert audit["details"][0]["fills"] == 2
+
+    # Zwei Einzelsteuern ohne Stueckzahl fuer zwei gleichgerichtete Fills:
+    # keine Zeile laesst sich einem Fill zuordnen.
+    two_closes = [
         _trade("C1", "A1", symbol, "2025-10-01", "SELL", "C", 50, -1),
         _trade("C2", "A1", symbol, "2025-10-01", "SELL", "C", 60, -1),
     ]
-    funds = [_ttax("DAILY", "A1", symbol, "2025-10-01", -1)]
-    report = _run(trades, funds)
-
+    funds = [_ttax("T1", "A1", symbol, "2025-10-01", -1),
+             _ttax("T2", "A1", symbol, "2025-10-01", -1)]
+    report = _run(two_closes, funds)
     _assert_close(report["options_gain_eur"], 110.0, "kein unsicherer Abzug")
+    assert report["audit"]["transaction_tax"]["unmatched_count"] == 2
+    print("  OK  Mehrdeutige Same-Day-TTAX bleibt sichtbarer Prueffall")
+
+
+def _french_ftt_fixture(lot_ids=True, second_buy_quantity=97,
+                        described_quantity=170):
+    """Realmuster U770 (Issue #89): HO, 0,3 % FTT als Tagesaggregat.
+
+    Kauf 19.06. in zwei Fills derselben Sekunde (73 + 97 = 170), eine
+    TTAX-Zeile "French Daily Trade Charge Tax HO 170" ueber 78,96 EUR
+    (= 0,3 % von 11.304,05 + 15.015,60). Verkauf 20.06. in zwei Fills
+    derselben Sekunde (100 + 70) mit drei CLOSED_LOTs (73 | 27 | 70), deren
+    transactionID auf die eroeffnende Transaktion zeigt.
+    """
+    buy_a = _trade("B73", "917799", "HO", "2025-06-19", "BUY", "O", 0, 73,
+                   category="STK")
+    buy_a["proceeds"] = "-11304.05"
+    buy_b = _trade("B97", "917799", "HO", "2025-06-19", "BUY", "O", 0,
+                   second_buy_quantity, category="STK")
+    buy_b["proceeds"] = "-15015.6"
+    sell_a = _trade("S100", "917799", "HO", "2025-06-20", "SELL", "C",
+                    235.740675, -100, category="STK")
+    sell_b = _trade("S70", "917799", "HO", "2025-06-20", "SELL", "C",
+                    167.57475, -70, category="STK")
+    ttax = _ttax("DAILY", "917799", "HO", "2025-06-19", -78.96, category="STK")
+    ttax["activityDescription"] = (
+        f"French Daily Trade Charge Tax HO {described_quantity}")
+    lots = [
+        _closed_lot("917799", "HO", "2025-06-19", "2025-06-20", 73, 171.1047,
+                    category="STK"),
+        _closed_lot("917799", "HO", "2025-06-19", "2025-06-20", 27, 64.635975,
+                    category="STK"),
+        _closed_lot("917799", "HO", "2025-06-19", "2025-06-20", 70, 167.57475,
+                    category="STK"),
+    ]
+    if lot_ids:
+        lots[0]["transactionID"] = buy_a["transactionID"]
+        lots[1]["transactionID"] = buy_b["transactionID"]
+        lots[2]["transactionID"] = buy_b["transactionID"]
+    return [buy_a, buy_b, sell_a, sell_b], [ttax], lots
+
+
+def _ho_rows(report):
+    return {
+        row["quantity"]: row for row in report["trade_details"]
+        if row.get("symbol") == "HO" and row.get("source") == "trades"
+        and row.get("buySell") == "SELL"
+    }
+
+
+def test_daily_aggregate_tax_is_distributed_across_same_day_fills():
+    """Issue #89: Tagesaggregat ueber zwei Kauf-Fills wird voll realisiert."""
+    trades, funds, lots = _french_ftt_fixture()
+    report = _run(trades, funds, lots)
+
+    _assert_close(report["stocks_gain_eur"], 235.740675 + 167.57475 - 78.96,
+                  "Aktiengewinn nach FTT")
+    assert not report["audit"]["unhandled_activity_codes"]
+    audit = report["audit"]["transaction_tax"]
+    assert audit["unmatched_count"] == 0
+    assert audit["applied_count"] == 1 and audit["distributed_count"] == 1
+    assert audit["deferred_count"] == 0
+    _assert_close(audit["applied_eur"], 78.96, "gesamte FTT angewandt")
+    detail = audit["details"][0]
+    assert detail["status"] == "applied_via_closed_lot"
+    assert detail["fills"] == 2
+    shares = {d["tradeID"]: d["share"] for d in detail["distribution"]}
+    _assert_close(shares["B73"], 11304.05 / 26319.65, "Anteil nach Kaufwert 73")
+    _assert_close(shares["B97"], 15015.6 / 26319.65, "Anteil nach Kaufwert 97")
+    rows = _ho_rows(report)
+    # Beide Verkaufs-Fills liegen in derselben Sekunde: mengenproportional.
+    _assert_close(rows["-100"]["transaction_tax_eur"], -78.96 * 100 / 170,
+                  "FTT-Anteil Verkauf 100")
+    _assert_close(rows["-70"]["transaction_tax_eur"], -78.96 * 70 / 170,
+                  "FTT-Anteil Verkauf 70")
+    _assert_close(rows["-100"]["pnl_eur"], 235.740675 - 78.96 * 100 / 170,
+                  "PnL Verkauf 100 nach FTT")
+    print("  OK  Tagesaggregat (HO 170 = 73 + 97) wird auf beide Fills verteilt")
+
+
+def test_daily_aggregate_without_lot_ids_consumes_each_lot_once():
+    """Ohne Lot-IDs teilen sich die Fills derselben Sekunde die Lots; kein
+    Lot wird doppelt beansprucht, das Ergebnis bleibt identisch."""
+    trades, funds, lots = _french_ftt_fixture(lot_ids=False)
+    report = _run(trades, funds, lots)
+    _assert_close(report["stocks_gain_eur"], 235.740675 + 167.57475 - 78.96,
+                  "Aktiengewinn nach FTT ohne Lot-IDs")
+    audit = report["audit"]["transaction_tax"]
+    assert audit["unmatched_count"] == 0 and audit["deferred_count"] == 0
+    _assert_close(audit["applied_eur"], 78.96, "gesamte FTT angewandt")
+    print("  OK  Lots derselben Sekunde werden ueber alle Fills nur einmal konsumiert")
+
+
+def test_daily_aggregate_quantity_mismatch_stays_review():
+    """Stueckzahl im Text (170) passt nicht zu den Fills (73 + 80)."""
+    trades, funds, lots = _french_ftt_fixture(second_buy_quantity=80)
+    report = _run(trades, funds, lots)
+    _assert_close(report["stocks_gain_eur"], 235.740675 + 167.57475,
+                  "kein geschaetzter Abzug")
+    audit = report["audit"]["transaction_tax"]
+    assert audit["unmatched_count"] == 1 and audit["applied_count"] == 0
+    assert audit["details"][0]["reason"] == "tagesaggregat_menge_abweichend"
     review = report["audit"]["unhandled_activity_codes"]
     assert len(review) == 1 and review[0]["code"] == "TTAX"
-    assert report["audit"]["transaction_tax"]["unmatched_count"] == 1
-    print("  OK  Mehrdeutige Same-Day-TTAX bleibt sichtbarer Prueffall")
+    _assert_close(review[0]["amount_eur"], -78.96, "sichtbarer Pruefbetrag")
+    print("  OK  Abweichende Stueckzahl im Buchungstext bleibt Prueffall")
+
+
+def test_daily_aggregate_partially_open_defers_remainder():
+    """Nur 100 von 170 Stueck verkauft: Rest der Kaufsteuer bleibt offen."""
+    trades, funds, lots = _french_ftt_fixture()
+    trades = trades[:3]  # SELL 70 entfaellt, Position teilweise offen
+    lots = lots[:2]      # Lots 73 + 27 gehoeren zum SELL 100
+    report = _run(trades, funds, lots)
+    audit = report["audit"]["transaction_tax"]
+    assert audit["unmatched_count"] == 0
+    assert audit["applied_count"] == 1 and audit["deferred_count"] == 1
+    applied = 78.96 * (11304.05 / 26319.65) + 78.96 * (15015.6 / 26319.65) * 27 / 97
+    _assert_close(audit["applied_eur"], applied, "realisierter FTT-Anteil")
+    _assert_close(audit["deferred_eur"], 78.96 - applied, "offener FTT-Anteil")
+    assert audit["details"][0]["status"] == "partially_applied"
+    _assert_close(report["stocks_gain_eur"], 235.740675 - applied,
+                  "Aktiengewinn nach realisiertem Anteil")
+    print("  OK  Teilverkauf: nur der realisierte FTT-Anteil mindert den Gewinn")
+
+
+def test_same_second_closes_share_lot_reduction():
+    """Ein Kauf-Fill, zwei Verkaufs-Fills derselben Sekunde: das Lot wird
+    mengenproportional auf beide Schluss-Zeilen verteilt statt Prueffall."""
+    buy = _trade("B170", "917799", "HO", "2025-06-19", "BUY", "O", 0, 170,
+                 category="STK")
+    sell_a = _trade("S100", "917799", "HO", "2025-06-20", "SELL", "C", 200,
+                    -100, category="STK")
+    sell_b = _trade("S70", "917799", "HO", "2025-06-20", "SELL", "C", 140,
+                    -70, category="STK")
+    ttax = _ttax("DAILY", "917799", "HO", "2025-06-19", -78.96, category="STK")
+    lot = _closed_lot("917799", "HO", "2025-06-19", "2025-06-20", 170, 340,
+                      category="STK")
+    report = _run([buy, sell_a, sell_b], [ttax], [lot])
+    audit = report["audit"]["transaction_tax"]
+    assert audit["unmatched_count"] == 0 and audit["applied_count"] == 1
+    _assert_close(audit["applied_eur"], 78.96, "volle Kaufsteuer realisiert")
+    rows = _ho_rows(report)
+    _assert_close(rows["-100"]["transaction_tax_eur"], -78.96 * 100 / 170,
+                  "Anteil Schluss 100")
+    _assert_close(rows["-70"]["transaction_tax_eur"], -78.96 * 70 / 170,
+                  "Anteil Schluss 70")
+    print("  OK  Schluss-Fills derselben Sekunde teilen sich das Lot")
+
+
+def test_described_quantity_identifies_single_fill_among_same_day_trades():
+    """Zwei Einzelsteuern mit Stueckzahl (EL 25, EL 27) fuer zwei Fills
+    desselben Tages: jede Zeile findet ihren Fill, beide bleiben offen."""
+    fill_a = _trade("E25", "E1", "EL", "2025-03-03", "BUY", "O", 0, 25,
+                    category="STK")
+    fill_b = _trade("E27", "E1", "EL", "2025-03-03", "BUY", "O", 0, 27,
+                    category="STK")
+    tax_a = _ttax("T25", "E1", "EL", "2025-03-03", -12.5, category="STK")
+    tax_a["activityDescription"] = "French Daily Trade Charge Tax EL 25"
+    tax_b = _ttax("T27", "E1", "EL", "2025-03-03", -13.5, category="STK")
+    tax_b["activityDescription"] = "French Daily Trade Charge Tax EL 27"
+    report = _run([fill_a, fill_b], [tax_a, tax_b])
+    audit = report["audit"]["transaction_tax"]
+    assert audit["unmatched_count"] == 0
+    assert audit["deferred_count"] == 2 and audit["distributed_count"] == 0
+    _assert_close(audit["deferred_eur"], 26.0, "beide Kaufsteuern offen")
+    assert not report["audit"]["unhandled_activity_codes"]
+    print("  OK  Stueckzahl im Text identifiziert den einzelnen Fill")
 
 
 def test_short_option_open_tax_stays_manual_review():
@@ -310,6 +492,102 @@ def test_short_option_open_tax_stays_manual_review():
     print("  OK  TTAX auf Short-Options-Eröffnung bleibt im richtigen Jahr prüfbar")
 
 
+def test_missing_or_mismatched_lots_stay_review_items():
+    trades = [
+        _trade('OPEN', 'S1', 'EL', '2025-04-10', 'BUY', 'O', 0, 10,
+               category='STK'),
+        _trade('CLOSE', 'S1', 'EL', '2025-08-20', 'SELL', 'C', 100, -10,
+               category='STK'),
+    ]
+    funds = [_ttax('OPEN', 'S1', 'EL', '2025-04-10', -10, category='STK')]
+    lot = _closed_lot('S1', 'EL', '2025-04-10', '2025-08-20', 10, 100,
+                      category='STK')
+    for lots in ([], [dict(lot, openDateTime='2025-04-10;10:00:01')]):
+        report = _run(trades, funds, lots)
+        final = build_final_values(report, {})
+        _assert_close(final['zeile_19'], 100, 'kein geschaetzter Abzug Z19')
+        _assert_close(final['zeile_20'], 100, 'kein geschaetzter Abzug Z20')
+        audit = report['audit']['transaction_tax']
+        assert audit['unmatched_count'] == 1
+        assert audit['deferred_count'] == audit['applied_count'] == 0
+        assert (audit['details'][0]['reason']
+                == 'closed_lot_abdeckung_unvollstaendig')
+        review = report['audit']['unhandled_activity_codes']
+        assert len(review) == 1 and review[0]['code'] == 'TTAX'
+        _assert_close(review[0]['amount_eur'], -10, 'sichtbarer Pruefbetrag')
+        notices = {n['id']: n for n in collect_notices(report)}
+        assert 'unhandled_activity_codes' in notices
+        assert 'transaction_tax_processed' not in notices
+    print('  OK  Fehlende/falsch datierte Lots bleiben als Prueffall sichtbar')
+
+
+def test_incomplete_lots_roll_back_only_the_affected_tax():
+    trades = [
+        _trade('OPEN', 'S1', 'EL', '2025-04-10', 'BUY', 'O', 0, 10,
+               category='STK'),
+        _trade('CLOSE', 'S1', 'EL', '2025-08-20', 'SELL', 'C', 100, -10,
+               category='STK'),
+    ]
+    funds = [
+        _ttax('OPEN', 'S1', 'EL', '2025-04-10', -10, category='STK'),
+        _ttax('CLOSE', 'S1', 'EL', '2025-08-20', -2, category='STK'),
+    ]
+    lots = [_closed_lot('S1', 'EL', '2025-04-10', '2025-08-20', 4, 40,
+                        category='STK')]
+    for ordered_funds in (funds, list(reversed(funds))):
+        report = _run(trades, ordered_funds, lots)
+        _assert_close(report['stocks_gain_eur'], 98, 'sichere Verkaufssteuer')
+        audit = report['audit']['transaction_tax']
+        assert audit['unmatched_count'] == audit['applied_count'] == 1
+        assert audit['deferred_count'] == 0
+        _assert_close(audit['applied_eur'], 2, 'keine anteilige Kaufsteuer')
+        _assert_close(report['trade_details'][0]['transaction_tax_eur'], -2,
+                      'Trade-Detail ohne zurueckgerollte Kaufsteuer')
+    print('  OK  Lueckenhafte Lots: nur unsichere Kaufsteuer zurueckgerollt')
+
+
+def test_proven_other_opening_does_not_block_deferral():
+    trades = [
+        _trade('OLDER', 'S1', 'EL', '2025-03-10', 'BUY', 'O', 0, 10,
+               category='STK'),
+        _trade('OPEN', 'S1', 'EL', '2025-04-10', 'BUY', 'O', 0, 10,
+               category='STK'),
+        _trade('CLOSE', 'S1', 'EL', '2025-08-20', 'SELL', 'C', 100, -10,
+               category='STK'),
+    ]
+    funds = [_ttax('OPEN', 'S1', 'EL', '2025-04-10', -10, category='STK')]
+    lots = [_closed_lot('S1', 'EL', '2025-03-10', '2025-08-20', 10, 100,
+                        category='STK')]
+    report = _run(trades, funds, lots)
+    assert not report['audit']['unhandled_activity_codes']
+    audit = report['audit']['transaction_tax']
+    assert audit['deferred_count'] == 1 and audit['applied_count'] == 0
+    _assert_close(audit['deferred_eur'], 10, 'Kauf bleibt nachgewiesen offen')
+    _assert_close(report['stocks_gain_eur'], 100, 'anderes Lot unveraendert')
+    print('  OK  Belegter Verkauf einer anderen Anschaffung erlaubt')
+
+
+def test_open_position_and_unrelated_closes_remain_deferred():
+    opening = _trade('OPEN', 'S1', 'EL', '2025-04-10', 'BUY', 'O', 0, 10,
+                     category='STK')
+    funds = [_ttax('OPEN', 'S1', 'EL', '2025-04-10', -10, category='STK')]
+    closes = [
+        _trade('EARLIER', 'S1', 'EL', '2025-03-10', 'SELL', 'C', 100, -10,
+               category='STK'),
+        _trade('FUTURE', 'S1', 'EL', '2026-08-20', 'SELL', 'C', 100, -10,
+               category='STK'),
+        _trade('OTHER', 'S2', 'SAN', '2025-08-20', 'SELL', 'C', 100, -10,
+               category='STK'),
+    ]
+    for extra_trades in ([], closes):
+        report = _run([opening] + extra_trades, funds)
+        audit = report['audit']['transaction_tax']
+        assert audit['deferred_count'] == 1 and audit['unmatched_count'] == 0
+        _assert_close(audit['deferred_eur'], 10, 'offene Kaufsteuer')
+        assert not report['audit']['unhandled_activity_codes']
+    print('  OK  Offene Position sowie fruehere/spaetere/fremde Schliessungen')
+
+
 if __name__ == "__main__":
     test_real_option_pattern_applies_open_and_close_tax()
     test_compact_dates_preserve_closed_lot_and_tax_matching()
@@ -319,4 +597,14 @@ if __name__ == "__main__":
     test_kap_inv_tax_reduces_raw_gain_before_partial_exemption()
     test_ambiguous_same_day_match_stays_manual_review()
     test_short_option_open_tax_stays_manual_review()
+    test_missing_or_mismatched_lots_stay_review_items()
+    test_incomplete_lots_roll_back_only_the_affected_tax()
+    test_proven_other_opening_does_not_block_deferral()
+    test_open_position_and_unrelated_closes_remain_deferred()
+    test_daily_aggregate_tax_is_distributed_across_same_day_fills()
+    test_daily_aggregate_without_lot_ids_consumes_each_lot_once()
+    test_daily_aggregate_quantity_mismatch_stays_review()
+    test_daily_aggregate_partially_open_defers_remainder()
+    test_same_second_closes_share_lot_reduction()
+    test_described_quantity_identifies_single_fill_among_same_day_trades()
     print("Alle TTAX-Tests bestanden.")

@@ -559,6 +559,68 @@ def test_future_option_assignment_is_transparent_in_ui():
     assert fut_rows, "FUT-Close-Zeile muss als korrigiert markiert sein"
 
 
+def _french_ftt_body(described_quantity=170):
+    """Realmuster U770 (Issue #89): Tages-FTT ueber zwei Kauf-Fills derselben
+    Sekunde, Verkauf am Folgetag in zwei Fills derselben Sekunde, drei Lots."""
+    return f"""
+      <Trades>
+        <Trade accountId="U123" assetCategory="STK" subCategory="COMMON" symbol="HO" description="THALES" conid="917799" isin="FR0000121329" tradeID="759436812" transactionID="2824330673" reportDate="2025-06-19" tradeDate="2025-06-19" dateTime="2025-06-19 09:18:02" buySell="BUY" openCloseIndicator="O" quantity="73" tradePrice="154.85" closePrice="154.85" proceeds="-11304.05" cost="11309.702025" fifoPnlRealized="0" fxRateToBase="1" ibCommission="-5.652025" taxes="0" currency="EUR" levelOfDetail="EXECUTION" transactionType="ExchTrade" multiplier="1" />
+        <Trade accountId="U123" assetCategory="STK" subCategory="COMMON" symbol="HO" description="THALES" conid="917799" isin="FR0000121329" tradeID="759436813" transactionID="2824330674" reportDate="2025-06-19" tradeDate="2025-06-19" dateTime="2025-06-19 09:18:02" buySell="BUY" openCloseIndicator="O" quantity="97" tradePrice="154.8" closePrice="154.8" proceeds="-15015.6" cost="15023.1078" fifoPnlRealized="0" fxRateToBase="1" ibCommission="-7.5078" taxes="0" currency="EUR" levelOfDetail="EXECUTION" transactionType="ExchTrade" multiplier="1" />
+        <Trade accountId="U123" assetCategory="STK" subCategory="COMMON" symbol="HO" description="THALES" conid="917799" isin="FR0000121329" tradeID="759920933" transactionID="2826569801" reportDate="2025-06-20" tradeDate="2025-06-20" dateTime="2025-06-20 10:00:13" buySell="SELL" openCloseIndicator="C" quantity="-100" tradePrice="157.35" closePrice="157.35" proceeds="15735" cost="-15491.391825" fifoPnlRealized="235.740675" fxRateToBase="1" ibCommission="-7.8675" taxes="0" currency="EUR" levelOfDetail="EXECUTION" transactionType="ExchTrade" multiplier="1" />
+        <Trade accountId="U123" assetCategory="STK" subCategory="COMMON" symbol="HO" description="THALES" conid="917799" isin="FR0000121329" tradeID="759920959" transactionID="2826569806" reportDate="2025-06-20" tradeDate="2025-06-20" dateTime="2025-06-20 10:00:13" buySell="SELL" openCloseIndicator="C" quantity="-70" tradePrice="157.35" closePrice="157.35" proceeds="11014.5" cost="-10841.418" fifoPnlRealized="167.57475" fxRateToBase="1" ibCommission="-5.50725" taxes="0" currency="EUR" levelOfDetail="EXECUTION" transactionType="ExchTrade" multiplier="1" />
+        <Trade accountId="U123" assetCategory="STK" symbol="HO" conid="917799" isin="FR0000121329" tradeID="" transactionID="2824330673" reportDate="2025-06-20" dateTime="2025-06-20 10:00:13" openDateTime="2025-06-19 09:18:02" buySell="SELL" quantity="73" cost="11309.702025" fifoPnlRealized="171.1047" fxRateToBase="1" currency="EUR" multiplier="1" levelOfDetail="CLOSED_LOT" />
+        <Trade accountId="U123" assetCategory="STK" symbol="HO" conid="917799" isin="FR0000121329" tradeID="" transactionID="2824330674" reportDate="2025-06-20" dateTime="2025-06-20 10:00:13" openDateTime="2025-06-19 09:18:02" buySell="SELL" quantity="27" cost="4181.6898" fifoPnlRealized="64.635975" fxRateToBase="1" currency="EUR" multiplier="1" levelOfDetail="CLOSED_LOT" />
+        <Trade accountId="U123" assetCategory="STK" symbol="HO" conid="917799" isin="FR0000121329" tradeID="" transactionID="2824330674" reportDate="2025-06-20" dateTime="2025-06-20 10:00:13" openDateTime="2025-06-19 09:18:02" buySell="SELL" quantity="70" cost="10841.418" fifoPnlRealized="167.57475" fxRateToBase="1" currency="EUR" multiplier="1" levelOfDetail="CLOSED_LOT" />
+      </Trades>
+      <StmtFunds>
+        <StatementOfFundsLine accountId="U123" currency="EUR" fxRateToBase="1" assetCategory="STK" symbol="HO" conid="917799" isin="FR0000121329" reportDate="2025-06-19" date="2025-06-19" settleDate="2025-06-19" activityCode="TTAX" activityDescription="French Daily Trade Charge Tax HO {described_quantity}" amount="-78.96" tradeID="2824434899" transactionID="2824434899" levelOfDetail="BaseCurrency" />
+      </StmtFunds>
+"""
+
+
+def test_transaction_tax_daily_aggregate_is_transparent_in_ui():
+    """Issue #89 end-to-end: Tages-FTT wird verteilt und im Ergebnis, in der
+    Notice, im Rechenwege-Expander und im Textbericht sichtbar; bei
+    abweichender Stueckzahl nennt der Prueffall den Grund."""
+    at = run_app(make_dataset([("ftt.xml", make_xml(body=_french_ftt_body()))]),
+                 nav='rechenwege')
+    assert_no_exception(at, "Tages-FTT in Rechenwege")
+    report = at.session_state['snapshot']['payload']['merged']
+    audit = report['audit']['transaction_tax']
+    assert audit['applied_count'] == 1 and audit['distributed_count'] == 1
+    assert audit['unmatched_count'] == 0
+    assert abs(audit['applied_eur'] - 78.96) < 1e-6
+    final = ui_model.build_final_values(report, ui_model.default_toggles())
+    assert abs(final['zeile_20'] - (235.740675 + 167.57475 - 78.96)) < 1e-6
+    rendered = all_markdown(at)
+    assert "Transaktionssteuer berücksichtigt" in rendered
+    assert "1 Tagesbuchung(en) wurden auf mehrere Teilausführungen" in rendered
+    assert "Kaufsteuer über CLOSED_LOT im realisierten Ergebnis berücksichtigt" in rendered
+    expander_labels = [expander.label for expander in at.expander]
+    assert any(label.startswith("Transaktionssteuer (TTAX) · 1 Buchung(en), 78,96 EUR")
+               for label in expander_labels), expander_labels
+
+    at.session_state['nav'] = 'export'
+    at.run()
+    assert_no_exception(at, "Tages-FTT im Export")
+    txt = at.session_state['export_cache']['txt']
+    assert "TRANSAKTIONSSTEUER (TTAX, §20 Abs. 4 EStG)" in txt
+    assert "auf 2 Teilausführungen verteilt" in txt
+
+    # Stueckzahl im Buchungstext passt nicht: Prueffall mit lesbarem Grund.
+    at = run_app(make_dataset([("ftt-mismatch.xml",
+                                make_xml(body=_french_ftt_body(described_quantity=160)))]),
+                 nav='prueffaelle')
+    assert_no_exception(at, "Tages-FTT mit abweichender Stueckzahl")
+    report = at.session_state['snapshot']['payload']['merged']
+    assert report['audit']['transaction_tax']['unmatched_count'] == 1
+    final = ui_model.build_final_values(report, ui_model.default_toggles())
+    assert abs(final['zeile_20'] - (235.740675 + 167.57475)) < 1e-6
+    rendered = all_markdown(at)
+    assert "Cash-Buchungen ohne automatische Zuordnung" in rendered
+    assert "TTAX-Gründe: 1× Stückzahl im Buchungstext passt nicht" in rendered
+
+
 def test_guidance_copy_and_rechenwege_grouping():
     dataset = make_dataset([("synthetic_2025.xml", make_xml())])
 
@@ -645,6 +707,7 @@ if __name__ == '__main__':
         test_overlapping_periods_are_a_hard_error,
         test_partnership_trade_is_visible_in_export_summary,
         test_future_option_assignment_is_transparent_in_ui,
+        test_transaction_tax_daily_aggregate_is_transparent_in_ui,
         test_guidance_copy_and_rechenwege_grouping,
     ]
     failures = 0

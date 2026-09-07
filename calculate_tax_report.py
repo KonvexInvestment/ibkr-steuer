@@ -4,7 +4,7 @@ import io
 import os
 import sys
 from datetime import datetime, timedelta
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 
 from ibkr_dates import (
     normalize_ibkr_datetime,
@@ -4116,13 +4116,84 @@ def _transaction_tax_trade_candidates(row, trades):
     return candidates
 
 
-def _transaction_tax_open_lots(open_trade, closed_lots):
-    """Findet CLOSED_LOTs, die exakt aus dem belasteten Opening stammen."""
+# Nutzerlesbare Labels fuer TTAX-Status und -Prueffallgruende. Single Source
+# fuer GUI (Rechenwege, Prueffall-Notice) und Textbericht.
+TRANSACTION_TAX_STATUS_LABELS = {
+    'applied_to_close': 'Verkaufssteuer im Schluss-Trade berücksichtigt',
+    'applied_via_closed_lot': (
+        'Kaufsteuer über CLOSED_LOT im realisierten Ergebnis berücksichtigt'),
+    'partially_applied': (
+        'teilweise realisiert, Rest entfällt auf die offene Position'),
+    'deferred_open_position': (
+        'Kaufsteuer auf offene Position, wird beim Verkauf berücksichtigt'),
+    'historical_close': 'Schluss im Vorjahr, dort zu berücksichtigen',
+    'already_in_trade': (
+        'bereits in Trade.taxes enthalten, nicht doppelt abgezogen'),
+    'unmatched': 'nicht automatisch zuordenbar (Prüffall)',
+}
+
+TRANSACTION_TAX_REASON_LABELS = {
+    'kein_eindeutiger_trade': (
+        'kein Trade mit gleicher Kontraktnummer am Buchungstag'),
+    'mehrere_trades_am_selben_tag': (
+        'mehrere Trades am selben Tag ohne konsistentes Tagesaggregat '
+        '(Richtung, Eröffnung/Schluss oder Stückzahl weichen ab)'),
+    'tagesaggregat_menge_abweichend': (
+        'Stückzahl im Buchungstext passt nicht zur Summe der Fills '
+        'desselben Tages'),
+    'steuerroute_nicht_automatisierbar': (
+        'Instrument mit eigenem Rechenweg (Anlage SO, Personengesellschaft)'),
+    'trade_taxes_weicht_ab': (
+        'Trade.taxes enthält einen abweichenden Steuerbetrag'),
+    'schluss_ausserhalb_steuerjahr': (
+        'Schluss-Trade liegt außerhalb des Steuerjahres'),
+    'schluss_ohne_fifo_pnl': 'Schluss-Trade ohne fifoPnlRealized',
+    'trade_nicht_oeffnung_oder_schluss': (
+        'Trade ist weder als Eröffnung noch als Schluss gekennzeichnet'),
+    'short_option_eroeffnung': (
+        'Stillhalter-Eröffnung: Zufluss im Eröffnungsjahr (§11 EStG), '
+        'manuell zuordnen'),
+    'eroeffnungsmenge_fehlt': 'Eröffnungsmenge fehlt',
+    'closed_lot_nicht_eindeutig': (
+        'CLOSED_LOT lässt sich keinem eindeutigen Schluss-Trade zuordnen'),
+    'closed_lot_abdeckung_unvollstaendig': (
+        'Verkauf im Steuerjahr ohne vollständigen CLOSED_LOT-Beleg; die '
+        'offene Restmenge ist nicht belegbar'),
+}
+
+
+def get_transaction_tax_status_label(status):
+    return TRANSACTION_TAX_STATUS_LABELS.get(status, status or '')
+
+
+def get_transaction_tax_reason_label(reason):
+    return TRANSACTION_TAX_REASON_LABELS.get(reason, reason or '')
+
+
+def _transaction_tax_lot_opening_id(lot):
+    """IBKRs Transaktions-ID der EROEFFNUNG, die ein CLOSED_LOT referenziert."""
+    return str(lot.get('origTransactionID') or lot.get('transactionID') or '').strip()
+
+
+def _transaction_tax_open_lots(open_trade, closed_lots, trade_tx_ids=None):
+    """Findet CLOSED_LOTs, die exakt aus dem belasteten Opening stammen.
+
+    Basis ist der Eroeffnungszeitstempel plus conid/Symbol. Liegen mehrere
+    Eroeffnungen in derselben Sekunde (Teilausfuehrungen), entscheidet die
+    ``transactionID`` des Lots, die bei IBKR auf die eroeffnende Transaktion
+    zeigt (Realbeleg U770: Lot 73 → BUY 73, Lots 27+70 → BUY 97): Ein Lot,
+    dessen ID zu einem ANDEREN bekannten Trade gehoert, wird ausgeschlossen.
+    Lots ohne bekannte ID bleiben beim Zeitstempel-Match (aeltere Exporte,
+    synthetische Fixtures). ``trade_tx_ids`` ist die Menge aller
+    Trade-``transactionID``s.
+    """
     open_timestamp = _normalize_ibkr_timestamp(open_trade.get('dateTime'))
     if not open_timestamp:
         return []
     open_conid = str(open_trade.get('conid') or '').strip()
     open_symbol = (open_trade.get('symbol') or '').strip()
+    open_tx = str(open_trade.get('transactionID') or '').strip()
+    known_ids = trade_tx_ids or set()
     matches = []
     for lot in closed_lots:
         lot_open = _normalize_ibkr_timestamp(
@@ -4136,8 +4207,12 @@ def _transaction_tax_open_lots(open_trade, closed_lots):
             identity_match = bool(
                 open_symbol and (lot.get('symbol') or '').strip() == open_symbol
             )
-        if identity_match:
-            matches.append(lot)
+        if not identity_match:
+            continue
+        lot_tx = _transaction_tax_lot_opening_id(lot)
+        if lot_tx and open_tx and lot_tx != open_tx and lot_tx in known_ids:
+            continue  # belegbar aus einer anderen Eroeffnung derselben Sekunde
+        matches.append(lot)
     return matches
 
 
@@ -4163,6 +4238,353 @@ def _transaction_tax_lot_close_candidates(lot, trades):
     return candidates
 
 
+def _transaction_tax_split_close_targets(candidates):
+    """Schluss-Trade(s) eines Lots als Liste ``(trade, anteil)``.
+
+    Mehrere Schluss-Fills zur selben Sekunde (Realbeleg U770: SELL 100 und
+    SELL 70 um 10:00:13) werden mengenproportional aufgeteilt. Das ist
+    steuerneutral: gleiches Instrument, gleicher Tag, gleiche Richtung, also
+    gleicher Topf und gleiches Jahr; nur die Zeilenzuordnung in den
+    Trade-Details ist naeherungsweise. Returns None bei unsicherer
+    Konstellation (gemischte Richtungen, kein Schluss, fehlender PnL).
+    """
+    if not candidates:
+        return None
+    quantities = []
+    sides = set()
+    for trade in candidates:
+        if trade.get('fifoPnlRealized') in (None, ''):
+            return None
+        if len(candidates) > 1:
+            is_close = (
+                (trade.get('openCloseIndicator') or '').upper() == 'C'
+                or abs(safe_float(trade.get('fifoPnlRealized'))) > 1e-7
+            )
+            if not is_close:
+                return None
+        sides.add((trade.get('buySell') or '').upper())
+        quantities.append(abs(safe_float(trade.get('quantity'))))
+    if len(candidates) == 1:
+        return [(candidates[0], 1.0)]
+    if len(sides) != 1:
+        return None
+    total = sum(quantities)
+    if total <= 1e-7:
+        return None
+    return [(trade, qty / total) for trade, qty in zip(candidates, quantities)]
+
+
+def _transaction_tax_described_quantity(row):
+    """Stueckzahl am Ende des IBKR-Buchungstexts.
+
+    "French Daily Trade Charge Tax HO 170" → 170.0. None, wenn der Text nicht
+    mit einer positiven Zahl endet ("Italian Derivative Transaction Tax
+    ENI DEC25 14 C -").
+    """
+    text = (row.get('activityDescription') or '').strip()
+    if not text:
+        return None
+    token = text.rsplit(None, 1)[-1].replace(',', '.')
+    try:
+        value = float(token)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _transaction_tax_row_key(row):
+    """Instrument + Buchungstag einer TTAX-Zeile (fuer 'eine Buchung pro Tag')."""
+    identity = next((
+        str(row.get(field) or '').strip()
+        for field in ('conid', 'isin', 'symbol')
+        if str(row.get(field) or '').strip()
+    ), '')
+    row_date = parse_date(row.get('date')) or parse_date(row.get('reportDate'))
+    return identity, str(row_date) if row_date else ''
+
+
+def _transaction_tax_daily_fills(row, candidates, same_day_rows):
+    """Verteilt eine Tages-TTAX auf die Teilausfuehrungen desselben Tages.
+
+    IBKR bucht Finanztransaktionssteuern (FR 0,3 %, ES 0,2 %) als EIN
+    Tagesaggregat pro Instrument, der Buchungstext endet mit der Stueckzahl
+    ("French Daily Trade Charge Tax HO 170" = Fills 73 + 97). Verteilt wird
+    nur auf eine homogene Gruppe (gleiche Richtung, gleiche Eroeffnungs-/
+    Schluss-Kennung), pro rata nach Transaktionswert:
+
+    * Stueckzahl belegt genau eine Gruppe und es gibt genau eine TTAX-Zeile
+      fuer Instrument und Tag → Tagesaggregat auf die Gruppe.
+    * Stueckzahl belegt genau einen einzelnen Fill → Einzelsteuer dieses Fills.
+    * Keine Stueckzahl, aber alle Fills homogen und genau eine TTAX-Zeile →
+      Tagesaggregat.
+    * Alles andere bleibt Prueffall (Grund im zweiten Rueckgabewert).
+
+    Returns ``([(trade, anteil), ...], None)`` oder ``(None, grund)``.
+    """
+    def quantity(trade):
+        return abs(safe_float(trade.get('quantity')))
+
+    described = _transaction_tax_described_quantity(row)
+    groups = defaultdict(list)
+    for trade in candidates:
+        groups[(
+            (trade.get('buySell') or '').upper(),
+            (trade.get('openCloseIndicator') or '').upper(),
+        )].append(trade)
+
+    fills = None
+    if described is not None:
+        matching_groups = [
+            group for group in groups.values()
+            if abs(sum(quantity(t) for t in group) - described) <= 1e-7
+        ]
+        single_fills = [
+            t for t in candidates if abs(quantity(t) - described) <= 1e-7
+        ]
+        if len(matching_groups) == 1 and same_day_rows == 1:
+            fills = matching_groups[0]
+        elif len(single_fills) == 1:
+            fills = single_fills
+        elif matching_groups or single_fills:
+            return None, 'mehrere_trades_am_selben_tag'
+        else:
+            return None, 'tagesaggregat_menge_abweichend'
+    elif len(groups) == 1 and same_day_rows == 1:
+        fills = list(candidates)
+    else:
+        return None, 'mehrere_trades_am_selben_tag'
+
+    if len(fills) == 1:
+        return [(fills[0], 1.0)], None
+    weights = [abs(safe_float(t.get('proceeds'))) for t in fills]
+    if any(weight <= 1e-9 for weight in weights):
+        weights = [quantity(t) for t in fills]
+    total = sum(weights)
+    if total <= 1e-9:
+        return None, 'mehrere_trades_am_selben_tag'
+    return [(t, weight / total) for t, weight in zip(fills, weights)], None
+
+
+def _transaction_tax_has_uncovered_close(open_trade, trades, closed_lots,
+                                         tax_year, trade_tx_ids=None):
+    """Fehlende Lots sind bei moeglichen Schliessungen kein offener Bestand.
+
+    Auch Schliessungen anderer Anschaffungen sind erlaubt, sofern ihre Lots
+    vollstaendig und eindeutig auf vorhandene Eroeffnungen zurueckfuehren.
+    Mehrere Schluss-Fills zur selben Sekunde teilen sich ein Lot
+    mengenproportional (``_transaction_tax_split_close_targets``). Ohne diesen
+    Nachweis bleibt die TTAX-Zuordnung bewusst ein Prueffall.
+    """
+    open_date = parse_date(
+        open_trade.get('dateTime') or open_trade.get('tradeDate')
+        or open_trade.get('reportDate'))
+    identity_field = next((field for field in ('conid', 'isin', 'symbol')
+                           if str(open_trade.get(field) or '').strip()), None)
+    if not open_date or not identity_field:
+        return True
+    identity = str(open_trade[identity_field]).strip()
+    open_timestamp = _normalize_ibkr_timestamp(open_trade.get('dateTime'))
+    for close_trade in trades:
+        if close_trade is open_trade:
+            continue
+        if close_trade.get('assetCategory') != open_trade.get('assetCategory'):
+            continue
+        if str(close_trade.get(identity_field) or '').strip() != identity:
+            continue
+        if (close_trade.get('openCloseIndicator') or '').upper() != 'C' and (
+                abs(safe_float(close_trade.get('fifoPnlRealized'))) < 1e-7):
+            continue
+        if (open_trade.get('buySell') and close_trade.get('buySell')
+                and open_trade['buySell'] == close_trade['buySell']):
+            continue
+        close_date = parse_date(
+            close_trade.get('reportDate') or close_trade.get('dateTime')
+            or close_trade.get('tradeDate'))
+        if not close_date:
+            return True
+        if close_date.year > tax_year or close_date < open_date:
+            continue
+        close_timestamp = _normalize_ibkr_timestamp(
+            close_trade.get('dateTime'))
+        if (open_timestamp and close_timestamp
+                and close_timestamp < open_timestamp):
+            continue
+        covered_quantity = 0.0
+        for lot in closed_lots:
+            if not _transaction_tax_lot_close_candidates(lot, [close_trade]):
+                continue
+            targets = _transaction_tax_split_close_targets(
+                _transaction_tax_lot_close_candidates(lot, trades))
+            if not targets:
+                continue
+            close_share = next(
+                (share for target, share in targets if target is close_trade),
+                0.0)
+            if close_share <= 0:
+                continue
+            openings = [
+                candidate for candidate in trades
+                if (candidate.get('openCloseIndicator') or '').upper() == 'O'
+                and _transaction_tax_open_lots(candidate, [lot], trade_tx_ids)
+            ]
+            if len(openings) == 1:
+                covered_quantity += (
+                    abs(safe_float(lot.get('quantity'))) * close_share)
+        close_quantity = abs(safe_float(close_trade.get('quantity')))
+        if (close_quantity <= 1e-7
+                or abs(covered_quantity - close_quantity) > 1e-7):
+            return True
+    return False
+
+
+def _transaction_tax_fill_outcome(trade, share, amount_eur, trades,
+                                  closed_lots, tax_year, base_currency,
+                                  usd_to_eur_rates, eligible_trade,
+                                  lot_consumed, trade_tx_ids):
+    """Wirkung eines TTAX-Anteils auf genau einen Trade (Fill).
+
+    Wendet NICHTS an: Der Aufrufer uebernimmt alle Fills eines Events
+    gemeinsam oder verwirft das Event als Prueffall. ``lot_consumed`` ist der
+    geteilte Lot-Konsum aller Fills eines Events (Teilausfuehrungen derselben
+    Sekunde duerfen ein Lot nicht doppelt beanspruchen).
+
+    Returns dict: ``reason`` (Prueffall-Code oder None), ``kind`` in
+    ('embedded', 'historical_close', 'close', 'open'), EUR-Betraege
+    ``applied``/``deferred``/``historical`` (positiv = Kostenreduktion des
+    PnL) und ``adjustments`` als Liste ``(close_trade, reduction_eur, source)``.
+    """
+    epsilon = 0.0000001
+    fill_amount_eur = amount_eur * share
+    reduction_eur = -fill_amount_eur
+    result = {'reason': None, 'kind': None, 'applied': 0.0, 'deferred': 0.0,
+              'historical': 0.0, 'adjustments': []}
+
+    if eligible_trade is not None and not eligible_trade(trade):
+        result['reason'] = 'steuerroute_nicht_automatisierbar'
+        return result
+
+    embedded_eur = _trade_value_eur(
+        trade.get('taxes'), trade, base_currency, usd_to_eur_rates)
+    if abs(embedded_eur) > epsilon:
+        tolerance = max(0.0001, abs(fill_amount_eur) * 0.001)
+        if abs(embedded_eur - fill_amount_eur) <= tolerance:
+            result['kind'] = 'embedded'
+        else:
+            result['reason'] = 'trade_taxes_weicht_ab'
+        return result
+
+    trade_report_date = (
+        parse_date(trade.get('reportDate'))
+        or parse_date(trade.get('dateTime'))
+        or parse_date(trade.get('tradeDate'))
+    )
+    pnl_value = trade.get('fifoPnlRealized')
+    is_close = (
+        (trade.get('openCloseIndicator') or '').upper() == 'C'
+        or abs(safe_float(pnl_value, 0.0)) > epsilon
+    )
+    if is_close:
+        if trade_report_date and trade_report_date.year < tax_year:
+            result['kind'] = 'historical_close'
+            result['historical'] = reduction_eur
+            return result
+        if not trade_report_date or trade_report_date.year != tax_year:
+            result['reason'] = 'schluss_ausserhalb_steuerjahr'
+            return result
+        if pnl_value in (None, ''):
+            result['reason'] = 'schluss_ohne_fifo_pnl'
+            return result
+        result['kind'] = 'close'
+        result['applied'] = reduction_eur
+        result['adjustments'].append((trade, reduction_eur, 'closing_trade'))
+        return result
+
+    if (trade.get('openCloseIndicator') or '').upper() != 'O':
+        result['reason'] = 'trade_nicht_oeffnung_oder_schluss'
+        return result
+
+    # Bei einem Optionsverkauf entsteht die Stillhalterpraemie bereits im
+    # Eroeffnungsjahr (§11 EStG). Dessen TTAX darf deshalb nicht wie die
+    # Anschaffungsnebenkosten einer Long-Position bis zum Close getragen
+    # werden. Ohne Eingriff in die separate Zufluss-FIFO bleibt der seltene
+    # Fall bewusst manuell statt die Steuer ins falsche Jahr zu verschieben.
+    if (
+        trade.get('assetCategory') in ('OPT', 'FOP', 'FSFOP')
+        and (trade.get('buySell') or '').upper() == 'SELL'
+    ):
+        result['reason'] = 'short_option_eroeffnung'
+        return result
+
+    open_quantity = abs(safe_float(trade.get('quantity'), 0.0))
+    if open_quantity <= epsilon:
+        result['reason'] = 'eroeffnungsmenge_fehlt'
+        return result
+
+    result['kind'] = 'open'
+    open_lots = sorted(
+        _transaction_tax_open_lots(trade, closed_lots, trade_tx_ids),
+        key=lambda lot: lot.get('reportDate') or lot.get('dateTime') or '',
+    )
+    remaining_quantity = open_quantity
+    for lot in open_lots:
+        lot_total = abs(safe_float(lot.get('quantity'), 0.0))
+        available = max(0.0, lot_total - lot_consumed.get(id(lot), 0.0))
+        lot_quantity = min(remaining_quantity, available)
+        if lot_quantity <= epsilon:
+            continue
+        lot_report_date = (
+            parse_date(lot.get('reportDate'))
+            or parse_date(lot.get('dateTime'))
+        )
+        if not lot_report_date:
+            result['reason'] = 'closed_lot_nicht_eindeutig'
+            return result
+        if lot_report_date.year > tax_year:
+            continue  # erst nach dem Steuerjahr geschlossen: bleibt offen
+        lot_consumed[id(lot)] = lot_consumed.get(id(lot), 0.0) + lot_quantity
+        remaining_quantity -= lot_quantity
+        lot_reduction = reduction_eur * lot_quantity / open_quantity
+        if lot_report_date.year < tax_year:
+            result['historical'] += lot_reduction
+            continue
+        targets = _transaction_tax_split_close_targets(
+            _transaction_tax_lot_close_candidates(lot, trades))
+        if not targets:
+            result['reason'] = 'closed_lot_nicht_eindeutig'
+            return result
+        for close_trade, close_share in targets:
+            if eligible_trade is not None and not eligible_trade(close_trade):
+                result['reason'] = 'closed_lot_nicht_eindeutig'
+                return result
+            result['adjustments'].append(
+                (close_trade, lot_reduction * close_share, 'opening_basis'))
+        result['applied'] += lot_reduction
+
+    if (remaining_quantity > epsilon
+            and _transaction_tax_has_uncovered_close(
+                trade, trades, closed_lots, tax_year, trade_tx_ids)):
+        result['reason'] = 'closed_lot_abdeckung_unvollstaendig'
+        return result
+    result['deferred'] = reduction_eur * remaining_quantity / open_quantity
+    return result
+
+
+def _transaction_tax_event_status(outcomes, applied_eur, deferred_eur,
+                                  historical_eur, epsilon=0.0000001):
+    kinds = {outcome['kind'] for outcome in outcomes}
+    if kinds == {'embedded'}:
+        return 'already_in_trade'
+    if abs(applied_eur) > epsilon and abs(deferred_eur) > epsilon:
+        return 'partially_applied'
+    if abs(applied_eur) > epsilon:
+        return 'applied_to_close' if kinds == {'close'} else 'applied_via_closed_lot'
+    if abs(deferred_eur) > epsilon:
+        return 'deferred_open_position'
+    if abs(historical_eur) > epsilon or 'historical_close' in kinds:
+        return 'historical_close'
+    return 'applied_to_close'
+
+
 def _collect_transaction_tax_adjustments(
         funds, trades, closed_lots, tax_year, base_currency,
         usd_to_eur_rates, eligible_trade=None):
@@ -4171,6 +4593,11 @@ def _collect_transaction_tax_adjustments(
     Returns ``(adjustments, resolved_oids, audit)``. ``adjustments`` ist nach
     ``id(close_trade)`` gruppiert und enthaelt EUR-PnL-Reduktionen. Negative
     TTAX-Cashwerte werden positiv als Kostenreduktion des PnL gefuehrt.
+
+    Ein TTAX-Event wird entweder vollstaendig belegt und angewandt (alle
+    Fills, alle Lots) oder komplett als Prueffall gemeldet; Teilanwendungen
+    gibt es nicht. Tagesaggregate (FR/ES-Finanztransaktionssteuer) werden
+    ueber ``_transaction_tax_daily_fills`` auf die Same-Day-Fills verteilt.
     """
     ttax_rows = [
         row for row in funds
@@ -4187,12 +4614,17 @@ def _collect_transaction_tax_adjustments(
         'deferred_eur': 0.0,
         'already_in_trade_count': 0,
         'historical_count': 0,
+        'distributed_count': 0,
         'unmatched_count': 0,
         'details': details,
     }
     epsilon = 0.0000001
+    trade_tx_ids = {
+        str(trade.get('transactionID') or '').strip() for trade in trades
+    } - {''}
+    same_day_rows = Counter(_transaction_tax_row_key(row) for row in ttax_rows)
 
-    def add_unmatched(row, amount_eur, reason):
+    def add_unmatched(row, amount_eur, reason, fills=1):
         audit['unmatched_count'] += 1
         details.append({
             'status': 'unmatched',
@@ -4202,200 +4634,83 @@ def _collect_transaction_tax_adjustments(
             'amount_eur': amount_eur,
             'applied_eur': 0.0,
             'deferred_eur': 0.0,
+            'fills': fills,
         })
 
     for row in ttax_rows:
         amount_eur = _stmtfund_value_eur(
             row, base_currency, usd_to_eur_rates)
-        reduction_eur = -amount_eur
         candidates = _transaction_tax_trade_candidates(row, trades)
-        if len(candidates) != 1:
-            add_unmatched(
-                row, amount_eur,
-                'kein_eindeutiger_trade' if not candidates
-                else 'mehrere_trades_am_selben_tag',
-            )
+        if not candidates:
+            add_unmatched(row, amount_eur, 'kein_eindeutiger_trade')
             continue
-        trade = candidates[0]
-        if eligible_trade is not None and not eligible_trade(trade):
-            add_unmatched(row, amount_eur, 'steuerroute_nicht_automatisierbar')
+        if len(candidates) == 1:
+            fills = [(candidates[0], 1.0)]
+        else:
+            fills, reason = _transaction_tax_daily_fills(
+                row, candidates, same_day_rows[_transaction_tax_row_key(row)])
+            if fills is None:
+                add_unmatched(row, amount_eur, reason, len(candidates))
+                continue
+
+        lot_consumed = {}
+        outcomes = []
+        failure = None
+        for trade, share in fills:
+            outcome = _transaction_tax_fill_outcome(
+                trade, share, amount_eur, trades, closed_lots, tax_year,
+                base_currency, usd_to_eur_rates, eligible_trade,
+                lot_consumed, trade_tx_ids)
+            if outcome['reason']:
+                failure = outcome['reason']
+                break
+            outcomes.append(outcome)
+        if failure:
+            add_unmatched(row, amount_eur, failure, len(fills))
             continue
 
-        embedded_eur = _trade_value_eur(
-            trade.get('taxes'), trade, base_currency, usd_to_eur_rates)
-        tolerance = max(0.0001, abs(amount_eur) * 0.001)
-        if abs(embedded_eur) > epsilon:
-            if abs(embedded_eur - amount_eur) <= tolerance:
-                resolved_oids.add(id(row))
-                audit['already_in_trade_count'] += 1
-                details.append({
-                    'status': 'already_in_trade',
-                    'symbol': row.get('symbol', ''),
-                    'date': row.get('date') or row.get('reportDate') or '',
-                    'amount_eur': amount_eur,
-                    'applied_eur': 0.0,
-                    'deferred_eur': 0.0,
+        for outcome in outcomes:
+            for close_trade, reduction, source in outcome['adjustments']:
+                adjustments[id(close_trade)].append({
+                    'fund_oid': id(row),
+                    'reduction_eur': reduction,
+                    'source': source,
                 })
-            else:
-                add_unmatched(row, amount_eur, 'trade_taxes_weicht_ab')
-            continue
-
-        trade_report_date = (
-            parse_date(trade.get('reportDate'))
-            or parse_date(trade.get('dateTime'))
-            or parse_date(trade.get('tradeDate'))
-        )
-        pnl_value = trade.get('fifoPnlRealized')
-        is_close = (
-            (trade.get('openCloseIndicator') or '').upper() == 'C'
-            or abs(safe_float(pnl_value, 0.0)) > epsilon
-        )
-        if is_close:
-            if trade_report_date and trade_report_date.year < tax_year:
-                resolved_oids.add(id(row))
-                audit['historical_count'] += 1
-                details.append({
-                    'status': 'historical_close',
-                    'symbol': row.get('symbol', ''),
-                    'date': row.get('date') or row.get('reportDate') or '',
-                    'amount_eur': amount_eur,
-                    'applied_eur': 0.0,
-                    'deferred_eur': 0.0,
-                })
-                continue
-            if not trade_report_date or trade_report_date.year != tax_year:
-                add_unmatched(row, amount_eur, 'schluss_ausserhalb_steuerjahr')
-                continue
-            if pnl_value in (None, ''):
-                add_unmatched(row, amount_eur, 'schluss_ohne_fifo_pnl')
-                continue
-            adjustments[id(trade)].append({
-                'fund_oid': id(row),
-                'reduction_eur': reduction_eur,
-                'source': 'closing_trade',
-            })
-            resolved_oids.add(id(row))
-            audit['applied_count'] += 1
-            audit['applied_eur'] += reduction_eur
-            details.append({
-                'status': 'applied_to_close',
-                'symbol': row.get('symbol', ''),
-                'date': row.get('date') or row.get('reportDate') or '',
-                'amount_eur': amount_eur,
-                'applied_eur': reduction_eur,
-                'deferred_eur': 0.0,
-            })
-            continue
-
-        if (trade.get('openCloseIndicator') or '').upper() != 'O':
-            add_unmatched(row, amount_eur, 'trade_nicht_oeffnung_oder_schluss')
-            continue
-
-        # Bei einem Optionsverkauf entsteht die Stillhalterpraemie bereits im
-        # Eroeffnungsjahr (§11 EStG). Dessen TTAX darf deshalb nicht wie die
-        # Anschaffungsnebenkosten einer Long-Position bis zum Close getragen
-        # werden. Ohne Eingriff in die separate Zufluss-FIFO bleibt der seltene
-        # Fall bewusst manuell statt die Steuer ins falsche Jahr zu verschieben.
-        if (
-            trade.get('assetCategory') in ('OPT', 'FOP', 'FSFOP')
-            and (trade.get('buySell') or '').upper() == 'SELL'
-        ):
-            add_unmatched(row, amount_eur, 'short_option_eroeffnung')
-            continue
-
-        open_quantity = abs(safe_float(trade.get('quantity'), 0.0))
-        if open_quantity <= epsilon:
-            add_unmatched(row, amount_eur, 'eroeffnungsmenge_fehlt')
-            continue
-        open_lots = sorted(
-            _transaction_tax_open_lots(trade, closed_lots),
-            key=lambda lot: (
-                lot.get('reportDate') or lot.get('dateTime') or ''
-            ),
-        )
-        remaining_quantity = open_quantity
-        applied_eur = 0.0
-        historical_eur = 0.0
-        ambiguous = False
-        for lot in open_lots:
-            lot_quantity = min(
-                remaining_quantity,
-                abs(safe_float(lot.get('quantity'), 0.0)),
-            )
-            if lot_quantity <= epsilon:
-                continue
-            remaining_quantity -= lot_quantity
-            lot_share = lot_quantity / open_quantity
-            lot_reduction = reduction_eur * lot_share
-            lot_report_date = (
-                parse_date(lot.get('reportDate'))
-                or parse_date(lot.get('dateTime'))
-            )
-            if not lot_report_date:
-                ambiguous = True
-                break
-            if lot_report_date.year < tax_year:
-                historical_eur += lot_reduction
-                continue
-            if lot_report_date.year > tax_year:
-                remaining_quantity += lot_quantity
-                continue
-            close_candidates = _transaction_tax_lot_close_candidates(
-                lot, trades)
-            if len(close_candidates) != 1:
-                ambiguous = True
-                break
-            close_trade = close_candidates[0]
-            if eligible_trade is not None and not eligible_trade(close_trade):
-                ambiguous = True
-                break
-            if close_trade.get('fifoPnlRealized') in (None, ''):
-                ambiguous = True
-                break
-            adjustments[id(close_trade)].append({
-                'fund_oid': id(row),
-                'reduction_eur': lot_reduction,
-                'source': 'opening_basis',
-            })
-            applied_eur += lot_reduction
-
-        if ambiguous:
-            # Teilanwendungen dieses Events zurueckrollen: Ein TTAX-Event wird
-            # nur ganz behandelt, wenn alle im Steuerjahr betroffenen Lots
-            # eindeutig sind.
-            for trade_oid in list(adjustments):
-                adjustments[trade_oid] = [
-                    item for item in adjustments[trade_oid]
-                    if item['fund_oid'] != id(row)
-                ]
-                if not adjustments[trade_oid]:
-                    del adjustments[trade_oid]
-            add_unmatched(row, amount_eur, 'closed_lot_nicht_eindeutig')
-            continue
-
-        deferred_eur = reduction_eur * remaining_quantity / open_quantity
         resolved_oids.add(id(row))
+        applied_eur = sum(o['applied'] for o in outcomes)
+        deferred_eur = sum(o['deferred'] for o in outcomes)
+        historical_eur = sum(o['historical'] for o in outcomes)
+        kinds = {o['kind'] for o in outcomes}
         if abs(applied_eur) > epsilon:
             audit['applied_count'] += 1
             audit['applied_eur'] += applied_eur
         if abs(deferred_eur) > epsilon:
             audit['deferred_count'] += 1
             audit['deferred_eur'] += deferred_eur
-        if abs(historical_eur) > epsilon:
+        if abs(historical_eur) > epsilon or 'historical_close' in kinds:
             audit['historical_count'] += 1
-        status = (
-            'partially_applied' if abs(applied_eur) > epsilon
-            and abs(deferred_eur) > epsilon
-            else 'applied_via_closed_lot' if abs(applied_eur) > epsilon
-            else 'deferred_open_position'
-        )
+        if 'embedded' in kinds:
+            audit['already_in_trade_count'] += 1
+        if len(fills) > 1:
+            audit['distributed_count'] += 1
         details.append({
-            'status': status,
+            'status': _transaction_tax_event_status(
+                outcomes, applied_eur, deferred_eur, historical_eur),
             'symbol': row.get('symbol', ''),
             'date': row.get('date') or row.get('reportDate') or '',
             'amount_eur': amount_eur,
             'applied_eur': applied_eur,
             'deferred_eur': deferred_eur,
+            'historical_eur': historical_eur,
+            'fills': len(fills),
+            'distribution': [
+                {
+                    'tradeID': trade.get('tradeID', ''),
+                    'quantity': abs(safe_float(trade.get('quantity'))),
+                    'share': share,
+                }
+                for trade, share in fills
+            ] if len(fills) > 1 else [],
         })
 
     return dict(adjustments), resolved_oids, audit
