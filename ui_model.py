@@ -822,6 +822,33 @@ def collect_notices(report, context=None):
             'prueffaelle', len(unrouted), unrouted,
         ))
 
+    # Flex Query ohne "Closed Lots": Schliessungen im Steuerjahr, aber keine
+    # einzige CLOSED_LOT-Zeile. Betrifft Tageskurs-Korrektur, TTAX-Kaufsteuer
+    # und die Haltefrist-Pruefung fuer Anlage SO (Issue #89, Folgefall).
+    lot_coverage = audit.get('closed_lot_coverage', {}) or {}
+    if 'closing_trades_without_lots' in lot_coverage:
+        # Kontoweise gezaehlt und im Multi-Account-Merge summiert.
+        closing_without_lots = int(
+            lot_coverage.get('closing_trades_without_lots') or 0)
+    else:
+        closing_without_lots = (
+            int(lot_coverage.get('closing_trades') or 0)
+            if not lot_coverage.get('lot_rows') else 0
+        )
+    if closing_without_lots:
+        notices.append(_notice(
+            'closed_lots_missing', 'prueffall', 'normal',
+            'Keine CLOSED_LOT-Daten im Export',
+            f"{closing_without_lots} schließende Trade(s) im Steuerjahr "
+            "stammen aus einem Export ohne CLOSED_LOT-Zeilen. Ohne sie entfallen "
+            "die Tageskurs-Korrektur, die Zuordnung von "
+            "Kauf-Transaktionssteuern (TTAX) und die Haltefrist-Prüfung für "
+            "Anlage SO. Lösung: in der Flex Query unter Trades bei Levels of "
+            "Detail zusätzlich Closed Lots aktivieren und neu exportieren.",
+            'prueffaelle', closing_without_lots,
+            [dict(lot_coverage)],
+        ))
+
     transaction_tax = audit.get('transaction_tax', {}) or {}
     unhandled = audit.get('unhandled_activity_codes', []) or []
     if unhandled:
@@ -856,6 +883,7 @@ def collect_notices(report, context=None):
     ttax_deferred = transaction_tax.get('deferred_count', 0)
     ttax_embedded = transaction_tax.get('already_in_trade_count', 0)
     ttax_distributed = transaction_tax.get('distributed_count', 0)
+    ttax_net = transaction_tax.get('net_aggregate_count', 0)
     if ttax_applied or ttax_deferred or ttax_embedded:
         parts = []
         if ttax_applied:
@@ -877,6 +905,12 @@ def collect_notices(report, context=None):
             parts.append(
                 f"{ttax_distributed} Tagesbuchung(en) wurden auf mehrere "
                 "Teilausführungen desselben Tages verteilt"
+            )
+        if ttax_net:
+            parts.append(
+                f"{ttax_net} Tagesbuchung(en) betreffen den Nettoerwerb "
+                "(Käufe abzüglich Verkäufe desselben Tages) und wurden den "
+                "Kauf-Fills zugeordnet"
             )
         notices.append(_notice(
             'transaction_tax_processed', 'transparenz', 'normal',

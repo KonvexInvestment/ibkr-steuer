@@ -4060,6 +4060,32 @@ def _stmtfund_value_eur(row, base_currency, usd_to_eur_rates):
     )
 
 
+def _count_closing_trades(trades, tax_year):
+    """Schliessende Trades des Steuerjahres, fuer die IBKR CLOSED_LOTs liefert.
+
+    Grundlage der Sichtbarkeit fehlender Lot-Daten (Issue #89, Folgefall:
+    Flex Query ohne "Closed Lots"). CASH ist ausgenommen, die FX-Engine
+    arbeitet ohne Lots.
+    """
+    count = 0
+    for trade in trades:
+        category = (trade.get('assetCategory') or '').strip()
+        if category in KNOWN_UNROUTED_ASSET_CATEGORIES:
+            continue
+        report_date = parse_date(
+            trade.get('reportDate') or trade.get('dateTime')
+            or trade.get('tradeDate'))
+        if not report_date or report_date.year != tax_year:
+            continue
+        is_close = (
+            'C' in (trade.get('openCloseIndicator') or '').upper()
+            or abs(safe_float(trade.get('fifoPnlRealized'))) > 1e-7
+        )
+        if is_close:
+            count += 1
+    return count
+
+
 def _transaction_tax_trade_candidates(row, trades):
     """Liefert konservative Trade-Kandidaten fuer eine TTAX-Tagesbuchung.
 
@@ -4159,6 +4185,10 @@ TRANSACTION_TAX_REASON_LABELS = {
     'closed_lot_abdeckung_unvollstaendig': (
         'Verkauf im Steuerjahr ohne vollständigen CLOSED_LOT-Beleg; die '
         'offene Restmenge ist nicht belegbar'),
+    'closed_lot_sektion_fehlt': (
+        'Verkauf im Steuerjahr, aber keine CLOSED_LOT-Zeilen im Export; in '
+        'der Flex Query unter Trades bei Levels of Detail zusätzlich '
+        'Closed Lots aktivieren'),
 }
 
 
@@ -4275,12 +4305,17 @@ def _transaction_tax_split_close_targets(candidates):
 
 
 def _transaction_tax_described_quantity(row):
-    """Stueckzahl am Ende des IBKR-Buchungstexts.
+    """Stueckzahl einer TTAX-Tagesbuchung.
 
-    "French Daily Trade Charge Tax HO 170" → 170.0. None, wenn der Text nicht
-    mit einer positiven Zahl endet ("Italian Derivative Transaction Tax
-    ENI DEC25 14 C -").
+    Primaer das Feld ``tradeQuantity`` der StmtFunds-Zeile (Realbelege:
+    "French Daily Trade Charge Tax HO 170" traegt tradeQuantity="170",
+    "… EL 25" traegt 25, die italienische Derivatesteuer 0). Fallback ist
+    die Zahl am Ende des Buchungstexts. None, wenn beides fehlt oder 0 ist
+    ("Italian Derivative Transaction Tax ENI DEC25 14 C -").
     """
+    field_value = abs(safe_float(row.get('tradeQuantity'), 0.0))
+    if field_value > 1e-9:
+        return field_value
     text = (row.get('activityDescription') or '').strip()
     if not text:
         return None
@@ -4290,6 +4325,14 @@ def _transaction_tax_described_quantity(row):
     except ValueError:
         return None
     return value if value > 0 else None
+
+
+def _transaction_tax_is_daily_charge(row):
+    """IBKRs tagesaggregierte Finanztransaktionssteuer ("… Daily Trade
+    Charge Tax …", belegt fuer FR und ES). Nur fuer diese Zeilen gilt die
+    Nettoregel Kaeufe abzueglich Verkaeufe desselben Tages."""
+    return 'daily trade charge' in (
+        row.get('activityDescription') or '').strip().lower()
 
 
 def _transaction_tax_row_key(row):
@@ -4306,34 +4349,51 @@ def _transaction_tax_row_key(row):
 def _transaction_tax_daily_fills(row, candidates, same_day_rows):
     """Verteilt eine Tages-TTAX auf die Teilausfuehrungen desselben Tages.
 
-    IBKR bucht Finanztransaktionssteuern (FR 0,3 %, ES 0,2 %) als EIN
-    Tagesaggregat pro Instrument, der Buchungstext endet mit der Stueckzahl
-    ("French Daily Trade Charge Tax HO 170" = Fills 73 + 97). Verteilt wird
-    nur auf eine homogene Gruppe (gleiche Richtung, gleiche Eroeffnungs-/
-    Schluss-Kennung), pro rata nach Transaktionswert:
+    IBKR bucht Finanztransaktionssteuern (FR 0,3 %, seit 01.04.2025 0,4 %;
+    ES 0,2 %) als EIN Tagesaggregat pro Instrument; die Stueckzahl steht im
+    Feld ``tradeQuantity`` und am Ende des Buchungstexts ("French Daily Trade
+    Charge Tax HO 170" = Fills 73 + 97). Verteilt wird pro rata nach
+    Transaktionswert:
 
-    * Stueckzahl belegt genau eine Gruppe und es gibt genau eine TTAX-Zeile
-      fuer Instrument und Tag → Tagesaggregat auf die Gruppe.
+    * "Daily Trade Charge"-Zeile, Stueckzahl = Kaeufe abzueglich Verkaeufe
+      desselben Tages (Nettoerwerb: Art. 235 ter ZD CGI, Ley 5/2020 Art. 5)
+      und genau eine TTAX-Zeile fuer Instrument und Tag → auf alle Kauf-Fills
+      des Tages ("Spanish Daily Trade Charge Tax BSD2 1" bei drei Kaeufen
+      und drei Verkaeufen). Ohne Verkaeufe ist das die Summe der Kaeufe.
+    * Stueckzahl belegt genau eine homogene Gruppe (gleiche Richtung, gleiche
+      Eroeffnungs-/Schluss-Kennung) und es gibt genau eine TTAX-Zeile fuer
+      Instrument und Tag → Tagesaggregat auf die Gruppe.
     * Stueckzahl belegt genau einen einzelnen Fill → Einzelsteuer dieses Fills.
     * Keine Stueckzahl, aber alle Fills homogen und genau eine TTAX-Zeile →
       Tagesaggregat.
     * Alles andere bleibt Prueffall (Grund im zweiten Rueckgabewert).
 
-    Returns ``([(trade, anteil), ...], None)`` oder ``(None, grund)``.
+    Die Verteilung auf die Kauf-Fills ist steuerneutral, solange alle Fills
+    im selben Jahr realisiert werden; sie kann nur den Zeitpunkt eines
+    offen bleibenden Anteils verschieben. Returns
+    ``([(trade, anteil), ...], None, modus)`` mit modus in
+    ('net', 'group', 'single') oder ``(None, grund, None)``.
     """
     def quantity(trade):
         return abs(safe_float(trade.get('quantity')))
+
+    def side(trade):
+        return (trade.get('buySell') or '').upper()
 
     described = _transaction_tax_described_quantity(row)
     groups = defaultdict(list)
     for trade in candidates:
         groups[(
-            (trade.get('buySell') or '').upper(),
+            side(trade),
             (trade.get('openCloseIndicator') or '').upper(),
         )].append(trade)
 
-    fills = None
+    fills, mode = None, None
     if described is not None:
+        buys = [t for t in candidates if side(t) == 'BUY']
+        sells = [t for t in candidates if side(t) == 'SELL']
+        net_bought = (sum(quantity(t) for t in buys)
+                      - sum(quantity(t) for t in sells))
         matching_groups = [
             group for group in groups.values()
             if abs(sum(quantity(t) for t in group) - described) <= 1e-7
@@ -4341,28 +4401,39 @@ def _transaction_tax_daily_fills(row, candidates, same_day_rows):
         single_fills = [
             t for t in candidates if abs(quantity(t) - described) <= 1e-7
         ]
-        if len(matching_groups) == 1 and same_day_rows == 1:
-            fills = matching_groups[0]
+        if _transaction_tax_is_daily_charge(row):
+            # Erwerbssteuer: Verkaufs-Fills tragen nie die Tages-FTT. Eine
+            # Stueckzahl, die nur zu Verkaeufen passt, ist ein Widerspruch.
+            matching_groups = [
+                group for group in matching_groups if side(group[0]) == 'BUY']
+            single_fills = [t for t in single_fills if side(t) == 'BUY']
+        if (buys and same_day_rows == 1
+                and _transaction_tax_is_daily_charge(row)
+                and abs(net_bought - described) <= 1e-7):
+            fills = buys
+            mode = 'net' if sells else 'group'
+        elif len(matching_groups) == 1 and same_day_rows == 1:
+            fills, mode = matching_groups[0], 'group'
         elif len(single_fills) == 1:
-            fills = single_fills
+            fills, mode = single_fills, 'single'
         elif matching_groups or single_fills:
-            return None, 'mehrere_trades_am_selben_tag'
+            return None, 'mehrere_trades_am_selben_tag', None
         else:
-            return None, 'tagesaggregat_menge_abweichend'
+            return None, 'tagesaggregat_menge_abweichend', None
     elif len(groups) == 1 and same_day_rows == 1:
-        fills = list(candidates)
+        fills, mode = list(candidates), 'group'
     else:
-        return None, 'mehrere_trades_am_selben_tag'
+        return None, 'mehrere_trades_am_selben_tag', None
 
     if len(fills) == 1:
-        return [(fills[0], 1.0)], None
+        return [(fills[0], 1.0)], None, mode
     weights = [abs(safe_float(t.get('proceeds'))) for t in fills]
     if any(weight <= 1e-9 for weight in weights):
         weights = [quantity(t) for t in fills]
     total = sum(weights)
     if total <= 1e-9:
-        return None, 'mehrere_trades_am_selben_tag'
-    return [(t, weight / total) for t, weight in zip(fills, weights)], None
+        return None, 'mehrere_trades_am_selben_tag', None
+    return [(t, weight / total) for t, weight in zip(fills, weights)], None, mode
 
 
 def _transaction_tax_has_uncovered_close(open_trade, trades, closed_lots,
@@ -4563,7 +4634,11 @@ def _transaction_tax_fill_outcome(trade, share, amount_eur, trades,
     if (remaining_quantity > epsilon
             and _transaction_tax_has_uncovered_close(
                 trade, trades, closed_lots, tax_year, trade_tx_ids)):
-        result['reason'] = 'closed_lot_abdeckung_unvollstaendig'
+        # Ohne jede Lot-Zeile ist die Ursache eine Flex-Query-Konfiguration
+        # (Trades ohne "Closed Lots"), nicht ein einzelnes fehlendes Lot.
+        result['reason'] = (
+            'closed_lot_sektion_fehlt' if not closed_lots
+            else 'closed_lot_abdeckung_unvollstaendig')
         return result
     result['deferred'] = reduction_eur * remaining_quantity / open_quantity
     return result
@@ -4615,6 +4690,7 @@ def _collect_transaction_tax_adjustments(
         'already_in_trade_count': 0,
         'historical_count': 0,
         'distributed_count': 0,
+        'net_aggregate_count': 0,
         'unmatched_count': 0,
         'details': details,
     }
@@ -4644,10 +4720,11 @@ def _collect_transaction_tax_adjustments(
         if not candidates:
             add_unmatched(row, amount_eur, 'kein_eindeutiger_trade')
             continue
+        fill_mode = 'single'
         if len(candidates) == 1:
             fills = [(candidates[0], 1.0)]
         else:
-            fills, reason = _transaction_tax_daily_fills(
+            fills, reason, fill_mode = _transaction_tax_daily_fills(
                 row, candidates, same_day_rows[_transaction_tax_row_key(row)])
             if fills is None:
                 add_unmatched(row, amount_eur, reason, len(candidates))
@@ -4693,6 +4770,8 @@ def _collect_transaction_tax_adjustments(
             audit['already_in_trade_count'] += 1
         if len(fills) > 1:
             audit['distributed_count'] += 1
+        if fill_mode == 'net':
+            audit['net_aggregate_count'] += 1
         details.append({
             'status': _transaction_tax_event_status(
                 outcomes, applied_eur, deferred_eur, historical_eur),
@@ -4703,6 +4782,9 @@ def _collect_transaction_tax_adjustments(
             'deferred_eur': deferred_eur,
             'historical_eur': historical_eur,
             'fills': len(fills),
+            # Nettoerwerb des Tages (Kaeufe abzueglich Verkaeufe): Steuer
+            # den Kauf-Fills zugeordnet, Verkaufs-Fills bleiben unberuehrt.
+            'net_aggregate': fill_mode == 'net',
             'distribution': [
                 {
                     'tradeID': trade.get('tradeID', ''),
@@ -4850,6 +4932,22 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     _alias_cl_path = os.path.join(ib_tax_dir, 'closed_lots.csv')
     if os.path.exists(_alias_cl_path):
         _alias_closed_lots = load_csv(_alias_cl_path)
+    # Sichtbarkeit fehlender CLOSED_LOT-Daten: Ohne Lots entfallen
+    # Tageskurs-Korrektur, Kaufsteuer-Zuordnung (TTAX) und die
+    # Haltefrist-Pruefung fuer Anlage SO. Notice in ui_model
+    # ('closed_lots_missing'), wenn es Schliessungen ohne jede Lot-Zeile gibt.
+    closed_lot_coverage = {
+        'lot_rows': len(_alias_closed_lots),
+        'closing_trades': _count_closing_trades(trades, tax_year),
+    }
+    # Kontoweise Kennzahl, die den Multi-Account-Merge (Summen) ueberlebt:
+    # ein Konto mit Lots darf die fehlende Sektion eines anderen nicht verdecken.
+    closed_lot_coverage['closing_trades_without_lots'] = (
+        closed_lot_coverage['closing_trades'] if not _alias_closed_lots else 0)
+    if closed_lot_coverage['closing_trades'] and not _alias_closed_lots:
+        print(f"  WARNUNG: {closed_lot_coverage['closing_trades']} schliessende "
+              f"Trades im Steuerjahr, aber keine CLOSED_LOT-Zeilen im Export "
+              f"(Flex Query: Trades → Levels of Detail → Closed Lots).")
     underlying_alias_map = _build_underlying_alias_map(trades, _alias_closed_lots, fi_rows)
     underlying_symbol_aliases = {}
     for _member, _canon in underlying_alias_map.items():
@@ -8372,6 +8470,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             # Cash-Buchungen ohne sichere automatische Zuordnung (Prueffall).
             "fee_by_activity_code": dict(sorted(fee_by_activity_code.items())),
             "transaction_tax": transaction_tax_audit,
+            # CLOSED_LOT-Abdeckung: lot_rows=0 bei closing_trades>0 heisst
+            # Flex Query ohne "Closed Lots" (Notice closed_lots_missing).
+            "closed_lot_coverage": closed_lot_coverage,
             "unhandled_activity_codes": sorted(
                 unhandled_activity_codes.values(), key=lambda e: e['code']
             ),

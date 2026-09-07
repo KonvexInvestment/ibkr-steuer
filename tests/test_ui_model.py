@@ -518,8 +518,11 @@ def full_trigger_report():
             'transaction_tax': {
                 'applied_count': 2, 'applied_eur': 0.05,
                 'deferred_count': 1, 'deferred_eur': 0.02,
-                'already_in_trade_count': 1, 'details': [],
+                'already_in_trade_count': 1, 'net_aggregate_count': 1,
+                'details': [],
             },
+            'closed_lot_coverage': {'lot_rows': 0, 'closing_trades': 3,
+                                    'closing_trades_without_lots': 3},
             'fx_rate_parse_failures': {'funds': 1, 'trades': 0},
             'occ_rename_matches': [{'sell_symbol': 'MMM', 'sell_date': 'x',
                                     'close_symbol': 'MMM1', 'close_date': 'y',
@@ -569,7 +572,7 @@ NOTICE_REGISTRY = {
     'csv_disabled_multi_account', 'plausibility_mismatch',
     'occ_rename_matches', 'underlying_symbol_aliases',
     'stillhalter_corrections_dropped', 'stillhalter_open_short',
-    'future_assignment_corrections',
+    'future_assignment_corrections', 'closed_lots_missing',
 }
 
 
@@ -711,6 +714,29 @@ def test_toggle_inventory_has_all_six_options():
     assert scopes['fx_margin'] == 'compute'
     assert scopes['dba_beta'] == 'compute'
     assert scopes['variante_b'] == 'view'
+
+
+def test_closed_lots_missing_notice_survives_multi_account_merge():
+    """Nach dem Merge sind lot_rows/closing_trades Summen: ein Konto mit
+    Lots darf die fehlende Lot-Sektion eines anderen nicht verdecken. Die
+    kontoweise Kennzahl closing_trades_without_lots entscheidet."""
+    merged = make_report(audit={'closed_lot_coverage': {
+        'lot_rows': 500, 'closing_trades': 60,
+        'closing_trades_without_lots': 12}})
+    notices = {n['id']: n for n in ui_model.collect_notices(merged)}
+    assert 'closed_lots_missing' in notices
+    assert notices['closed_lots_missing']['count'] == 12
+    assert 'Closed Lots' in notices['closed_lots_missing']['body']
+    clean = make_report(audit={'closed_lot_coverage': {
+        'lot_rows': 500, 'closing_trades': 60,
+        'closing_trades_without_lots': 0}})
+    assert 'closed_lots_missing' not in {
+        n['id'] for n in ui_model.collect_notices(clean)}
+    # Aeltere Snapshots ohne die Kennzahl: Fallback auf lot_rows == 0.
+    legacy = make_report(audit={'closed_lot_coverage': {
+        'lot_rows': 0, 'closing_trades': 4}})
+    assert 'closed_lots_missing' in {
+        n['id'] for n in ui_model.collect_notices(legacy)}
 
 
 if __name__ == '__main__':

@@ -502,7 +502,15 @@ def test_missing_or_mismatched_lots_stay_review_items():
     funds = [_ttax('OPEN', 'S1', 'EL', '2025-04-10', -10, category='STK')]
     lot = _closed_lot('S1', 'EL', '2025-04-10', '2025-08-20', 10, 100,
                       category='STK')
-    for lots in ([], [dict(lot, openDateTime='2025-04-10;10:00:01')]):
+    # Ohne jede Lot-Zeile (Flex Query ohne "Closed Lots") nennt der Grund
+    # die Konfiguration und die Notice die Loesung; ein vorhandenes, aber
+    # falsch datiertes Lot bleibt der allgemeine Abdeckungs-Prueffall.
+    cases = (
+        ([], 'closed_lot_sektion_fehlt', True),
+        ([dict(lot, openDateTime='2025-04-10;10:00:01')],
+         'closed_lot_abdeckung_unvollstaendig', False),
+    )
+    for lots, expected_reason, expect_missing_notice in cases:
         report = _run(trades, funds, lots)
         final = build_final_values(report, {})
         _assert_close(final['zeile_19'], 100, 'kein geschaetzter Abzug Z19')
@@ -510,15 +518,137 @@ def test_missing_or_mismatched_lots_stay_review_items():
         audit = report['audit']['transaction_tax']
         assert audit['unmatched_count'] == 1
         assert audit['deferred_count'] == audit['applied_count'] == 0
-        assert (audit['details'][0]['reason']
-                == 'closed_lot_abdeckung_unvollstaendig')
+        assert audit['details'][0]['reason'] == expected_reason
         review = report['audit']['unhandled_activity_codes']
         assert len(review) == 1 and review[0]['code'] == 'TTAX'
         _assert_close(review[0]['amount_eur'], -10, 'sichtbarer Pruefbetrag')
         notices = {n['id']: n for n in collect_notices(report)}
         assert 'unhandled_activity_codes' in notices
         assert 'transaction_tax_processed' not in notices
-    print('  OK  Fehlende/falsch datierte Lots bleiben als Prueffall sichtbar')
+        assert ('closed_lots_missing' in notices) == expect_missing_notice
+        coverage = report['audit']['closed_lot_coverage']
+        assert coverage['closing_trades'] == 1
+        assert coverage['lot_rows'] == len(lots)
+        assert coverage['closing_trades_without_lots'] == (0 if lots else 1)
+        if expect_missing_notice:
+            body = notices['closed_lots_missing']['body']
+            assert 'Closed Lots' in body and 'Levels of Detail' in body
+            assert 'Closed Lots' in notices['unhandled_activity_codes']['body']
+    print('  OK  Fehlende Lot-Sektion und falsch datierte Lots bleiben '
+          'als Prueffall sichtbar')
+
+
+def test_trade_quantity_field_is_primary_quantity_source():
+    """Realbeleg: die TTAX-Zeile traegt tradeQuantity="170"/"25"/"1"; der
+    Text ist nur Fallback (italienische Zeilen: tradeQuantity="0")."""
+    # Text ohne Stueckzahl, Feld belegt die Summe der Fills → Tagesaggregat.
+    trades, funds, lots = _french_ftt_fixture()
+    funds[0]['activityDescription'] = 'French Daily Trade Charge Tax HO'
+    funds[0]['tradeQuantity'] = '170'
+    report = _run(trades, funds, lots)
+    audit = report['audit']['transaction_tax']
+    assert audit['unmatched_count'] == 0 and audit['distributed_count'] == 1
+    _assert_close(audit['applied_eur'], 78.96, 'Feld tradeQuantity genuegt')
+
+    # Feld 0 (wie bei der italienischen Derivatesteuer): Text-Fallback.
+    trades, funds, lots = _french_ftt_fixture()
+    funds[0]['tradeQuantity'] = '0'
+    report = _run(trades, funds, lots)
+    _assert_close(report['audit']['transaction_tax']['applied_eur'], 78.96,
+                  'Text-Fallback bei tradeQuantity=0')
+
+    # Feld und Text widersprechen sich: das Feld gewinnt, 160 passt zu
+    # keinem Fill und keiner Summe → Prueffall statt Textglaeubigkeit.
+    trades, funds, lots = _french_ftt_fixture()
+    funds[0]['tradeQuantity'] = '160'
+    report = _run(trades, funds, lots)
+    audit = report['audit']['transaction_tax']
+    assert audit['unmatched_count'] == 1
+    assert audit['details'][0]['reason'] == 'tagesaggregat_menge_abweichend'
+    print('  OK  tradeQuantity ist Primaerquelle der Stueckzahl, Text Fallback')
+
+
+def _stk_fill(tid, conid, symbol, date, time, side, open_close, pnl,
+              quantity, price):
+    trade = _trade(tid, conid, symbol, date, side, open_close, pnl, quantity,
+                   category='STK')
+    trade['dateTime'] = f'{date};{time}'
+    trade['tradePrice'] = str(price)
+    trade['proceeds'] = str(-price * quantity)
+    return trade
+
+
+def _stk_lot(conid, symbol, open_date, open_time, close_date, close_time,
+             quantity, pnl, opening):
+    lot = _closed_lot(conid, symbol, open_date, close_date, quantity, pnl,
+                      category='STK')
+    lot['openDateTime'] = f'{open_date};{open_time}'
+    lot['dateTime'] = f'{close_date};{close_time}'
+    lot['transactionID'] = opening['transactionID']
+    return lot
+
+
+def _spanish_net_fixture(described_quantity='1'):
+    """Realmuster Issue #89 (Santander, BSD2): drei Kaeufe (1 + 2 + 1) und
+    drei Verkaeufe (je 1) am 30.10., eine Aktie bleibt und wird am 01.12.
+    verkauft. Die spanische FTT wird auf den Nettoerwerb erhoben (Ley 5/2020
+    Art. 5): "Spanish Daily Trade Charge Tax BSD2 1", 0,02 EUR."""
+    conid, symbol, day = '30314144', 'BSD2', '2025-10-30'
+    k1 = _stk_fill('K1', conid, symbol, day, '10:01:00', 'BUY', 'O', 0, 1, 8.73)
+    v1 = _stk_fill('V1', conid, symbol, day, '10:02:00', 'SELL', 'C', -0.01, -1, 8.72)
+    k2 = _stk_fill('K2', conid, symbol, day, '10:03:00', 'BUY', 'O', 0, 2, 8.73)
+    v2 = _stk_fill('V2', conid, symbol, day, '10:04:00', 'SELL', 'C', -0.01, -1, 8.72)
+    k3 = _stk_fill('K3', conid, symbol, day, '10:05:00', 'BUY', 'O', 0, 1, 8.73)
+    v3 = _stk_fill('V3', conid, symbol, day, '10:06:00', 'SELL', 'C', -0.01, -1, 8.72)
+    v4 = _stk_fill('V4', conid, symbol, '2025-12-01', '10:00:00', 'SELL', 'C',
+                   0.5, -1, 9.23)
+    ttax = _ttax('DAILY', conid, symbol, day, -0.02, category='STK')
+    ttax['activityDescription'] = (
+        f'Spanish Daily Trade Charge Tax BSD2 {described_quantity}')
+    ttax['tradeQuantity'] = described_quantity
+    lots = [
+        _stk_lot(conid, symbol, day, '10:01:00', day, '10:02:00', 1, -0.01, k1),
+        _stk_lot(conid, symbol, day, '10:03:00', day, '10:04:00', 1, -0.01, k2),
+        _stk_lot(conid, symbol, day, '10:03:00', day, '10:06:00', 1, -0.01, k2),
+        _stk_lot(conid, symbol, day, '10:05:00', '2025-12-01', '10:00:00', 1,
+                 0.5, k3),
+    ]
+    return [k1, v1, k2, v2, k3, v3, v4], [ttax], lots
+
+
+def test_net_daily_aggregate_after_intraday_sales():
+    """Issue #89 Folgefall: Stueckzahl = Kaeufe abzueglich Verkaeufe des
+    Tages. Die Steuer wird den Kauf-Fills zugeordnet und ueber deren Lots
+    realisiert; Verkaufs-Fills tragen sie nie."""
+    trades, funds, lots = _spanish_net_fixture()
+    report = _run(trades, funds, lots)
+    assert not report['audit']['unhandled_activity_codes']
+    audit = report['audit']['transaction_tax']
+    assert audit['unmatched_count'] == 0
+    assert audit['applied_count'] == 1 and audit['net_aggregate_count'] == 1
+    assert audit['distributed_count'] == 1 and audit['deferred_count'] == 0
+    _assert_close(audit['applied_eur'], 0.02, 'gesamte Nettosteuer realisiert')
+    detail = audit['details'][0]
+    assert detail['net_aggregate'] is True and detail['fills'] == 3
+    shares = {d['tradeID']: d['share'] for d in detail['distribution']}
+    assert set(shares) == {'K1', 'K2', 'K3'}, 'nur Kauf-Fills'
+    _assert_close(shares['K2'], 0.5, 'Anteil nach Kaufwert')
+    _assert_close(report['stocks_gain_eur'], 0.5 - 0.005, 'Dezember-Verkauf')
+    _assert_close(report['stocks_loss_eur'], -0.03 - 0.015, 'Tagesverkaeufe')
+    notices = {n['id']: n for n in collect_notices(report)}
+    assert 'Nettoerwerb' in notices['transaction_tax_processed']['body']
+
+    # Stueckzahl passt weder zum Nettoerwerb (1) noch zu Kauf-Fills oder
+    # ihrer Summe (4); dass sie die Verkaufsgruppe (3) trifft, zaehlt bei
+    # einer Erwerbssteuer nicht → Prueffall.
+    trades, funds, lots = _spanish_net_fixture(described_quantity='3')
+    report = _run(trades, funds, lots)
+    audit = report['audit']['transaction_tax']
+    assert audit['unmatched_count'] == 1
+    assert audit['details'][0]['reason'] == 'tagesaggregat_menge_abweichend'
+    _assert_close(report['stocks_gain_eur'], 0.5, 'kein Abzug auf Verkaeufe')
+    print('  OK  Netto-Tagesaggregat (Kaeufe abzueglich Verkaeufe) wird den '
+          'Kauf-Fills zugeordnet')
 
 
 def test_incomplete_lots_roll_back_only_the_affected_tax():
@@ -607,4 +737,6 @@ if __name__ == "__main__":
     test_daily_aggregate_partially_open_defers_remainder()
     test_same_second_closes_share_lot_reduction()
     test_described_quantity_identifies_single_fill_among_same_day_trades()
+    test_trade_quantity_field_is_primary_quantity_source()
+    test_net_daily_aggregate_after_intraday_sales()
     print("Alle TTAX-Tests bestanden.")

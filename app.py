@@ -1227,13 +1227,22 @@ def merge_report_data(reports):
                 'found_count', 'applied_count', 'applied_eur',
                 'deferred_count', 'deferred_eur',
                 'already_in_trade_count', 'historical_count',
-                'distributed_count', 'unmatched_count',
+                'distributed_count', 'net_aggregate_count', 'unmatched_count',
             )
         },
         'unhandled_activity_codes': [],
         'fx_rate_parse_failures': {
             'funds': sum(r.get('audit', {}).get('fx_rate_parse_failures', {}).get('funds', 0) for r in reports),
             'trades': sum(r.get('audit', {}).get('fx_rate_parse_failures', {}).get('trades', 0) for r in reports),
+        },
+        # CLOSED_LOT-Abdeckung je Konto summiert; die Notice greift, sobald
+        # ein Konto Schliessungen ohne jede Lot-Zeile hat (lot_rows kontoweise
+        # 0). Nach dem Merge ist das nur noch als Summe sichtbar; deshalb
+        # zaehlt closing_trades_without_lots die betroffenen Schliessungen.
+        'closed_lot_coverage': {
+            'lot_rows': sum(r.get('audit', {}).get('closed_lot_coverage', {}).get('lot_rows', 0) for r in reports),
+            'closing_trades': sum(r.get('audit', {}).get('closed_lot_coverage', {}).get('closing_trades', 0) for r in reports),
+            'closing_trades_without_lots': sum(r.get('audit', {}).get('closed_lot_coverage', {}).get('closing_trades_without_lots', 0) for r in reports),
         },
     }
     _fees_by_code = {}
@@ -3714,13 +3723,16 @@ def _render_transparency_details():
                 "Transaktionssteuern sind nach §20 Abs. 4 EStG "
                 "ergebniswirksam. IBKR bucht Finanztransaktionssteuern "
                 "(z. B. French oder Spanish Daily Trade Charge Tax) als "
-                "Tagesaggregat pro Wertpapier; die Stückzahl am Ende des "
-                "Buchungstexts entspricht der Summe der Teilausführungen des "
-                "Tages. Der Betrag wird nach Transaktionswert auf diese Fills "
-                "verteilt: Verkaufssteuer mindert den Schluss-Trade sofort, "
-                "Kaufsteuer wird über die CLOSED_LOTs bis zum Verkauf "
-                "getragen. Nicht belegbare Buchungen bleiben Prüffall und "
-                "sind in keiner Zeile enthalten."
+                "Tagesaggregat pro Wertpapier; die Stückzahl der Buchung "
+                "entspricht der Summe der Kauf-Fills des Tages, bei Käufen "
+                "und Verkäufen am selben Tag dem Nettoerwerb (Käufe abzüglich "
+                "Verkäufe). Der Betrag wird nach Transaktionswert auf die "
+                "Kauf-Fills verteilt: Verkaufssteuer mindert den Schluss-Trade "
+                "sofort, Kaufsteuer wird über die CLOSED_LOTs bis zum Verkauf "
+                "getragen. Ohne CLOSED_LOT-Zeilen im Export (Flex Query: "
+                "Trades, Levels of Detail, Closed Lots) ist die Kaufsteuer "
+                "nicht zuordenbar. Nicht belegbare Buchungen bleiben Prüffall "
+                "und sind in keiner Zeile enthalten."
             )
             ttax_table = (
                 "| Datum | Symbol | Betrag (EUR) | Status | berücksichtigt | "
@@ -3735,7 +3747,8 @@ def _render_transparency_details():
                     f"{esc(calculate_tax_report.get_transaction_tax_status_label(item.get('status')))} | "
                     f"{fmt_de(float(item.get('applied_eur') or 0))} | "
                     f"{fmt_de(float(item.get('deferred_eur') or 0))} | "
-                    f"{int(item.get('fills') or 1)} | "
+                    f"{int(item.get('fills') or 1)}"
+                    f"{' (Nettoerwerb)' if item.get('net_aggregate') else ''} | "
                     f"{esc(calculate_tax_report.get_transaction_tax_reason_label(item.get('reason')))} |\n")
             st.markdown(ttax_table)
 
@@ -4392,7 +4405,7 @@ Aus `statement_of_funds.csv` werden Cash-Positionen nach `activityCode` zugeordn
 | `CFD` | CFD-Zinsen und -Gebühren | Habenzinsen in Topf 2, Finanzierungskosten wie `DINT` nur nachrichtlich |
 | `FRTAX` / `WHT` | Quellensteuer (Withholding Tax) | Zeile 41 (anrechenbar). Ausnahmen: deutsche Kapitalertragsteuer auf DE-Wertpapieren geht nach Zeile 37/38; liegt sie auf einem DE-Fonds, wird sie als Prüffall gemeldet, da §32d Abs. 5 EStG nur ausländische Steuern erfasst und die Formularzuordnung nicht automatisierbar ist |
 | `OFEE` / `STAX` | Gebühren, Umsatzsteuer | Nicht abziehbar (§20 Abs. 9), nur nachrichtlich |
-| `TTAX` | Transaktionssteuer | Nach §20 Abs. 4 EStG ergebniswirksam. IBKR bucht Finanztransaktionssteuern (z. B. French oder Spanish Daily Trade Charge Tax) als Tagesaggregat pro Wertpapier, die Stückzahl im Buchungstext ist die Summe der Teilausführungen des Tages; der Betrag wird nach Transaktionswert auf diese Fills verteilt. Verkaufssteuer mindert den Schluss-Trade sofort, Kaufsteuer wird über das geschlossene Lot anteilig bis zum Verkauf getragen; mehrere Schluss-Fills zur selben Sekunde teilen sich ein Lot mengenproportional. Bereits in `Trade.taxes` enthaltene Beträge werden nicht doppelt abgezogen. Prüffall bleiben Buchungen ohne konsistente Zuordnung (Stückzahl passt nicht, gemischte Richtungen, Verkauf ohne CLOSED_LOT-Beleg), Steuern auf Stillhalter-Eröffnungen (Zufluss im Eröffnungsjahr, §11 EStG) sowie Instrumente mit eigenem Rechenweg (Anlage SO, Personengesellschaften). Jede Buchung steht mit Status und Grund im Bereich Rechenwege |
+| `TTAX` | Transaktionssteuer | Nach §20 Abs. 4 EStG ergebniswirksam. IBKR bucht Finanztransaktionssteuern (French Daily Trade Charge Tax 0,3 %, seit 1. April 2025 0,4 %; Spanish Daily Trade Charge Tax 0,2 %) als Tagesaggregat pro Wertpapier. Die Stückzahl der Buchung (Feld `tradeQuantity`, ersatzweise Ende des Buchungstexts) ist die Summe der Kauf-Fills des Tages, bei Käufen und Verkäufen am selben Tag der Nettoerwerb (Käufe abzüglich Verkäufe); der Betrag wird nach Transaktionswert auf die Kauf-Fills verteilt. Verkaufssteuer mindert den Schluss-Trade sofort, Kaufsteuer wird über das geschlossene Lot anteilig bis zum Verkauf getragen; mehrere Schluss-Fills zur selben Sekunde teilen sich ein Lot mengenproportional. Bereits in `Trade.taxes` enthaltene Beträge werden nicht doppelt abgezogen. Prüffall bleiben Buchungen ohne konsistente Zuordnung (Stückzahl passt nicht, gemischte Richtungen, Verkauf ohne CLOSED_LOT-Beleg, Export ohne CLOSED_LOT-Zeilen), Steuern auf Stillhalter-Eröffnungen (Zufluss im Eröffnungsjahr, §11 EStG) sowie Instrumente mit eigenem Rechenweg (Anlage SO, Personengesellschaften). Jede Buchung steht mit Status und Grund im Bereich Rechenwege |
 | `BUY` / `SELL` / `ADJ` / `ASSIGN` / `EXE` | Trade- und Settlement-Buchungen | Übersprungen; das realisierte Ergebnis kommt aus den Trade-Daten |
 | `DEP` / `WITH` | Ein- und Auszahlungen | Übersprungen; kein eigener Kapitalertrag |
 | `FOREX` | Devisenumsatz | Übersprungen; das Ergebnis kommt aus der separaten FX-Rechnung |
@@ -4970,6 +4983,8 @@ def _build_text_report():
                 f"{calculate_tax_report.get_transaction_tax_status_label(item.get('status'))}")
             if int(item.get('fills') or 1) > 1:
                 line += f" (auf {int(item.get('fills'))} Teilausführungen verteilt)"
+            if item.get('net_aggregate'):
+                line += " (Nettoerwerb des Tages: Käufe abzüglich Verkäufe)"
             if item.get('reason'):
                 line += (": " + calculate_tax_report.get_transaction_tax_reason_label(
                     item.get('reason')))
