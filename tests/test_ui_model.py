@@ -527,6 +527,10 @@ def full_trigger_report():
             'underlying_symbol_aliases': {'CON': ['CONd']},
             'stillhalter_corrections_dropped': [{'symbol': 'DDD'}],
             'stillhalter_open_short': [{'symbol': 'EEE'}],
+            'future_assignment_corrections': [
+                {'assignment_symbol': 'FFF P100', 'future_symbol': 'FFF',
+                 'mode': 'deferred_close', 'quantity': 1.0,
+                 'amount_eur': 12.5, 'assignment_commission_raw': -2.47}],
         },
     )
 
@@ -565,6 +569,7 @@ NOTICE_REGISTRY = {
     'csv_disabled_multi_account', 'plausibility_mismatch',
     'occ_rename_matches', 'underlying_symbol_aliases',
     'stillhalter_corrections_dropped', 'stillhalter_open_short',
+    'future_assignment_corrections',
 }
 
 

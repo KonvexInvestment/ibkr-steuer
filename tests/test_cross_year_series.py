@@ -3111,6 +3111,65 @@ def test_cross_year_future_assignment_missing_delivery_warns_from_lot():
     print("  TC56 Fehlende FUT-Delivery wird aus aktuellem Lot erkannt: OK")
 
 
+def test_future_assignment_fee_stays_in_future_basis():
+    """TC57: Realmuster audit1 (6EZ4): IBKR-Basis = Strike - Netto-Praemie +
+    Andienungsgebuehr. Nur die Netto-Praemie verlaesst den FUT-PnL; die
+    Gebuehr bleibt Anschaffungsnebenkosten des Termingeschaefts."""
+    sell = _future_option_sell(
+        "2025-06-01", "FEE P100", "FEE", 8001, "P", 2, 100)
+    sell["ibCommission"] = "-2.47"
+    sell["cost"] = str(-(200 - 2.47))
+    # IBKR: Andienungszeile traegt cost = Netto-Praemie plus eigene Gebuehr.
+    assignment = _future_option_assignment(
+        "2025-06-20", "FEE P100", "FEE", 8001, "P", 197.53, 100)
+    assignment["ibCommission"] = "-2.47"
+    delivery = _future_trade(
+        "2025-06-20 16:20:00", "fee_delivery", "FEE", 8001,
+        "BUY", 1, 100, 10000, -10000, 0, "BookTrade", "O")
+    ibkr_basis = 10000 - 197.53 + 2.47
+    close = _future_trade(
+        "2025-08-01 10:00:00", "fee_close", "FEE", 8001,
+        "SELL", -1, 100, -ibkr_basis, 9850, 9850 - ibkr_basis,
+        "ExchTrade", "C")
+    lot = _future_closed_lot(
+        "2025-06-20 16:20:00", "2025-08-01 10:00:00",
+        "FEE", 8001, "SELL", 1, 100, ibkr_basis, 9850 - ibkr_basis,
+        opening_transaction_id="fee_delivery")
+
+    rd = calculate_for_trades(
+        [sell, assignment, delivery, close],
+        tax_year=2025,
+        closed_lots=[lot],
+    )
+    row = next(
+        item for item in rd["trade_details"]
+        if item.get("symbol") == "FEE" and item.get("source") == "trades"
+    )
+    assert_close(row["cost"], -(10000 + 2.47),
+                 label="TC57 Basis = Strike + Andienungsgebuehr")
+    assert_close(row["fifoPnlRealized"], 9850 - 10000 - 2.47,
+                 label="TC57 FUT-PnL traegt die Gebuehr")
+    assert_close(rd["options_gain_eur"], 197.53,
+                 label="TC57 Netto-Praemie in Topf 2")
+    assert_close(rd["options_loss_eur"], 9850 - 10000 - 2.47,
+                 label="TC57 FUT-Verlust")
+    # Topf 2 = tatsaechlicher Cash-Effekt: +200 -2.47 -2.47 -10000 +9850
+    assert_close(rd["options_gain_eur"] + rd["options_loss_eur"],
+                 200 - 2.47 - 2.47 - 10000 + 9850,
+                 label="TC57 Topf 2 entspricht dem Cash-Effekt")
+    corrections = rd["audit"]["future_assignment_corrections"]
+    assert len(corrections) == 1
+    assert_close(corrections[0]["amount_raw"], 197.53,
+                 label="TC57 Korrektur = Netto-Praemie")
+    assert_close(corrections[0]["cost_adjustment_raw"], 197.53,
+                 label="TC57 Basis-Korrektur = Netto-Praemie")
+    assert_close(corrections[0]["assignment_commission_raw"], -2.47,
+                 label="TC57 Gebuehrenanteil dokumentiert")
+    assert not rd["audit"]["stillhalter_corrections_dropped"]
+
+    print("  TC57 Andienungsgebuehr bleibt Anschaffungsnebenkosten des Futures: OK")
+
+
 if __name__ == "__main__":
     test_cross_year_put_series()
     test_cross_year_call_series()
@@ -3168,4 +3227,5 @@ if __name__ == "__main__":
     test_deferred_fsfop_call_corrects_future_cover()
     test_partial_future_assignment_warns_only_for_realized_remainder()
     test_cross_year_future_assignment_missing_delivery_warns_from_lot()
-    print("\nOK: alle 56 TCs gruen")
+    test_future_assignment_fee_stays_in_future_basis()
+    print("\nOK: alle 57 TCs gruen")

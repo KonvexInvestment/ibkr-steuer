@@ -57,6 +57,7 @@ SYNTHETIC_TESTS = [
     ("Instrumentenkategorie-Routing", "tests/test_asset_category_routing.py"),
     ("Transaktionssteuern-TTAX", "tests/test_transaction_tax.py"),
     ("Merge-Completeness", "tests/test_merge_completeness.py"),
+    ("Plausibilitaetscheck", "tests/test_plausibility.py"),
     ("UI-Eintragungsuebersicht", "tests/test_ui_result_summary.py"),
     ("UI-Model-Schicht", "tests/test_ui_model.py"),
     ("App-Verhalten (AppTest)", "tests/test_app_ui.py"),

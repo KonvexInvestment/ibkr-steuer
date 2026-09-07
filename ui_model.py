@@ -1122,6 +1122,22 @@ def collect_notices(report, context=None):
             'rechenwege', len(open_short), open_short,
         ))
 
+    future_corrections = audit.get('future_assignment_corrections', []) or []
+    if future_corrections:
+        total_eur = sum(
+            float(c.get('amount_eur') or 0) for c in future_corrections)
+        notices.append(_notice(
+            'future_assignment_corrections', 'transparenz', 'normal',
+            'Future-Optionen: Prämie aus Future-Ergebnis herausgerechnet',
+            f"{len(future_corrections)} Andienung(en) von Future-Optionen: IBKR "
+            "hatte die Stillhalterprämie in die Kostenbasis des gelieferten "
+            "Futures eingebettet. Das realisierte Future-Ergebnis wurde um "
+            f"{total_eur:,.2f} EUR bereinigt, damit die Prämie nur einmal in "
+            "Topf 2 steht. Andienungsgebühren bleiben Anschaffungsnebenkosten "
+            "des Futures. Details im Bereich Rechenwege.",
+            'rechenwege', len(future_corrections), future_corrections,
+        ))
+
     return notices
 
 

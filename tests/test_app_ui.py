@@ -496,6 +496,69 @@ def test_partnership_trade_is_visible_in_export_summary():
     assert "Details Personengesellschaft: 45,00 EUR" in rendered
 
 
+FUTURE_OPTION_BODY = """
+      <Trades>
+        <Trade accountId="U123" assetCategory="FOP" symbol="FUTP P100" description="FUTP JUN25 100 P" conid="5001" underlyingConid="7001" underlyingSymbol="FUTP" tradeID="s1" transactionID="s1" reportDate="2025-06-01" dateTime="2025-06-01 10:00:00" buySell="SELL" openClose="O" openCloseIndicator="O" quantity="-1" tradePrice="2" closePrice="2" proceeds="200" cost="-197.53" fifoPnlRealized="0" fxRateToBase="1" ibCommission="-2.47" currency="EUR" strike="100" expiry="2025-06-20" putCall="P" multiplier="100" levelOfDetail="EXECUTION" transactionType="ExchTrade" />
+        <Trade accountId="U123" assetCategory="FOP" symbol="FUTP P100" description="FUTP JUN25 100 P" conid="5001" underlyingConid="7001" underlyingSymbol="FUTP" tradeID="a1" transactionID="a1" reportDate="2025-06-20" dateTime="2025-06-20 16:20:00" buySell="BUY" openClose="C" openCloseIndicator="C" quantity="1" tradePrice="0" closePrice="0" proceeds="0" cost="197.53" fifoPnlRealized="0" fxRateToBase="1" ibCommission="-2.47" currency="EUR" strike="100" expiry="2025-06-20" putCall="P" multiplier="100" notes="A" levelOfDetail="EXECUTION" transactionType="BookTrade" />
+        <Trade accountId="U123" assetCategory="FUT" symbol="FUTP" description="FUTP SEP25" conid="7001" tradeID="d1" transactionID="d1" reportDate="2025-06-20" dateTime="2025-06-20 16:20:00" buySell="BUY" openClose="O" openCloseIndicator="O" quantity="1" tradePrice="100" closePrice="100" proceeds="-10000" cost="10000" fifoPnlRealized="0" fxRateToBase="1" ibCommission="0" currency="EUR" multiplier="100" notes="A" levelOfDetail="EXECUTION" transactionType="BookTrade" />
+        <Trade accountId="U123" assetCategory="FUT" symbol="FUTP" description="FUTP SEP25" conid="7001" tradeID="c1" transactionID="c1" reportDate="2025-08-01" dateTime="2025-08-01 10:00:00" buySell="SELL" openClose="C" openCloseIndicator="C" quantity="-1" tradePrice="98.5" closePrice="98.5" proceeds="9850" cost="-9804.94" fifoPnlRealized="45.06" fxRateToBase="1" ibCommission="0" currency="EUR" multiplier="100" levelOfDetail="EXECUTION" transactionType="ExchTrade" />
+        <Trade accountId="U123" assetCategory="FUT" symbol="FUTP" description="FUTP SEP25" conid="7001" tradeID="" transactionID="d1" reportDate="2025-08-01" dateTime="2025-08-01 10:00:00" openDateTime="2025-06-20 16:20:00" buySell="SELL" quantity="1" cost="9804.94" fifoPnlRealized="45.06" fxRateToBase="1" currency="EUR" multiplier="100" levelOfDetail="CLOSED_LOT" />
+      </Trades>
+"""
+
+
+def test_future_option_assignment_is_transparent_in_ui():
+    """FOP-Andienung end-to-end: IBKR-Basis = Strike - Netto-Praemie + Gebuehr.
+    Erwartung: Praemie 197,53 separat in Topf 2, FUT-PnL 45,06 -> -152,47
+    (Basis Strike + Gebuehr), Notice + Rechenwege-Expander + Textbericht +
+    Excel zeigen die Korrektur, kein Prueffall."""
+    import io
+    from openpyxl import load_workbook
+
+    dataset = make_dataset([("fop.xml", make_xml(body=FUTURE_OPTION_BODY))])
+    at = run_app(dataset, nav='rechenwege')
+    assert_no_exception(at, "FOP-Andienung in Rechenwege")
+    report = at.session_state['snapshot']['payload']['merged']
+    corrections = report['audit']['future_assignment_corrections']
+    assert len(corrections) == 1, corrections
+    assert abs(corrections[0]['amount_eur'] - 197.53) < 1e-6
+    assert abs(corrections[0]['assignment_commission_raw'] + 2.47) < 1e-6
+    assert not report['audit']['stillhalter_corrections_dropped']
+    assert not report['audit']['stillhalter_unmatched']
+    final = ui_model.build_final_values(report, ui_model.default_toggles())
+    # Topf 2 = Cash-Effekt: +200 -2.47 -2.47 -10000 +9850 = 45.06
+    assert abs(final['zeile_19'] - 45.06) < 1e-6, final['zeile_19']
+    assert abs(final['options_gain'] - 197.53) < 1e-6
+    assert abs(final['options_loss'] + 152.47) < 1e-6
+
+    rendered = all_markdown(at)
+    assert "Future-Optionen: Prämie aus Future-Ergebnis herausgerechnet" in rendered
+    assert "Andienungsgebühren bleiben Anschaffungsnebenkosten" in rendered
+    assert "späterer Close (CLOSED_LOT)" in rendered
+    assert "197,53" in rendered
+    # Nutzersichtbare Doku nennt den Fall im Report
+    assert "davon 1 Future-Option(en) mit 197,53 EUR" in rendered
+    expander_labels = [expander.label for expander in at.expander]
+    assert any(label.startswith("Future-Optionen · 1 Andienungskorrektur")
+               for label in expander_labels), expander_labels
+    assert not any(label.startswith("Nicht zuordenbare Stillhalter-Korrekturen")
+                   for label in expander_labels)
+
+    at.session_state['nav'] = 'export'
+    at.run()
+    assert_no_exception(at, "FOP-Andienung im Export")
+    exports = at.session_state['export_cache']
+    assert "davon Future-Optionen: 1 Andienung(en), 197,53 EUR" in exports['txt']
+    assert "Future-Ergebnis bereinigt:" in exports['txt']
+    assert "Andienungsgebühren bleiben Anschaffungsnebenkosten" in exports['txt']
+    wb = load_workbook(io.BytesIO(exports['xlsx']))
+    details = wb['Trade-Details 2025']
+    fut_rows = [row for row in details.iter_rows(values_only=True)
+                if row and any(isinstance(v, str) and 'Prämie separiert' in v
+                               for v in row)]
+    assert fut_rows, "FUT-Close-Zeile muss als korrigiert markiert sein"
+
+
 def test_guidance_copy_and_rechenwege_grouping():
     dataset = make_dataset([("synthetic_2025.xml", make_xml())])
 
@@ -581,6 +644,7 @@ if __name__ == '__main__':
         test_multi_statement_xml_is_a_hard_error,
         test_overlapping_periods_are_a_hard_error,
         test_partnership_trade_is_visible_in_export_summary,
+        test_future_option_assignment_is_transparent_in_ui,
         test_guidance_copy_and_rechenwege_grouping,
     ]
     failures = 0

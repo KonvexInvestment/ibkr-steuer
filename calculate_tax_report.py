@@ -3389,6 +3389,504 @@ def _future_assignment_review(assignment, reason, amount_raw=0.0,
     }
 
 
+# Nutzerlesbare Erklaerungen der Prueffall-Codes aus dem Stillhalter-Apply
+# (Aktien) und dem FUT-Resolver. Single Source fuer GUI (Rechenwege) und
+# Textbericht; unbekannte Codes fallen auf den Rohcode zurueck.
+STILLHALTER_REVIEW_REASON_LABELS = {
+    'long_put_exercise_pnl_mismatch': (
+        'Long-Put-Ausübung erkannt, aber der Cover-PnL des Aktien-Shorts '
+        'trägt die Prämie nicht; Korrektur verweigert'),
+    'future_assignment_history_missing': (
+        'Vorjahres-Andienung ohne Optionsverkauf in der Historie: Prämie '
+        'nicht belegbar, Future-Ergebnis bleibt unkorrigiert'),
+    'future_assignment_terms_missing': (
+        'Kontraktdaten der Andienung (Multiplikator oder Zeitstempel) fehlen'),
+    'future_assignment_partial_short_match': (
+        'Nur ein Teil der angedienten Kontrakte lässt sich einem '
+        'Optionsverkauf zuordnen'),
+    'future_assignment_premium_evidence_mismatch': (
+        'Prämie laut Optionsverkauf passt nicht zur Kostenbasis der '
+        'Andienungszeile'),
+    'future_assignment_delivery_missing_or_ambiguous': (
+        'Keine eindeutige Future-Lieferung zum Andienungszeitpunkt gefunden'),
+    'future_assignment_direct_close_mismatch': (
+        'Sofortiger Future-Close trägt die Prämie nicht in erwarteter Höhe'),
+    'future_assignment_mixed_open_close': (
+        'Future-Lieferung ist weder als Eröffnung noch als Schließung '
+        'gekennzeichnet'),
+    'future_assignment_delivery_terms_missing': (
+        'Lieferpreis oder Multiplikator des gelieferten Futures fehlen'),
+    'future_assignment_lot_basis_mismatch': (
+        'Kostenbasis des geschlossenen Future-Lots enthält die Prämie nicht '
+        'in erwarteter Höhe'),
+    'future_assignment_close_missing_or_ambiguous': (
+        'Kein eindeutiger Future-Close zum Schlusszeitpunkt des Lots'),
+    'future_assignment_close_unproven': (
+        'Future im Steuerjahr geschlossen, aber ohne CLOSED_LOT-Beleg für '
+        'die Andienungsposition'),
+}
+
+
+def get_stillhalter_review_reason_label(reason):
+    """Erklaerung eines Prueffall-Codes; leerer Code = fehlende Verkaufszeile."""
+    if not reason:
+        return 'Keine passende Basiswert-Verkaufszeile für die Korrektur'
+    return STILLHALTER_REVIEW_REASON_LABELS.get(reason, reason)
+
+
+_FUTURE_EPSILON = 0.0000001
+
+
+class _FutureRowView:
+    """Vorberechnete Sicht auf eine FUT-Trade- oder CLOSED_LOT-Zeile.
+
+    Zeitstempel, Datum, Multiplikator und Menge werden genau einmal
+    normalisiert statt in jeder Matching-Schleife erneut geparst. ``row``
+    bleibt die Originalzeile, ``oid`` ihre Identitaet fuer Konsum-Zaehler
+    und fuer ``future_assignment_adjustments`` (dort per ``id(trade)``).
+    """
+    __slots__ = ('row', 'oid', 'ts', 'sort_ts', 'open_ts', 'report_date',
+                 'mult', 'qty_abs', 'qty_signed', 'side', 'open_close',
+                 'transaction_type')
+
+    def __init__(self, row, kind):
+        self.row = row
+        self.oid = id(row)
+        self.ts = normalize_ibkr_datetime(row.get('dateTime') or '')
+        self.sort_ts = normalize_ibkr_datetime(
+            row.get('dateTime') or row.get('reportDate') or '')
+        self.open_ts = normalize_ibkr_datetime(row.get('openDateTime') or '')
+        if kind == 'lot':
+            self.report_date = parse_date(
+                row.get('reportDate') or row.get('dateTime'))
+        else:
+            self.report_date = parse_date(
+                row.get('reportDate') or row.get('dateTime')
+                or row.get('tradeDate'))
+        self.mult = safe_float(row.get('multiplier'), 0.0)
+        self.qty_signed = safe_float(row.get('quantity'), 0.0)
+        self.qty_abs = abs(self.qty_signed)
+        self.side = row.get('buySell')
+        self.open_close = (row.get('openCloseIndicator') or '').strip()
+        self.transaction_type = row.get('transactionType')
+
+
+class _FutureAssignmentCase:
+    """Eine FOP/FSFOP-Andienung mit ihren vorab berechneten Kontraktdaten."""
+    __slots__ = ('row', 'matches', 'qty', 'mult', 'ts', 'date', 'put_call',
+                 'delivery_side', 'close_side', 'strike', 'commission')
+
+    def __init__(self, row, matches):
+        self.row = row
+        self.matches = matches
+        self.qty = abs(safe_float(row.get('quantity'), 0.0))
+        self.mult = safe_float(row.get('multiplier'), 0.0)
+        self.ts = normalize_ibkr_datetime(row.get('dateTime') or '')
+        self.date = parse_date(
+            row.get('reportDate') or row.get('dateTime')
+            or row.get('tradeDate'))
+        self.put_call = row.get('putCall')
+        # Put-Andienung liefert einen Long-Future (BUY), Call einen Short (SELL).
+        self.delivery_side = 'BUY' if self.put_call == 'P' else 'SELL'
+        self.close_side = 'SELL' if self.delivery_side == 'BUY' else 'BUY'
+        self.strike = safe_float(row.get('strike'), 0.0)
+        # Andienungsgebuehr (negativ). IBKR rechnet sie in die Future-Basis;
+        # steuerlich sind es Anschaffungsnebenkosten des Termingeschaefts.
+        self.commission = safe_float(row.get('ibCommission'), 0.0)
+
+    def lot_direction_ok(self, lot):
+        return lot.qty_signed > 0 if self.put_call == 'P' else lot.qty_signed < 0
+
+
+class _FutureAssignmentContext:
+    """Zustand des FUT-Resolvers: vorgefilterte Zeilen und Konsum-Zaehler.
+
+    Konsum-Zaehler sind ueber alle Andienungen geteilt, damit zwei
+    Andienungen desselben Futures nie denselben Lot- oder Close-Anteil
+    doppelt beanspruchen.
+    """
+
+    def __init__(self, trades, closed_lots, tax_year):
+        self.tax_year = tax_year
+        self.fut_trades = [
+            _FutureRowView(row, 'trade') for row in trades
+            if row.get('assetCategory') == 'FUT'
+        ]
+        self.fut_lots = [
+            _FutureRowView(row, 'lot') for row in (closed_lots or [])
+            if row.get('assetCategory') == 'FUT'
+        ]
+        self.claimed_deliveries = set()
+        self.claimed_lot_qty = defaultdict(float)
+        self.claimed_target_qty = defaultdict(float)
+        self.adjustments = {}
+        self.audit_details = []
+        self.review_items = []
+
+    def in_tax_year(self, view):
+        return bool(view.report_date) and view.report_date.year == self.tax_year
+
+    def review(self, case, reason, amount_raw=0.0, quantity=0.0, future=None):
+        self.review_items.append(_future_assignment_review(
+            case.row, reason, amount_raw, quantity,
+            future.row if future is not None else None))
+
+    def record_adjustment(self, target, correction_raw, cost_raw, case,
+                          future, mode, quantity, fee_raw):
+        entry = self.adjustments.setdefault(target.oid, {
+            'pnl_raw': 0.0,
+            'cost_raw': 0.0,
+            'details': [],
+        })
+        detail = {
+            'assignment_symbol': case.row.get('symbol', ''),
+            'future_symbol': future.row.get('symbol', ''),
+            'assignment_date': case.ts,
+            'realization_date': target.ts,
+            'putCall': case.put_call,
+            'quantity': quantity,
+            'amount_raw': correction_raw,
+            'cost_adjustment_raw': cost_raw,
+            # Anteil der Andienungsgebuehr (negativ), der als
+            # Anschaffungsnebenkosten im Future-Ergebnis verbleibt.
+            'assignment_commission_raw': fee_raw,
+            'currency': target.row.get('currency', ''),
+            'mode': mode,
+            'target_trade_id': (
+                target.row.get('transactionID')
+                or target.row.get('tradeID') or ''
+            ),
+        }
+        entry['pnl_raw'] += correction_raw
+        entry['cost_raw'] += cost_raw
+        entry['details'].append(detail)
+        self.audit_details.append(detail)
+
+
+def _future_multiplier_matches(left_mult, right_mult):
+    return (left_mult > 0 and right_mult > 0
+            and abs(left_mult - right_mult) <= _FUTURE_EPSILON)
+
+
+def _future_delivery_candidates(ctx, case):
+    """FUT-BookTrades, die exakt zur Andienung passen (Zeit, Identitaet,
+    Menge, Multiplikator, Lieferpreis = Strike)."""
+    if (not case.ts or case.mult <= 0 or case.strike <= 0
+            or case.qty <= _FUTURE_EPSILON):
+        return []
+    candidates = []
+    for future in ctx.fut_trades:
+        if (future.transaction_type != 'BookTrade'
+                or future.side != case.delivery_side
+                or future.ts != case.ts
+                or not _future_assignment_row_matches(
+                    case.row, future.row, option_to_future=True)
+                or abs(future.qty_abs - case.qty) > _FUTURE_EPSILON):
+            continue
+        delivery_price = safe_float(future.row.get('tradePrice'), 0.0)
+        if (not _future_multiplier_matches(case.mult, future.mult)
+                or delivery_price <= 0
+                or abs(case.strike - delivery_price)
+                > max(_FUTURE_EPSILON, abs(case.strike) * 0.0000001)):
+            continue
+        candidates.append(future)
+    return candidates
+
+
+def _future_has_current_realization_evidence(ctx, future, case):
+    """True, wenn im Steuerjahr ein nicht anderweitig belegter Close existiert."""
+    if future.open_close == 'C' and ctx.in_tax_year(future):
+        return True
+
+    for lot in ctx.fut_lots:
+        if (ctx.in_tax_year(lot)
+                and lot.side == case.close_side
+                and lot.open_ts == case.ts
+                and _future_assignment_row_matches(future.row, lot.row)
+                and _future_delivery_lot_transaction_matches(
+                    future.row, lot.row)):
+            return True
+
+    for target in ctx.fut_trades:
+        if (not ctx.in_tax_year(target)
+                or target.side != case.close_side
+                or target.open_close != 'C'
+                or target.ts <= case.ts
+                or not _future_assignment_row_matches(future.row, target.row)
+                or not _future_multiplier_matches(target.mult, future.mult)
+                or target.qty_abs <= _FUTURE_EPSILON):
+            continue
+        # Ein exaktes CLOSED_LOT mit anderem Open-Timestamp belegt, dass
+        # diese Close-Row einen anderen Future-Lot realisiert hat. Nur ein
+        # darueber hinausgehender Anteil bleibt fuer die Assignment-
+        # Position ungeklaert.
+        explained_qty = 0.0
+        for lot in ctx.fut_lots:
+            if (lot.side != case.close_side
+                    or lot.ts != target.ts
+                    or lot.open_ts == case.ts
+                    or not _future_assignment_row_matches(future.row, lot.row)):
+                continue
+            explained_qty += lot.qty_abs
+        if target.qty_abs - explained_qty > _FUTURE_EPSILON:
+            return True
+    return False
+
+
+def _future_assignment_has_current_lot_evidence(ctx, case):
+    """Erkennt aktuelle FUT-Lots auch bei fehlender Delivery-Trade-Row."""
+    for lot in ctx.fut_lots:
+        if (ctx.in_tax_year(lot)
+                and lot.side == case.close_side
+                and case.lot_direction_ok(lot)
+                and lot.open_ts == case.ts
+                and _future_assignment_row_matches(
+                    case.row, lot.row, option_to_future=True)
+                and _future_multiplier_matches(case.mult, lot.mult)):
+            return True
+    return False
+
+
+def _future_unproven_current_realization_qty(ctx, future, case):
+    """Menge aktueller Closes ohne bereits zugeordneten Lot-Beleg."""
+    unresolved_qty = 0.0
+    for target in ctx.fut_trades:
+        available_target_qty = max(
+            0.0, target.qty_abs - ctx.claimed_target_qty[target.oid])
+        if (not ctx.in_tax_year(target)
+                or target.side != case.close_side
+                or target.open_close != 'C'
+                or target.ts <= case.ts
+                or not _future_assignment_row_matches(future.row, target.row)
+                or not _future_multiplier_matches(target.mult, future.mult)
+                or available_target_qty <= _FUTURE_EPSILON):
+            continue
+
+        explained_qty = 0.0
+        for lot in ctx.fut_lots:
+            if (lot.side != case.close_side
+                    or lot.ts != target.ts
+                    or not _future_assignment_row_matches(future.row, lot.row)
+                    or not _future_multiplier_matches(lot.mult, future.mult)):
+                continue
+            lot_qty = lot.qty_abs
+            if lot.open_ts == case.ts:
+                if not _future_delivery_lot_transaction_matches(
+                        future.row, lot.row):
+                    continue
+                lot_qty = max(0.0, lot_qty - ctx.claimed_lot_qty[lot.oid])
+            explained_qty += lot_qty
+        unresolved_qty += max(0.0, available_target_qty - explained_qty)
+    return unresolved_qty
+
+
+def _future_delivery_lots(ctx, future, case):
+    """CLOSED_LOTs des gelieferten Futures, chronologisch nach Close."""
+    lots = []
+    for lot in ctx.fut_lots:
+        if (not ctx.in_tax_year(lot)
+                or lot.open_ts != case.ts
+                or lot.side != case.close_side
+                or not case.lot_direction_ok(lot)
+                or not _future_assignment_row_matches(future.row, lot.row)
+                or not _future_delivery_lot_transaction_matches(
+                    future.row, lot.row)
+                or not _future_multiplier_matches(lot.mult, future.mult)):
+            continue
+        lots.append(lot)
+    lots.sort(key=lambda lot: lot.sort_ts)
+    return lots
+
+
+def _future_close_targets(ctx, future, case, lot, lot_qty, lot_cost):
+    """Trade-Rows, die den Lot-Close tragen; bei Mehrdeutigkeit entscheidet
+    die exakte Kostenbasis."""
+    targets = []
+    for target in ctx.fut_trades:
+        if (not ctx.in_tax_year(target)
+                or target.side != case.close_side
+                or target.ts != lot.sort_ts
+                or not _future_assignment_row_matches(future.row, target.row)
+                or not _future_multiplier_matches(target.mult, future.mult)
+                or (target.qty_abs - ctx.claimed_target_qty[target.oid]
+                    + _FUTURE_EPSILON) < lot_qty):
+            continue
+        targets.append(target)
+    if len(targets) > 1:
+        cost_targets = [
+            target for target in targets
+            if _future_assignment_values_close(
+                abs(safe_float(target.row.get('cost'), 0.0)), lot_cost)
+        ]
+        if len(cost_targets) == 1:
+            targets = cost_targets
+    return targets
+
+
+def _resolve_future_direct_close(ctx, case, future, expected_raw):
+    """Andienung schliesst eine bestehende Future-Position sofort."""
+    if not ctx.in_tax_year(future):
+        return
+    broker_pnl = safe_float(future.row.get('fifoPnlRealized'), 0.0)
+    cash_pnl = (
+        safe_float(future.row.get('cost'), 0.0)
+        + safe_float(future.row.get('proceeds'), 0.0)
+        + safe_float(future.row.get('ibCommission'), 0.0)
+    )
+    observed_raw = broker_pnl - cash_pnl
+    if (observed_raw <= 0.01
+            or not _future_assignment_values_close(observed_raw, expected_raw)):
+        ctx.review(case, 'future_assignment_direct_close_mismatch',
+                   expected_raw, case.qty, future)
+        return
+    # Nur die Netto-Praemie verlaesst das Future-Ergebnis; die
+    # Andienungsgebuehr bleibt als Aufwand des Termingeschaefts stehen.
+    correction_raw = observed_raw - case.commission
+    ctx.record_adjustment(future, correction_raw, 0.0, case, future,
+                          'direct_close', case.qty, case.commission)
+
+
+def _resolve_future_deferred_close(ctx, case, future, expected_raw,
+                                   delivery_price):
+    """Gelieferter Future wird spaeter geschlossen: Lot-fuer-Lot belegen."""
+    remaining_qty = case.qty
+    for lot in _future_delivery_lots(ctx, future, case):
+        if remaining_qty <= _FUTURE_EPSILON:
+            break
+        available_qty = max(0.0, lot.qty_abs - ctx.claimed_lot_qty[lot.oid])
+        if available_qty <= _FUTURE_EPSILON:
+            continue
+        lot_qty = min(available_qty, remaining_qty)
+        notional = delivery_price * future.mult * lot_qty
+        lot_cost = abs(safe_float(lot.row.get('cost'), 0.0))
+        if lot_qty < lot.qty_abs and lot.qty_abs > 0:
+            lot_cost *= lot_qty / lot.qty_abs
+        if case.put_call == 'P':
+            observed_raw = notional - lot_cost
+        else:
+            observed_raw = lot_cost - notional
+        expected_slice = expected_raw * lot_qty / case.qty
+        if (observed_raw <= 0.01
+                or not _future_assignment_values_close(
+                    observed_raw, expected_slice)):
+            ctx.review(case, 'future_assignment_lot_basis_mismatch',
+                       expected_slice, lot_qty, future)
+            continue
+
+        targets = _future_close_targets(
+            ctx, future, case, lot, lot_qty, lot_cost)
+        if len(targets) != 1:
+            ctx.review(case, 'future_assignment_close_missing_or_ambiguous',
+                       expected_slice, lot_qty, future)
+            continue
+
+        target = targets[0]
+        ctx.claimed_lot_qty[lot.oid] += lot_qty
+        ctx.claimed_target_qty[target.oid] += lot_qty
+        remaining_qty -= lot_qty
+        # IBKR-Basis = Strike - Netto-Praemie + Andienungsgebuehr. Die
+        # Korrektur hebt die Basis auf Strike + Gebuehr: Praemie raus
+        # (steht separat als Stillhaltereinkunft), Gebuehr bleibt
+        # Anschaffungsnebenkosten des Futures.
+        fee_slice = case.commission * lot_qty / case.qty
+        correction_raw = observed_raw - fee_slice
+        ctx.record_adjustment(target, correction_raw, correction_raw, case,
+                              future, 'deferred_close', lot_qty, fee_slice)
+
+    unproven_qty = min(
+        remaining_qty,
+        _future_unproven_current_realization_qty(ctx, future, case),
+    )
+    if unproven_qty > _FUTURE_EPSILON:
+        ctx.review(case, 'future_assignment_close_unproven',
+                   expected_raw * unproven_qty / case.qty, unproven_qty,
+                   future)
+
+
+def _resolve_future_assignment(ctx, case):
+    """Evidenzkette einer Andienung pruefen und Korrektur oder Prueffall
+    erzeugen. Jede Unsicherheit endet als Prueffall, nie als Korrektur."""
+    future_rows = _future_delivery_candidates(ctx, case)
+    has_current_realization = (
+        any(_future_has_current_realization_evidence(ctx, future, case)
+            for future in future_rows)
+        or _future_assignment_has_current_lot_evidence(ctx, case)
+    )
+    is_prior_year = bool(case.date and case.date.year < ctx.tax_year)
+    if not case.matches or case.qty <= _FUTURE_EPSILON:
+        # Aktuelle fehlende Original-SELLs meldet weiterhin der bestehende
+        # stillhalter_unmatched-Pfad. Fuer Vorjahres-Assignments existiert
+        # dieser Pfad nicht; ein aktueller FUT-Close darf dort nicht still
+        # unkorrigiert bleiben.
+        if is_prior_year and has_current_realization:
+            ctx.review(case, 'future_assignment_history_missing',
+                       quantity=case.qty,
+                       future=(future_rows[0] if len(future_rows) == 1
+                               else None))
+        return
+
+    # Vollstaendig historische FUT-Realisierungen gehoeren weder als
+    # Korrektur noch als Evidenzfehler in das aktuelle Steuerjahr. Ein
+    # Vorjahres-Assignment bleibt nur relevant, wenn mindestens eine
+    # aktuelle Realisierung des gelieferten Futures belegt ist.
+    if is_prior_year and not has_current_realization:
+        return
+
+    if case.mult <= 0:
+        ctx.review(case, 'future_assignment_terms_missing', quantity=case.qty)
+        return
+    (premium_raw, commission_raw, _fx_weighted, _premium_eur,
+     _sells, consumed_qty) = _consume_assignment_fifo_matches(
+        case.matches, case.mult or 1.0)
+    if abs(consumed_qty - case.qty) > _FUTURE_EPSILON:
+        ctx.review(case, 'future_assignment_partial_short_match',
+                   premium_raw + commission_raw, case.qty)
+        return
+
+    # expected_raw = Basisreduktion, die IBKR vorgenommen hat: Netto-Praemie
+    # abzueglich der Andienungsgebuehr (Gebuehr ist negativ, erhoeht die
+    # Basis). Die Evidenzpruefungen vergleichen gegen diesen Wert.
+    premium_net_raw = premium_raw + commission_raw
+    expected_raw = premium_net_raw + case.commission
+    assignment_cost = abs(safe_float(case.row.get('cost'), 0.0))
+    if expected_raw <= 0.01:
+        return
+    if assignment_cost > 0.01:
+        cost_evidence = assignment_cost + case.commission
+        if not _future_assignment_values_close(cost_evidence, expected_raw):
+            ctx.review(case, 'future_assignment_premium_evidence_mismatch',
+                       expected_raw, case.qty)
+            return
+
+    if not case.ts:
+        ctx.review(case, 'future_assignment_terms_missing',
+                   expected_raw, case.qty)
+        return
+    if (len(future_rows) != 1
+            or future_rows[0].oid in ctx.claimed_deliveries):
+        ctx.review(case, 'future_assignment_delivery_missing_or_ambiguous',
+                   expected_raw, case.qty)
+        return
+    future = future_rows[0]
+    ctx.claimed_deliveries.add(future.oid)
+
+    if future.open_close == 'C':
+        _resolve_future_direct_close(ctx, case, future, expected_raw)
+        return
+    if future.open_close != 'O':
+        ctx.review(case, 'future_assignment_mixed_open_close',
+                   expected_raw, case.qty, future)
+        return
+
+    delivery_price = safe_float(future.row.get('tradePrice'), 0.0)
+    if future.mult <= 0 or delivery_price <= 0:
+        ctx.review(case, 'future_assignment_delivery_terms_missing',
+                   expected_raw, case.qty, future)
+        return
+    _resolve_future_deferred_close(
+        ctx, case, future, expected_raw, delivery_price)
+
+
 def _collect_future_assignment_adjustments(trades, closed_lots, tax_year):
     """Findet belegte FOP/FSFOP-Praemien in realisierten FUT-PnL-Zeilen.
 
@@ -3398,17 +3896,17 @@ def _collect_future_assignment_adjustments(trades, closed_lots, tax_year):
     werden. Deshalb werden nur exakte Option->FUT-BookTrade->Closed-Lot-Ketten
     ueber Timestamp, conid, Waehrung, Menge, Multiplikator und Strike genutzt.
 
+    Steuerlich (BMF 14.05.2025 Rn. 26/33 analog): Die Praemie ist eine
+    Stillhaltereinkunft zum Zuflusszeitpunkt (§20 Abs. 1 Nr. 11 EStG); der
+    gelieferte Future wird zum Strike angeschafft bzw. veraeussert (§20
+    Abs. 2 S. 1 Nr. 3 EStG). IBKR bettet die Praemie in die Future-Basis
+    ein; die Korrektur hebt die Basis auf Strike plus Andienungsgebuehr.
+
     Returns ``(adjustments_by_trade_oid, audit_details, review_items)``.
     """
     assignment_matches, _ = _collect_assignment_fifo_matches(
         trades, tax_year, include_prior=True)
-    adjustments = {}
-    audit_details = []
-    review_items = []
-    claimed_deliveries = set()
-    claimed_lot_qty = defaultdict(float)
-    claimed_target_qty = defaultdict(float)
-    epsilon = 0.0000001
+    ctx = _FutureAssignmentContext(trades, closed_lots, tax_year)
 
     assignments = sorted(
         [
@@ -3427,451 +3925,11 @@ def _collect_future_assignment_adjustments(trades, closed_lots, tax_year):
         ],
         key=_option_sort_key,
     )
+    for row in assignments:
+        _resolve_future_assignment(
+            ctx, _FutureAssignmentCase(row, assignment_matches.get(id(row), [])))
 
-    def record_adjustment(target, correction_raw, cost_raw, assignment,
-                          future, mode, quantity):
-        target_oid = id(target)
-        entry = adjustments.setdefault(target_oid, {
-            'pnl_raw': 0.0,
-            'cost_raw': 0.0,
-            'details': [],
-        })
-        detail = {
-            'assignment_symbol': assignment.get('symbol', ''),
-            'future_symbol': future.get('symbol', ''),
-            'assignment_date': normalize_ibkr_datetime(
-                assignment.get('dateTime') or ''),
-            'realization_date': normalize_ibkr_datetime(
-                target.get('dateTime') or ''),
-            'putCall': assignment.get('putCall', ''),
-            'quantity': quantity,
-            'amount_raw': correction_raw,
-            'cost_adjustment_raw': cost_raw,
-            'currency': target.get('currency', ''),
-            'mode': mode,
-            'target_trade_id': (
-                target.get('transactionID') or target.get('tradeID') or ''
-            ),
-        }
-        entry['pnl_raw'] += correction_raw
-        entry['cost_raw'] += cost_raw
-        entry['details'].append(detail)
-        audit_details.append(detail)
-
-    def delivery_candidates(assignment, assignment_qty):
-        assignment_ts = normalize_ibkr_datetime(
-            assignment.get('dateTime') or '')
-        assignment_mult = safe_float(assignment.get('multiplier'), 0.0)
-        strike = safe_float(assignment.get('strike'), 0.0)
-        expected_side = (
-            'BUY' if assignment.get('putCall') == 'P' else 'SELL')
-        if (not assignment_ts or assignment_mult <= 0 or strike <= 0
-                or assignment_qty <= epsilon):
-            return []
-        candidates = []
-        for future in trades:
-            if (future.get('assetCategory') != 'FUT'
-                    or future.get('transactionType') != 'BookTrade'
-                    or future.get('buySell') != expected_side
-                    or normalize_ibkr_datetime(
-                        future.get('dateTime') or '') != assignment_ts
-                    or not _future_assignment_row_matches(
-                        assignment, future, option_to_future=True)
-                    or abs(abs(safe_float(future.get('quantity'), 0.0))
-                           - assignment_qty) > epsilon):
-                continue
-            future_mult = safe_float(future.get('multiplier'), 0.0)
-            delivery_price = safe_float(future.get('tradePrice'), 0.0)
-            if (future_mult <= 0
-                    or abs(assignment_mult - future_mult) > epsilon
-                    or delivery_price <= 0
-                    or abs(strike - delivery_price)
-                    > max(epsilon, abs(strike) * 0.0000001)):
-                continue
-            candidates.append(future)
-        return candidates
-
-    def has_current_realization_evidence(future, assignment_ts, close_side):
-        """True, wenn im Steuerjahr ein nicht anderweitig belegter Close existiert."""
-        report_date = parse_date(
-            future.get('reportDate')
-            or future.get('dateTime')
-            or future.get('tradeDate'))
-        if ((future.get('openCloseIndicator') or '').strip() == 'C'
-                and report_date and report_date.year == tax_year):
-            return True
-
-        future_mult = safe_float(future.get('multiplier'), 0.0)
-        for lot in closed_lots or []:
-            lot_date = parse_date(
-                lot.get('reportDate') or lot.get('dateTime'))
-            if (lot.get('assetCategory') == 'FUT'
-                    and lot_date and lot_date.year == tax_year
-                    and lot.get('buySell') == close_side
-                    and normalize_ibkr_datetime(
-                        lot.get('openDateTime') or '') == assignment_ts
-                    and _future_assignment_row_matches(future, lot)
-                    and _future_delivery_lot_transaction_matches(
-                        future, lot)):
-                return True
-
-        for target in trades:
-            target_report_date = parse_date(
-                target.get('reportDate')
-                or target.get('dateTime')
-                or target.get('tradeDate'))
-            target_ts = normalize_ibkr_datetime(
-                target.get('dateTime') or '')
-            target_mult = safe_float(target.get('multiplier'), 0.0)
-            target_qty = abs(safe_float(target.get('quantity'), 0.0))
-            if (target.get('assetCategory') != 'FUT'
-                    or not target_report_date
-                    or target_report_date.year != tax_year
-                    or target.get('buySell') != close_side
-                    or (target.get('openCloseIndicator') or '').strip() != 'C'
-                    or target_ts <= assignment_ts
-                    or not _future_assignment_row_matches(future, target)
-                    or target_mult <= 0
-                    or abs(target_mult - future_mult) > epsilon
-                    or target_qty <= epsilon):
-                continue
-
-            # Ein exaktes CLOSED_LOT mit anderem Open-Timestamp belegt, dass
-            # diese Close-Row einen anderen Future-Lot realisiert hat. Nur ein
-            # darueber hinausgehender Anteil bleibt fuer die Assignment-
-            # Position ungeklärt.
-            explained_qty = 0.0
-            for lot in closed_lots or []:
-                if (lot.get('assetCategory') != 'FUT'
-                        or lot.get('buySell') != close_side
-                        or normalize_ibkr_datetime(
-                            lot.get('dateTime') or '') != target_ts
-                        or normalize_ibkr_datetime(
-                            lot.get('openDateTime') or '') == assignment_ts
-                        or not _future_assignment_row_matches(future, lot)):
-                    continue
-                explained_qty += abs(safe_float(lot.get('quantity'), 0.0))
-            if target_qty - explained_qty > epsilon:
-                return True
-        return False
-
-    def assignment_has_current_lot_evidence(assignment, assignment_ts,
-                                            close_side):
-        """Erkennt aktuelle FUT-Lots auch bei fehlender Delivery-Trade-Row."""
-        assignment_mult = safe_float(assignment.get('multiplier'), 0.0)
-        for lot in closed_lots or []:
-            lot_date = parse_date(
-                lot.get('reportDate') or lot.get('dateTime'))
-            lot_mult = safe_float(lot.get('multiplier'), 0.0)
-            lot_qty = safe_float(lot.get('quantity'), 0.0)
-            direction_ok = (
-                lot_qty > 0 if assignment.get('putCall') == 'P'
-                else lot_qty < 0
-            )
-            if (lot.get('assetCategory') == 'FUT'
-                    and lot_date and lot_date.year == tax_year
-                    and lot.get('buySell') == close_side
-                    and direction_ok
-                    and normalize_ibkr_datetime(
-                        lot.get('openDateTime') or '') == assignment_ts
-                    and _future_assignment_row_matches(
-                        assignment, lot, option_to_future=True)
-                    and assignment_mult > 0
-                    and lot_mult > 0
-                    and abs(lot_mult - assignment_mult) <= epsilon):
-                return True
-        return False
-
-    def unproven_current_realization_qty(future, assignment_ts, close_side):
-        """Menge aktueller Closes ohne bereits zugeordneten Lot-Beleg."""
-        future_mult = safe_float(future.get('multiplier'), 0.0)
-        unresolved_qty = 0.0
-        for target in trades:
-            target_report_date = parse_date(
-                target.get('reportDate')
-                or target.get('dateTime')
-                or target.get('tradeDate'))
-            target_ts = normalize_ibkr_datetime(
-                target.get('dateTime') or '')
-            target_mult = safe_float(target.get('multiplier'), 0.0)
-            target_qty = abs(safe_float(target.get('quantity'), 0.0))
-            available_target_qty = max(
-                0.0, target_qty - claimed_target_qty[id(target)])
-            if (target.get('assetCategory') != 'FUT'
-                    or not target_report_date
-                    or target_report_date.year != tax_year
-                    or target.get('buySell') != close_side
-                    or (target.get('openCloseIndicator') or '').strip() != 'C'
-                    or target_ts <= assignment_ts
-                    or not _future_assignment_row_matches(future, target)
-                    or target_mult <= 0
-                    or abs(target_mult - future_mult) > epsilon
-                    or available_target_qty <= epsilon):
-                continue
-
-            explained_qty = 0.0
-            for lot in closed_lots or []:
-                lot_mult = safe_float(lot.get('multiplier'), 0.0)
-                lot_open_ts = normalize_ibkr_datetime(
-                    lot.get('openDateTime') or '')
-                if (lot.get('assetCategory') != 'FUT'
-                        or lot.get('buySell') != close_side
-                        or normalize_ibkr_datetime(
-                            lot.get('dateTime') or '') != target_ts
-                        or not _future_assignment_row_matches(future, lot)
-                        or lot_mult <= 0
-                        or abs(lot_mult - future_mult) > epsilon):
-                    continue
-                lot_qty = abs(safe_float(lot.get('quantity'), 0.0))
-                if lot_open_ts == assignment_ts:
-                    if not _future_delivery_lot_transaction_matches(
-                            future, lot):
-                        continue
-                    lot_qty = max(
-                        0.0, lot_qty - claimed_lot_qty[id(lot)])
-                explained_qty += lot_qty
-            unresolved_qty += max(
-                0.0, available_target_qty - explained_qty)
-        return unresolved_qty
-
-    for assignment in assignments:
-        matches = assignment_matches.get(id(assignment), [])
-        assignment_qty = abs(safe_float(assignment.get('quantity'), 0.0))
-        assignment_mult = safe_float(assignment.get('multiplier'), 0.0)
-        assignment_ts = normalize_ibkr_datetime(
-            assignment.get('dateTime') or '')
-        expected_side = 'BUY' if assignment.get('putCall') == 'P' else 'SELL'
-        expected_close_side = 'SELL' if expected_side == 'BUY' else 'BUY'
-        future_rows = delivery_candidates(assignment, assignment_qty)
-        assignment_date = parse_date(
-            assignment.get('reportDate')
-            or assignment.get('dateTime')
-            or assignment.get('tradeDate'))
-        has_current_realization = (
-            any(has_current_realization_evidence(
-                future, assignment_ts, expected_close_side)
-                for future in future_rows)
-            or assignment_has_current_lot_evidence(
-                assignment, assignment_ts, expected_close_side)
-        )
-        if not matches or assignment_qty <= epsilon:
-            # Aktuelle fehlende Original-SELLs meldet weiterhin der bestehende
-            # stillhalter_unmatched-Pfad. Fuer Vorjahres-Assignments existiert
-            # dieser Pfad nicht; ein aktueller FUT-Close darf dort nicht still
-            # unkorrigiert bleiben.
-            if (assignment_date and assignment_date.year < tax_year
-                    and has_current_realization):
-                review_items.append(_future_assignment_review(
-                    assignment, 'future_assignment_history_missing',
-                    quantity=assignment_qty,
-                    future=(future_rows[0] if len(future_rows) == 1
-                            else None)))
-            continue
-
-        # Vollstaendig historische FUT-Realisierungen gehoeren weder als
-        # Korrektur noch als Evidenzfehler in das aktuelle Steuerjahr. Ein
-        # Vorjahres-Assignment bleibt nur relevant, wenn mindestens eine
-        # aktuelle Realisierung des gelieferten Futures belegt ist.
-        if (assignment_date and assignment_date.year < tax_year
-                and not has_current_realization):
-            continue
-
-        if assignment_mult <= 0:
-            review_items.append(_future_assignment_review(
-                assignment, 'future_assignment_terms_missing',
-                quantity=assignment_qty))
-            continue
-        (premium_raw, commission_raw, _fx_weighted, _premium_eur,
-         _sells, consumed_qty) = _consume_assignment_fifo_matches(
-            matches, assignment_mult or 1.0)
-        if abs(consumed_qty - assignment_qty) > epsilon:
-            review_items.append(_future_assignment_review(
-                assignment, 'future_assignment_partial_short_match',
-                premium_raw + commission_raw, assignment_qty))
-            continue
-
-        assignment_commission = safe_float(
-            assignment.get('ibCommission'), 0.0)
-        expected_raw = premium_raw + commission_raw + assignment_commission
-        assignment_cost = abs(safe_float(assignment.get('cost'), 0.0))
-        if expected_raw <= 0.01:
-            continue
-        if assignment_cost > 0.01:
-            cost_evidence = assignment_cost + assignment_commission
-            if not _future_assignment_values_close(
-                    cost_evidence, expected_raw):
-                review_items.append(_future_assignment_review(
-                    assignment, 'future_assignment_premium_evidence_mismatch',
-                    expected_raw, assignment_qty))
-                continue
-
-        if not assignment_ts:
-            review_items.append(_future_assignment_review(
-                assignment, 'future_assignment_terms_missing',
-                expected_raw, assignment_qty))
-            continue
-        if len(future_rows) != 1 or id(future_rows[0]) in claimed_deliveries:
-            review_items.append(_future_assignment_review(
-                assignment, 'future_assignment_delivery_missing_or_ambiguous',
-                expected_raw, assignment_qty))
-            continue
-        future = future_rows[0]
-        claimed_deliveries.add(id(future))
-        open_close = (future.get('openCloseIndicator') or '').strip()
-
-        if open_close == 'C':
-            future_report_date = parse_date(
-                future.get('reportDate')
-                or future.get('dateTime')
-                or future.get('tradeDate'))
-            if (not future_report_date
-                    or future_report_date.year != tax_year):
-                continue
-            broker_pnl = safe_float(future.get('fifoPnlRealized'), 0.0)
-            cash_pnl = (
-                safe_float(future.get('cost'), 0.0)
-                + safe_float(future.get('proceeds'), 0.0)
-                + safe_float(future.get('ibCommission'), 0.0)
-            )
-            observed_raw = broker_pnl - cash_pnl
-            if (observed_raw <= 0.01
-                    or not _future_assignment_values_close(
-                        observed_raw, expected_raw)):
-                review_items.append(_future_assignment_review(
-                    assignment, 'future_assignment_direct_close_mismatch',
-                    expected_raw, assignment_qty, future))
-                continue
-            record_adjustment(
-                future, observed_raw, 0.0, assignment, future,
-                'direct_close', assignment_qty)
-            continue
-
-        if open_close != 'O':
-            review_items.append(_future_assignment_review(
-                assignment, 'future_assignment_mixed_open_close',
-                expected_raw, assignment_qty, future))
-            continue
-
-        future_mult = safe_float(future.get('multiplier'), 0.0)
-        delivery_price = safe_float(future.get('tradePrice'), 0.0)
-        if future_mult <= 0 or delivery_price <= 0:
-            review_items.append(_future_assignment_review(
-                assignment, 'future_assignment_delivery_terms_missing',
-                expected_raw, assignment_qty, future))
-            continue
-
-        lots = []
-        for lot in closed_lots or []:
-            lot_date = parse_date(
-                lot.get('reportDate') or lot.get('dateTime'))
-            lot_qty_signed = safe_float(lot.get('quantity'), 0.0)
-            direction_ok = (
-                lot_qty_signed > 0 if assignment.get('putCall') == 'P'
-                else lot_qty_signed < 0
-            )
-            if (lot.get('assetCategory') != 'FUT'
-                    or not lot_date or lot_date.year != tax_year
-                    or normalize_ibkr_datetime(
-                        lot.get('openDateTime') or '') != assignment_ts
-                    or lot.get('buySell') != expected_close_side
-                    or not direction_ok
-                    or not _future_assignment_row_matches(future, lot)
-                    or not _future_delivery_lot_transaction_matches(
-                        future, lot)):
-                continue
-            lot_mult = safe_float(lot.get('multiplier'), 0.0)
-            if (lot_mult <= 0
-                    or abs(lot_mult - future_mult) > epsilon):
-                continue
-            lots.append(lot)
-
-        lots.sort(key=lambda lot: normalize_ibkr_datetime(
-            lot.get('dateTime') or lot.get('reportDate') or ''))
-        remaining_assignment_qty = assignment_qty
-        for lot in lots:
-            if remaining_assignment_qty <= epsilon:
-                break
-            lot_qty_total = abs(safe_float(lot.get('quantity'), 0.0))
-            available_qty = max(
-                0.0, lot_qty_total - claimed_lot_qty[id(lot)])
-            if available_qty <= epsilon:
-                continue
-            lot_qty = min(available_qty, remaining_assignment_qty)
-            notional = delivery_price * future_mult * lot_qty
-            lot_cost = abs(safe_float(lot.get('cost'), 0.0))
-            if lot_qty < lot_qty_total and lot_qty_total > 0:
-                lot_cost *= lot_qty / lot_qty_total
-            if assignment.get('putCall') == 'P':
-                observed_raw = notional - lot_cost
-            else:
-                observed_raw = lot_cost - notional
-            expected_slice = expected_raw * lot_qty / assignment_qty
-            if (observed_raw <= 0.01
-                    or not _future_assignment_values_close(
-                        observed_raw, expected_slice)):
-                review_items.append(_future_assignment_review(
-                    assignment, 'future_assignment_lot_basis_mismatch',
-                    expected_slice, lot_qty, future))
-                continue
-
-            close_ts = normalize_ibkr_datetime(
-                lot.get('dateTime') or lot.get('reportDate') or '')
-            targets = []
-            for target in trades:
-                target_report_date = parse_date(
-                    target.get('reportDate')
-                    or target.get('dateTime')
-                    or target.get('tradeDate'))
-                if (target.get('assetCategory') != 'FUT'
-                        or not target_report_date
-                        or target_report_date.year != tax_year
-                        or target.get('buySell') != expected_close_side
-                        or normalize_ibkr_datetime(
-                            target.get('dateTime') or '') != close_ts
-                        or not _future_assignment_row_matches(future, target)):
-                    continue
-                target_mult = safe_float(target.get('multiplier'), 0.0)
-                if (target_mult <= 0
-                        or abs(target_mult - future_mult) > epsilon):
-                    continue
-                target_qty = abs(safe_float(target.get('quantity'), 0.0))
-                if target_qty - claimed_target_qty[id(target)] + epsilon < lot_qty:
-                    continue
-                targets.append(target)
-            if len(targets) > 1:
-                cost_targets = [
-                    target for target in targets
-                    if _future_assignment_values_close(
-                        abs(safe_float(target.get('cost'), 0.0)), lot_cost)
-                ]
-                if len(cost_targets) == 1:
-                    targets = cost_targets
-            if len(targets) != 1:
-                review_items.append(_future_assignment_review(
-                    assignment, 'future_assignment_close_missing_or_ambiguous',
-                    expected_slice, lot_qty, future))
-                continue
-
-            target = targets[0]
-            claimed_lot_qty[id(lot)] += lot_qty
-            claimed_target_qty[id(target)] += lot_qty
-            remaining_assignment_qty -= lot_qty
-            record_adjustment(
-                target, observed_raw, observed_raw, assignment, future,
-                'deferred_close', lot_qty)
-
-        unproven_qty = min(
-            remaining_assignment_qty,
-            unproven_current_realization_qty(
-                future, assignment_ts, expected_close_side),
-        )
-        if unproven_qty > epsilon:
-            review_items.append(_future_assignment_review(
-                assignment, 'future_assignment_close_unproven',
-                expected_raw * unproven_qty / assignment_qty,
-                unproven_qty, future))
-
-    return adjustments, audit_details, review_items
+    return ctx.adjustments, ctx.audit_details, ctx.review_items
 
 
 def _collect_option_assignments(trades, tax_year):

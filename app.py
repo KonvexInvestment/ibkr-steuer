@@ -2032,10 +2032,15 @@ def build_plausibility(d, toggles):
                        "Optionen auf Futures", "Anleihen", "Treasury Bills"]
     zufluss_adj = (audit.get('zufluss_premium_eur', 0)
                    - audit.get('prior_zufluss_correction_eur', 0))
+    # Future-Optionen: die Praemie wurde aus dem FUT-PnL herausgerechnet,
+    # IBKRs Kategoriesumme enthaelt sie noch. Analog zum Aktien-Addback oben.
+    future_addback = sum(
+        float(item.get('amount_eur') or 0)
+        for item in audit.get('future_assignment_corrections', []) or [])
     our_topf2_gain = (d.get('options_gain_eur', 0)
                       - audit.get('stillhalter_premium_eur', 0)
                       - d.get('fx_total_gain', 0) - no_invstg_gain
-                      - zufluss_adj)
+                      - zufluss_adj + future_addback)
     our_topf2_loss = (d.get('options_loss_eur', 0)
                       - d.get('fx_total_loss', 0) - no_invstg_loss)
     ibkr_topf2_gain = sum(
@@ -2321,6 +2326,17 @@ zufluss_details = audit.get('zufluss_details', [])
 zufluss_premium = audit.get('zufluss_premium_eur', 0)
 prior_zufluss_details = audit.get('prior_zufluss_details', [])
 prior_zufluss_correction = audit.get('prior_zufluss_correction_eur', 0)
+# Future-Optionen (FOP/FSFOP): Praemie separat in Topf 2, Gegenkorrektur am
+# realisierten Future-Ergebnis (audit['future_assignment_corrections']).
+future_option_details = [
+    det for det in audit.get('stillhalter_details', [])
+    if det.get('assetCategory') in ('FOP', 'FSFOP')
+]
+future_option_premium_eur = sum(
+    float(det.get('premium_eur') or 0) for det in future_option_details)
+future_assignment_corrections = audit.get('future_assignment_corrections', []) or []
+future_correction_eur = sum(
+    float(c.get('amount_eur') or 0) for c in future_assignment_corrections)
 
 fx_corr_total = d.get('fx_correction_total', 0)
 tk_gain_adj = d.get('fx_corr_gain_adj', {}) or {}
@@ -3624,6 +3640,66 @@ def _render_transparency_details():
             for item in open_short:
                 st.markdown(f"- {esc(item)}")
 
+    if future_assignment_corrections:
+        with st.expander(
+                f"Future-Optionen · {len(future_assignment_corrections)} "
+                f"Andienungskorrektur(en), {fmt_de(future_correction_eur)} EUR",
+                expanded=False):
+            st.caption(
+                "IBKR bettet die Stillhalterprämie einer angedienten "
+                "Future-Option in die Kostenbasis des gelieferten Futures ein. "
+                "Die Prämie steht bereits als Stillhaltereinkunft in Topf 2; "
+                "deshalb wird das realisierte Future-Ergebnis um genau diesen "
+                "Betrag bereinigt (Kostenbasis zurück auf den Strike, "
+                "Andienungsgebühren bleiben Anschaffungsnebenkosten des "
+                "Futures). Beide Buchungen liegen in Topf 2; ohne die "
+                "Korrektur wäre die Prämie dort doppelt enthalten."
+            )
+            mode_labels = {
+                'deferred_close': 'späterer Close (CLOSED_LOT)',
+                'direct_close': 'sofortiger Close',
+            }
+            fut_table = (
+                "| Option | Future | Andienung | Realisierung | Art | "
+                "Kontrakte | Bereinigung (EUR) |\n"
+                "|--------|--------|-----------|--------------|-----|"
+                "----------:|------------------:|\n")
+            for c in future_assignment_corrections:
+                mode = c.get('mode', '')
+                fut_table += (
+                    f"| {esc(str(c.get('assignment_symbol', '')))} | "
+                    f"{esc(str(c.get('future_symbol', '')))} | "
+                    f"{esc(str(c.get('assignment_date', ''))[:10])} | "
+                    f"{esc(str(c.get('realization_date', ''))[:10])} | "
+                    f"{esc(mode_labels.get(mode, str(mode)))} | "
+                    f"{float(c.get('quantity') or 0):g} | "
+                    f"{fmt_de(float(c.get('amount_eur') or 0))} |\n")
+            st.markdown(fut_table)
+
+    dropped_corrections = audit.get('stillhalter_corrections_dropped', [])
+    if dropped_corrections:
+        with st.expander(
+                f"Nicht zuordenbare Stillhalter-Korrekturen · "
+                f"{len(dropped_corrections)}",
+                expanded=False):
+            st.caption(
+                "Für diese Andienungen konnte die Prämie nicht belegbar aus "
+                "dem Ergebnis des Basiswerts herausgerechnet werden. Es wurde "
+                "bewusst nichts korrigiert; die Prämie kann dort doppelt "
+                "enthalten sein. Trade-Details prüfen."
+            )
+            drop_table = (
+                "| Basiswert | Andienung | Menge | Betrag (roh) | Grund |\n"
+                "|-----------|-----------|------:|-------------:|-------|\n")
+            for item in dropped_corrections:
+                drop_table += (
+                    f"| {esc(str(item.get('underlying', '')))} | "
+                    f"{esc(str(item.get('assignment_date', ''))[:10])} | "
+                    f"{float(item.get('leftover_shares') or 0):g} | "
+                    f"{fmt_de(float(item.get('leftover_raw') or 0))} | "
+                    f"{esc(calculate_tax_report.get_stillhalter_review_reason_label(item.get('reason')))} |\n")
+            st.markdown(drop_table)
+
 
 def _render_stillhalter_zufluss():
     if not (cross_year_details or zufluss_details or prior_zufluss_details):
@@ -4084,10 +4160,11 @@ Wird eine verkaufte Option (Stillhalterposition) ausgeübt (Assignment), muss di
 
 - **Prämie** = laufende Einnahmen nach §20 Abs. 1 Nr. 11 → gehört in **Topf 2**
 - **Aktientransaktion** = Veräußerung (Call, Rn. 26) bzw. Anschaffung (Put, Rn. 33) nach §20 Abs. 2 → gehört in **Topf 1**
+- **Future-Optionen (FOP/FSFOP)** = der gelieferte Future ist ein Termingeschäft nach §20 Abs. 2 S. 1 Nr. 3 EStG → bleibt in **Topf 2**. IBKR bettet die Prämie in die Kostenbasis des Futures ein; das Tool rechnet sie beim Close des Futures (auch jahresübergreifend) wieder heraus, damit sie nur einmal in Topf 2 steht. Andienungsgebühren bleiben Anschaffungsnebenkosten des Futures. Ohne lückenlose Belegkette (Optionsverkauf, Lieferung, CLOSED_LOT, Close) erfolgt keine Korrektur, sondern ein Prüffall.
 
-Bei **beiden** Assignment-Typen gilt laut BMF: „Die vereinnahmte Optionsprämie wird bei der Ermittlung des Veräußerungsgewinns **nicht berücksichtigt**." IBKR bündelt die Prämie jedoch im Aktien-Trade (Call: im Verkaufserlös, Put: in den reduzierten Anschaffungskosten). Dieses Tool erkennt Assignments automatisch und trennt die Prämie heraus.
+Bei **beiden** Assignment-Typen gilt laut BMF: „Die vereinnahmte Optionsprämie wird bei der Ermittlung des Veräußerungsgewinns **nicht berücksichtigt**." IBKR bündelt die Prämie jedoch im Trade des Basiswerts (Call: im Verkaufserlös, Put: in den reduzierten Anschaffungskosten). Dieses Tool erkennt Assignments automatisch und trennt die Prämie heraus.
 
-{"**In diesem Report:** " + str(sh_count) + " Assignments erkannt (Call + Put), " + fmt_de(sh_eur) + " EUR Stillhalterprämien von Topf 1 nach Topf 2 verschoben." if sh_count > 0 else "**In diesem Report:** Keine Assignments erkannt."}
+{"**In diesem Report:** " + str(sh_count) + " Assignments erkannt (Call + Put), " + fmt_de(sh_eur) + " EUR Stillhalterprämien separat in Topf 2 erfasst" + (" (davon " + str(len(future_option_details)) + " Future-Option(en) mit " + fmt_de(future_option_premium_eur) + " EUR; Future-Ergebnis um " + fmt_de(future_correction_eur) + " EUR bereinigt)" if future_option_details else "") + "." if sh_count > 0 else "**In diesem Report:** Keine Assignments erkannt."}
 
 ---
 
@@ -4252,6 +4329,8 @@ Jede Teilfüllung wird einzeln umgerechnet. Ein gewichteter Durchschnittskurs w�
 **Topf-Umbuchung:**
 - `stocks_gain -= Prämie` (aus Topf 1 entfernen)
 - `options_gain += Prämie` (in Topf 2 als §20 Abs. 1 Nr. 11)
+
+**Future-Optionen (FOP/FSFOP):** Die Gegenkorrektur läuft nicht über Aktien-Lots, sondern über den gelieferten Future: FUT-BookTrade mit identischem Zeitstempel, `conid`, Menge und Multiplikator, Lieferpreis = Strike. Beim späteren Close wird das CLOSED_LOT gegen die Strike-Basis geprüft; nur bei exakter Übereinstimmung (Toleranz 0,05 in Kontraktwährung) wird der Future-PnL um die Netto-Prämie bereinigt und die Kostenbasis auf Strike plus Andienungsgebühr gesetzt. Jede Abweichung wird als Prüffall gemeldet, nicht korrigiert.
 
 **Cross-Year:** Wenn die Option in einem Vorjahr verkauft wurde und im Steuerjahr assigned wird, gehört die Prämie ins Vorjahr (Zuflussprinzip). Vorjahres-XMLs müssen mit hochgeladen werden (beim Start oder über "Daten ändern" in der Sidebar), damit der Original-SELL gefunden wird. Findet das Tool zu einer Andienung im Steuerjahr keinen Original-Verkauf (fehlendes oder lückenhaftes Vorjahres-XML), erscheint eine Stillhalter-Warnung mit den betroffenen Serien; die Prämie bleibt dann unkorrigiert im Aktien-Ergebnis. Fehlt der Original-Verkauf bei einer noch älteren Put-Andienung, wird nur dann ein separater Prüffall angezeigt, wenn das daraus entstandene Aktien-Lot tatsächlich im Steuerjahr veräußert wurde.
 
@@ -4821,7 +4900,20 @@ def _build_text_report():
         sh_export = f"\nSTILLHALTERPRÄMIEN (BMF Rn. 25-35)\n"
         sh_export += f"  {sh_count} Assignment(s) erkannt\n"
         sh_export += f"  Prämien umgebucht:     {fmt_de(sh_eur):>14} EUR\n"
-        sh_export += f"  (Von Topf 1 nach Topf 2 verschoben)\n"
+        if future_option_details:
+            sh_export += ("  (Aktien: aus Topf 1 herausgelöst; Future-Optionen: "
+                          "aus dem Future-Ergebnis, beides Topf 2)\n")
+            sh_export += (
+                f"  davon Future-Optionen: {len(future_option_details)} Andienung(en), "
+                f"{fmt_de(future_option_premium_eur)} EUR Prämie separat in Topf 2\n")
+        else:
+            sh_export += f"  (Von Topf 1 nach Topf 2 verschoben)\n"
+        if future_assignment_corrections:
+            sh_export += (
+                f"  Future-Ergebnis bereinigt: {fmt_de(-future_correction_eur):>10} EUR "
+                f"({len(future_assignment_corrections)} Korrektur(en); die Prämie war in der "
+                "Future-Kostenbasis eingebettet, Andienungsgebühren bleiben Anschaffungsnebenkosten)\n")
+
 
     inv_export = ""
     kap_inv_entries_export = ""
