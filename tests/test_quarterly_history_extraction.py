@@ -417,6 +417,124 @@ def test_quarterly_fx_totals_match_single_and_history_paths():
         assert all(r == reports[0] for r in reports), reports
 
 
+def test_history_trade_merge_preserves_multiplicity_across_repeated_exports():
+    """F3b: max. Vorkommenszahl je Vollzeile, nicht ein Fill je Composite-Key."""
+    from calculate_tax_report import _dedupe_trades
+
+    fill = '''<Trade dateTime="2024-05-06 10:00:00" assetCategory="STK"
+        isin="US0000000001" buySell="SELL" quantity="-100"
+        closePrice="60" fifoPnlRealized="-129" ibCommission="-1" />'''
+    variant = fill.replace('ibCommission="-1"', 'ibCommission="-2"')
+    identified = fill.replace('<Trade ', '<Trade tradeID="KNOWN" ')
+    with tempfile.TemporaryDirectory() as tmp:
+        main = write_xml(tmp, 'main.xml', '2025-01-01', '2025-12-31',
+                         '<Trades><Trade tradeID="CURRENT" '
+                         'dateTime="2025-02-03 10:00:00" /></Trades>')
+        shorter = write_xml(tmp, 'shorter.xml', '2024-01-01', '2024-06-30',
+                            '<Trades>' + fill * 2 + identified + '</Trades>')
+        full = write_xml(tmp, 'full.xml', '2024-01-01', '2024-12-31',
+                         '<Trades>' + fill * 3 + variant + identified + '</Trades>')
+        # CSV-Hilfsfelder, leere XML-Attribute und normalisierte Datumsformate
+        # duerfen aus einer wiederholten Zeile keinen zusaetzlichen Fill machen.
+        repeated = write_xml(tmp, 'repeated.xml', '20240101', '20241231',
+                             '<Trades>' + fill.replace(
+                                 '2024-05-06 10:00:00', '20240506;100000').replace(
+                                 '<Trade ', '<Trade symbol="" ') * 3
+                             + variant + identified + '</Trades>')
+        out = os.path.join(tmp, 'out')
+        os.mkdir(out)
+        with contextlib.redirect_stdout(io.StringIO()):
+            extract_fx_multi_xml([main, repeated, full, shorter, full], out)
+        rows = read_csv(os.path.join(out, 'trades.csv'))
+        anonymous = [r for r in rows if not r.get('tradeID')]
+        assert len(anonymous) == 4, anonymous
+        assert Counter(r['ibCommission'] for r in anonymous) == {'-1': 3, '-2': 1}
+        assert len(rows) == 6
+        trades, duplicates = _dedupe_trades(rows)
+        assert len(trades) == 6 and duplicates == 0
+
+
+def test_anonymous_trade_totals_match_single_quarterly_and_history_paths():
+    """F3b: drei identische ETF-Fills erreichen Rechnung und Formularwerte."""
+    from calculate_tax_report import calculate_tax
+    from run_tests import compute_user_facing
+
+    fill = '''<Trade accountId="U123" assetCategory="STK" subCategory="ETF"
+        isin="US9219468850" currency="USD" dateTime="2025-03-03 10:00:00"
+        buySell="SELL" openClose="C" quantity="-100" closePrice="60.37"
+        fifoPnlRealized="-129.014815" fxRateToBase="0.91973"
+        transactionType="ExchTrade" multiplier="1" />'''
+    with tempfile.TemporaryDirectory() as tmp:
+        annual = write_xml(tmp, 'annual.xml', '2025-01-01', '2025-12-31',
+                           '<Trades>' + fill * 3 + '</Trades>')
+        q1 = write_xml(tmp, 'q1.xml', '2025-01-01', '2025-03-31',
+                       '<Trades>' + fill * 3 + '</Trades>')
+        q2 = write_xml(tmp, 'q2.xml', '2025-04-01', '2025-12-31', '')
+        history = write_xml(tmp, 'history.xml', '2024-01-01', '2024-12-31',
+                            '<Trades>' + fill.replace('2025-03-03', '2024-03-03') * 3
+                            + '</Trades>')
+        reports = []
+        for mode, paths in [('single', [annual]), ('quarters', [q1, q2]),
+                            ('history', [history, annual]),
+                            ('quarter_history', [history, q1, q2])]:
+            out = os.path.join(tmp, mode)
+            os.mkdir(out)
+            with contextlib.redirect_stdout(io.StringIO()):
+                if mode == 'single':
+                    parse_ibkr_xml(paths[0], out)
+                elif mode == 'quarters':
+                    extract_quarterly_xmls(paths, out)
+                else:
+                    extract_fx_multi_xml(paths, out)
+                report = calculate_tax(out)
+            expected_loss = 3 * -129.014815 * 0.91973
+            fund = report['kap_inv']['etf_by_isin']['US9219468850']
+            assert abs(fund['loss'] - expected_loss) < 1e-9, (mode, fund)
+            assert len(report['trade_details']) == 3, mode
+            detail, = report['kap_inv_form']['details']
+            assert detail['sale_line'] == 26
+            assert abs(detail['sale_raw_eur'] - expected_loss) < 1e-9
+            final = compute_user_facing(report)
+            assert abs(final['etf_net_taxable'] - expected_loss) < 1e-9
+            reports.append(final)
+        assert all(r == reports[0] for r in reports), reports
+
+
+def test_anonymous_history_fills_keep_full_prior_year_premium():
+    """Drei Vorjahrespraemien genau einmal, auch bei wiederholter History."""
+    from calculate_tax_report import calculate_tax
+    from run_tests import compute_user_facing
+
+    opening = '''<Trade accountId="U123" assetCategory="OPT" conid="123"
+        underlyingSymbol="SYN" symbol="SYN 100 P" strike="100" putCall="P"
+        expiry="2025-12-19" currency="EUR" dateTime="2024-12-20 10:00:00"
+        buySell="SELL" openClose="O" quantity="-1" tradePrice="2"
+        closePrice="2" fifoPnlRealized="0" fxRateToBase="1"
+        ibCommission="-1" transactionType="ExchTrade" multiplier="100" />'''
+    closing = opening.replace('2024-12-20', '2025-01-10').replace(
+        'buySell="SELL" openClose="O" quantity="-1"',
+        'buySell="BUY" openClose="C" quantity="3"').replace(
+        'tradePrice="2"', 'tradePrice="1"').replace(
+        'fifoPnlRealized="0"', 'fifoPnlRealized="297"').replace(
+        'ibCommission="-1"', 'ibCommission="0"')
+    with tempfile.TemporaryDirectory() as tmp:
+        history = write_xml(tmp, 'history.xml', '2024-01-01', '2024-12-31',
+                            '<Trades>' + opening * 3 + '</Trades>')
+        main = write_xml(tmp, 'main.xml', '2025-01-01', '2025-12-31',
+                         '<Trades>' + closing + '</Trades>')
+        out = os.path.join(tmp, 'out')
+        os.mkdir(out)
+        with contextlib.redirect_stdout(io.StringIO()):
+            extract_fx_multi_xml([main, history, history], out)
+            report = calculate_tax(out)
+        # 3 * (2 EUR * 100 - 1 EUR Gebuehr) = 597 EUR Vorjahrespraemie.
+        # IBKR-PnL 297 EUR - 597 EUR = -300 EUR Glattstellung im Steuerjahr.
+        assert len(read_csv(os.path.join(out, 'trades.csv'))) == 4
+        assert report['audit']['prior_zufluss_correction_eur'] == 597
+        assert compute_user_facing(report)['zeile_19'] == -300
+        assert not report['audit']['zufluss_unmatched']
+
+
 def test_parse_ibkr_xml_rejects_malformed_xml():
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "malformed.xml")
@@ -464,6 +582,12 @@ if __name__ == "__main__":
     print("OK: F4 PnL-Summary trennt ISIN, conid und Waehrung")
     test_quarterly_fx_totals_match_single_and_history_paths()
     print("OK: F4 Steuerwerte identisch bei Einzel-, Quartals- und History-Import")
+    test_history_trade_merge_preserves_multiplicity_across_repeated_exports()
+    print("OK: F3b History behaelt echte Fills ohne Dateiduplikate")
+    test_anonymous_trade_totals_match_single_quarterly_and_history_paths()
+    print("OK: F3b alle Ausfuehrungen erreichen KAP-INV in jedem Importpfad")
+    test_anonymous_history_fills_keep_full_prior_year_premium()
+    print("OK: F3b Vorjahrespraemien aus identischen Fills vollstaendig und einmalig")
     test_parse_ibkr_xml_rejects_malformed_xml()
     print("OK: kaputtes XML wird sichtbar abgewiesen")
     test_parse_ibkr_xml_rejects_non_flex_xml()

@@ -28,7 +28,7 @@ import calculate_tax_report
 
 # Bump when the snapshot payload layout changes; stale session_state snapshots
 # from an older code version are then recomputed instead of rendered.
-SCHEMA_VERSION = 3  # F2: Teilbericht mit explizit ungeklaerter Konto-FX-Sektion.
+SCHEMA_VERSION = 4  # F3b: alte Snapshots mit verlorenen Trade-Fills neu berechnen.
 # Bump when the view-model/export layout changes (part of the view key).
 VIEW_SCHEMA_VERSION = 1
 

@@ -36,15 +36,30 @@ def test_trades_partial_fills_with_same_attributes_survive():
     print("  OK  Trades: Partial Fills mit eigenen tradeIDs bleiben erhalten")
 
 
-def test_trades_composite_key_fallback_without_trade_id():
-    """Ohne tradeID greift der Composite-Key (Basis-Flex-Query)."""
+def test_trades_without_trade_id_preserve_every_fill():
+    """F3b: Gleiche Attribute belegen ohne tradeID kein Duplikat."""
     fill = {'tradeID': '', 'dateTime': '2025-03-03 15:30:00',
             'isin': 'US0000000001', 'buySell': 'BUY', 'quantity': '5',
             'closePrice': '100', 'fifoPnlRealized': '0'}
     other = dict(fill, quantity='7')
-    trades, dups = _dedupe_trades([fill, dict(fill), other])
-    assert len(trades) == 2 and dups == 1
-    print("  OK  Trades: Composite-Key-Fallback ohne tradeID")
+    rows = [fill, dict(fill), dict(fill), other,
+            dict(fill, ibCommission='-2')]
+    trades, dups = _dedupe_trades(rows)
+    assert len(trades) == 5 and dups == 0
+    assert all(actual is original for actual, original in zip(trades, rows))
+    print("  OK  Trades: alle Fills ohne tradeID bleiben erhalten")
+
+
+def test_trades_missing_and_blank_ids_are_not_identities():
+    rows = [{'quantity': '1'}, {'quantity': '1', 'tradeID': None},
+            {'quantity': '1', 'tradeID': '  '},
+            {'quantity': '1', 'tradeID': ' T1 '},
+            {'quantity': '1', 'tradeID': 'T1'}]
+    snapshot = [dict(row) for row in rows]
+    trades, dups = _dedupe_trades(rows)
+    assert trades == rows[:4] and dups == 1
+    assert rows == snapshot
+    print("  OK  Trades: nur belegte tradeID entfernt eine Wiederholung")
 
 
 def test_funds_dedupe_key_includes_activity_description():
@@ -88,7 +103,8 @@ if __name__ == '__main__':
     print("Trade-/Funds-Dedupe (reine Kerne)")
     test_trades_dedupe_by_trade_id()
     test_trades_partial_fills_with_same_attributes_survive()
-    test_trades_composite_key_fallback_without_trade_id()
+    test_trades_without_trade_id_preserve_every_fill()
+    test_trades_missing_and_blank_ids_are_not_identities()
     test_funds_dedupe_key_includes_activity_description()
     test_funds_without_transaction_id_use_full_row()
     test_inputs_not_mutated()

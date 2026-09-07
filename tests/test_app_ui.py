@@ -421,6 +421,38 @@ def test_mixed_valid_and_non_flex_xml_is_a_hard_error():
         "Keine ausgewählte XML darf still aus dem Steuerreport fallen"
 
 
+def test_anonymous_fills_reach_ui_and_exports():
+    """F3b: identische Ausfuehrungen bleiben bis zur KAP-INV-Ausgabe erhalten."""
+    import io
+    from openpyxl import load_workbook
+
+    fill = '''<Trade accountId="U123" assetCategory="STK" subCategory="ETF"
+        isin="US9219468850" currency="USD" dateTime="2025-03-03 10:00:00"
+        buySell="SELL" openClose="C" quantity="-100" closePrice="60.37"
+        fifoPnlRealized="-129.014815" fxRateToBase="0.91973"
+        transactionType="ExchTrade" multiplier="1" />'''
+    at = run_app(make_dataset([
+        ('fills.xml', make_xml(body='<Trades>' + fill * 3 + '</Trades>')),
+    ]), nav='kap_inv')
+    assert_no_exception(at, 'F3b identische Trade-Fills')
+    report = at.session_state['snapshot']['payload']['merged']
+    assert len(report['trade_details']) == 3
+    assert '355,98' in all_markdown(at)
+    final = ui_model.build_final_values(report, ui_model.default_toggles())
+    assert round(final['etf_net_taxable'], 2) == -355.98
+
+    at.session_state['nav'] = 'export'
+    at.run()
+    assert_no_exception(at, 'F3b korrigierte Exporte')
+    exports = at.session_state['export_cache']
+    assert '355,98' in exports['txt']
+    wb = load_workbook(io.BytesIO(exports['xlsx']))
+    z26 = next(row for row in wb['Zusammenfassung'].values
+               if isinstance(row[1], str) and row[1].startswith('Zeile 26'))
+    assert round(z26[2], 2) == -355.98
+    assert exports['n_details'] == 3
+
+
 def test_multi_statement_xml_is_a_hard_error():
     xml = make_xml()
     start = xml.index('    <FlexStatement')
@@ -545,6 +577,7 @@ if __name__ == '__main__':
         test_fx_currency_guidance_escapes_xml_content,
         test_quarterly_fx_fills_reach_final_values,
         test_mixed_valid_and_non_flex_xml_is_a_hard_error,
+        test_anonymous_fills_reach_ui_and_exports,
         test_multi_statement_xml_is_a_hard_error,
         test_overlapping_periods_are_a_hard_error,
         test_partnership_trade_is_visible_in_export_summary,

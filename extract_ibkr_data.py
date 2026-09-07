@@ -166,15 +166,27 @@ def extract_fx_multi_xml(xml_files, output_dir):
                 existing_headers = set(reader.fieldnames or [])
                 existing_trades = list(reader)
 
-        # Build dedup keys from existing trades
-        def trade_dedup_key(t):
-            trade_id = t.get('tradeID', '')
-            if trade_id:
-                return ('tradeID', trade_id)
-            return (t.get('dateTime', ''), t.get('isin', ''), t.get('buySell', ''),
-                    t.get('quantity', ''), t.get('closePrice', ''), t.get('fifoPnlRealized', ''))
+        def trade_occurrence_keys(rows):
+            # F3b: identische Fills innerhalb einer Datei sind keine Duplikate.
+            # Bei wiederholten Exporten die hoechste Vorkommenszahl behalten.
+            occurrences = Counter()
+            for row in rows:
+                trade_id = (row.get('tradeID') or '').strip()
+                if trade_id:
+                    key = ('tradeID', trade_id)
+                else:
+                    # CSV-Hilfsfeld und durch Header-Union entstandene Leerwerte
+                    # gehoeren nicht zur Identitaet der XML-Trade-Zeile.
+                    fingerprint = tuple(sorted(
+                        (field, value) for field, value in row.items()
+                        if field not in ('__source_section__', 'tradeID')
+                        and value not in ('', None)
+                    ))
+                    occurrences[fingerprint] += 1
+                    key = ('row', fingerprint, occurrences[fingerprint])
+                yield row, key
 
-        existing_keys = {trade_dedup_key(t) for t in existing_trades}
+        existing_keys = {key for _, key in trade_occurrence_keys(existing_trades)}
         added_history_trades = 0
 
         for xml_path in history_xmls:
@@ -183,8 +195,7 @@ def extract_fx_multi_xml(xml_files, output_dir):
                 r = t.getroot()
                 rows, hdrs = extract_trades_from_root(r)
                 existing_headers.update(hdrs)
-                for row in rows:
-                    key = trade_dedup_key(row)
+                for row, key in trade_occurrence_keys(rows):
                     if key not in existing_keys:
                         existing_keys.add(key)
                         row['__source_section__'] = 'Trades'

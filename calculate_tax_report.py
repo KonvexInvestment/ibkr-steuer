@@ -3918,32 +3918,21 @@ def _write_trades_debug_csv(debug_rows, ib_tax_dir):
 def _dedupe_trades(all_trades):
     """Dedupliziert Trade-Rows.
 
-    Key ist primaer tradeID (extended Flex Query) — verhindert falsches
-    Deduplizieren von Partial-Fills mit identischen Attributen. Fallback ohne
-    tradeID: Composite-Key aus dateTime/isin/buySell/quantity/closePrice/
-    fifoPnlRealized. Reine Funktion: mutiert nichts, liefert
-    (trades, duplicates_count).
+    Nur eine nichtleere tradeID belegt eine Wiederholung. Ohne ID bleiben
+    alle Fills erhalten, auch bei identischen Attributen. Dateiuebergreifende
+    Wiederholungen behandelt bereits die Extraktion mit Vorkommenszaehlern.
+    Reine Funktion: mutiert nichts, liefert (trades, duplicates_count).
     """
     unique_trades_set = set()
     trades = []
     duplicates_count = 0
     for t in all_trades:
-        trade_id = t.get('tradeID', '').strip()
-        if trade_id:
-            key = (trade_id,)
-        else:
-            key = (
-                t.get('dateTime'),
-                t.get('isin'),
-                t.get('buySell'),
-                t.get('quantity'),
-                t.get('closePrice'),
-                t.get('fifoPnlRealized')
-            )
-        if key in unique_trades_set:
+        trade_id = (t.get('tradeID') or '').strip()
+        if trade_id and trade_id in unique_trades_set:
             duplicates_count += 1
             continue
-        unique_trades_set.add(key)
+        if trade_id:
+            unique_trades_set.add(trade_id)
         trades.append(t)
     return trades, duplicates_count
 
