@@ -2263,7 +2263,7 @@ with _toggle_slot:
             "Tageskurs-Methode "
             f"({'+' if _fx_corr_total >= 0 else ''}{fmt_de(_fx_corr_total)} EUR)",
             "Rechnet Erlöse und Anschaffungskosten jeweils zum FX-Kurs ihres "
-            "eigenen Datums um (§20 Abs. 4 S. 1 EStG) statt den Netto-PnL "
+            "eigenen Handelstags um (§20 Abs. 4 S. 1 EStG) statt den Netto-PnL "
             "zum Schlusskurs. Benötigt CLOSED_LOT-Daten der Flex Query.",
             "ersetzt für betroffene Geschäfte die IBKR-Schlusskursumrechnung; "
             f"erkannte Gesamtdifferenz in diesem Bericht: "
@@ -4320,7 +4320,7 @@ Tageskurs-Methode: PnL (EUR) = Erlös × FX_Verkaufstag − AK × FX_Kauftag
 
 **IBKR-Methode (Standard):** Rechnet den Netto-PnL komplett zum Schlusskurs um.
 
-**Tageskurs-Methode (§20 Abs. 4 S. 1 EStG, optional):** *"Bei nicht in Euro getätigten Geschäften sind die Einnahmen im Zeitpunkt der Veräußerung und die Anschaffungskosten im Zeitpunkt der Anschaffung in Euro umzurechnen."* Verwendet die CLOSED_LOT-Zeilen der Flex Query (Trades, Levels of Detail: Closed Lots). Korrigiert werden alle Lots in einer Fremdwährung (USD, CHF, GBP, JPY, HKD usw.), jede Währung mit ihrer eigenen Kursreihe. Futures werden ausgeschlossen (Kostenbasis = Notional, kein realer Cashflow), ebenso angediente oder ausgeübte Optionen (die Prämie ist bereits zum Kurs des Verkaufstags erfasst). Korrektur: `AK × (FX_Schlusskurs - FX_Kaufkurs)` pro Lot; AK ist vorzeichenbehaftet (Long positiv, Short negativ), dadurch kehrt sich die Richtung bei Short-Positionen automatisch um. Kursquelle bei EUR-Basiskonten: IBKRs Tageskurs der jeweiligen Währung (`ConversionRate`). Fehlt er im Export, dient das Tagesmittel der `fxRateToBase`-Kurse der Trades als Ersatz: der Intraday-Kurs der ExchTrades, an reinen Verfall-/Andienungstagen der Settlement-Kurs der BookTrades (16:20). Bei USD-Basiskonten: Kurs der Währung zu USD × USD/EUR-Tageskurs. Liegt der Kauf vor dem Zeitraum des Exports, wird der früheste verfügbare Kurs verwendet; für exakte Werte das XML des Vorjahres mit hochladen.
+**Tageskurs-Methode (§20 Abs. 4 S. 1 EStG, optional):** *"Bei nicht in Euro getätigten Geschäften sind die Einnahmen im Zeitpunkt der Veräußerung und die Anschaffungskosten im Zeitpunkt der Anschaffung in Euro umzurechnen."* Verwendet die CLOSED_LOT-Zeilen der Flex Query (Trades, Levels of Detail: Closed Lots). Korrigiert werden alle Lots in einer Fremdwährung (USD, CHF, GBP, JPY, HKD usw.), jede Währung mit ihrer eigenen Kursreihe. Futures werden ausgeschlossen (Kostenbasis = Notional, kein realer Cashflow), ebenso angediente oder ausgeübte Optionen (die Prämie ist bereits zum Kurs des Verkaufstags erfasst). Korrektur: `AK × (FX_Schlusskurs - FX_Kaufkurs)` pro Lot; AK ist vorzeichenbehaftet (Long positiv, Short negativ), dadurch kehrt sich die Richtung bei Short-Positionen automatisch um. Kursquelle bei EUR-Basiskonten: IBKRs Tageskurs der jeweiligen Währung (`ConversionRate`). Fehlt er im Export, dient das Tagesmittel der `fxRateToBase`-Kurse der Trades als Ersatz: der Intraday-Kurs der ExchTrades, an reinen Verfall-/Andienungstagen der Settlement-Kurs der BookTrades (16:20). Bei USD-Basiskonten: Kurs der Währung zu USD × USD/EUR-Tageskurs. Stichtag ist jeweils der Handelstag von Kauf und Verkauf (IBKR `tradeDate`), nicht das Kalenderdatum des IBKR-Zeitstempels in US-Ostküstenzeit: Käufe an asiatischen Börsen und im US-Nachthandel fallen dort auf den Vorabend. Liegt der Kauf vor dem Zeitraum des Exports, wird der früheste verfügbare Kurs verwendet; für exakte Werte das XML des Vorjahres mit hochladen.
 
 | Feld | Bedeutung |
 |---|---|
@@ -4497,7 +4497,7 @@ Vorabpauschalen ausdrücklich noch nicht final.
 ```
 Korrektur = Σ Anschaffungskosten × (FX_Verkauf − FX_Kauf) pro CLOSED_LOT
 Anschaffungskosten vorzeichenbehaftet (Long positiv, Short negativ);
-jede Fremdwährung mit eigener Tageskursreihe.
+jede Fremdwährung mit eigener Tageskursreihe, Stichtag = Handelstag.
 Futures und angediente Optionen ausgeschlossen.
 Wird auf Topf 1, Topf 2 und KAP-INV aufgeteilt. In die KAP-INV-Formularzeile
 fließt das rohe Delta; das teilfreigestellte Delta dient nur der Kontrollrechnung.
@@ -5193,13 +5193,16 @@ def _build_export_trade_details():
                 continue
             underlying = (lot.get('underlyingSymbol', '')
                           or lot.get('symbol', '') or '').split()[0]
-            open_dt = (lot.get('openDateTime', '') or '')[:10]
+            open_dt = (lot.get('fx_open_date')
+                       or (lot.get('openDateTime', '') or '')[:10])
             close_dt = lot.get('reportDate', '')
             delta_eur = lot['delta_eur']
             # .6g statt .5f: JPY-, TWD- oder KRW-Kurse liegen weit unter 0,01
             # und waeren mit fuenf Nachkommastellen nicht nachrechenbar.
-            note = (f'Tageskurs-Korrektur (Kauf {open_dt}, Kurs '
-                    f'{lot["fx_open"]:.6g} → {lot["fx_close"]:.6g})')
+            sale_dt = lot.get('fx_close_date') or close_dt
+            note = (f'Tageskurs-Korrektur (Kauf {open_dt}, Verkauf '
+                    f'{sale_dt}, Kurs {lot["fx_open"]:.6g} → '
+                    f'{lot["fx_close"]:.6g})')
             if lot.get('invstg_basis_adjustment_raw', 0) > 0:
                 note += (' · KAP-INV-AK inkl. zusätzlicher ausländischer '
                          'Basisreduktion (z. B. ROC) auf Put-Strike '

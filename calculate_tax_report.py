@@ -7794,12 +7794,47 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     if rate > 0:
                         conv_rates_by_currency[currency][cr['reportDate']] = rate
 
+        # Rate day = IBKR's tradeDate, not the calendar day of the ET
+        # timestamp: Asian listings and US overnight fills on an ET evening
+        # belong to the next trading day, and IBKR's own fxRateToBase applies
+        # to tradeDate. tradeDate approximates the contract date (BMF Rn. 85);
+        # CME holiday sessions carry the next business day.
+        # (conid, dateTime) resolves to exactly one tradeDate in every real
+        # export. The lot transactionID points at the opening fill; it is
+        # trusted when that fill carries the lot's timestamp (conid change,
+        # e.g. a split) or the same conid on the same ET day (IBKR sometimes
+        # writes a synthetic lot timestamp such as 20:26:00).
+        trade_day_by_fill = {}
+        trade_by_tx = {}
+        for trade in trades:
+            trade_day = (trade.get('tradeDate') or '')[:10]
+            if not trade_day:
+                continue
+            trade_day_by_fill[
+                (trade.get('conid', ''), trade.get('dateTime', ''))
+            ] = trade_day
+            if trade.get('transactionID'):
+                trade_by_tx[trade['transactionID']] = trade
+
+        def lot_trade_day(lot, timestamp, tx_id=''):
+            conid = lot.get('conid', '')
+            day = trade_day_by_fill.get((conid, timestamp)) if conid else None
+            if not day and tx_id:
+                opener = trade_by_tx.get(tx_id)
+                if opener is not None and (
+                        opener.get('dateTime') == timestamp
+                        or (conid and opener.get('conid') == conid
+                            and (opener.get('dateTime') or '')[:10]
+                            == timestamp[:10])):
+                    day = (opener.get('tradeDate') or '')[:10]
+            return day or timestamp[:10]
+
         daily_exch = defaultdict(lambda: defaultdict(list))
         daily_book = defaultdict(lambda: defaultdict(list))
         for trade in trades:
             currency = trade.get('currency', '')
             fx = safe_float(trade.get('fxRateToBase'), 0)
-            dt = (trade.get('dateTime') or '')[:10]
+            dt = (trade.get('tradeDate') or trade.get('dateTime') or '')[:10]
             if not currency or fx <= 0 or not dt:
                 continue
             if base_currency == 'USD':
@@ -7890,11 +7925,15 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             cost_basis_adjustment_raw = 0.0
             invstg_basis_adjustment_raw = 0.0
 
-            # dateTime = actual trade date; reportDate = settlement/booking date.
-            # Use trade date for FX lookup (§20 Abs. 4 S. 1 EStG: "Veräußerungszeitpunkt").
-            # IBKR settles expiries/assignments on the next business day (e.g. Friday→Monday),
-            # but the steuerlich relevant rate is the trade date rate.
-            close_dt = (lot.get('dateTime') or lot.get('reportDate') or '')[:10]
+            # Use the trade date for the FX lookup (§20 Abs. 4 S. 1 EStG:
+            # "Veräußerungszeitpunkt"), resolved from the closing fill.
+            # reportDate is the booking date: IBKR books expiries/assignments
+            # on the next business day (e.g. Friday→Monday).
+            # The CLOSED_LOT row carries the closing tradeDate itself.
+            close_ts = lot.get('dateTime') or ''
+            close_dt = ((lot.get('tradeDate') or '')[:10]
+                        or (lot_trade_day(lot, close_ts) if close_ts
+                            else (lot.get('reportDate') or '')[:10]))
             if (base_currency == 'EUR'
                     and not conv_rates_by_currency.get(currency)):
                 # Fallback: lot rate converts this currency to EUR at close
@@ -7904,7 +7943,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 fx_close = lookup_fx(currency, close_dt)
 
             open_dt = lot.get('openDateTime', '')
-            fx_open = lookup_fx(currency, open_dt)
+            open_fx_day = lot_trade_day(lot, open_dt,
+                                        lot.get('transactionID', ''))
+            fx_open = lookup_fx(currency, open_fx_day)
 
             if fx_close <= 0 or fx_open <= 0:
                 continue
@@ -8028,6 +8069,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 'currency': lot.get('currency', ''),
                 'fx_open': fx_open,
                 'fx_close': fx_close,
+                'fx_open_date': open_fx_day,
+                'fx_close_date': close_dt,
                 'delta_eur': round(delta, 5),
                 'topf': topf,
                 'underlyingSymbol': lot.get('underlyingSymbol', ''),
