@@ -40,7 +40,7 @@ Run the main regression runner:
 python run_tests.py
 ```
 
-Run individual synthetic tests while iterating. At the end of a full run, `run_tests.py` executes every entry of its `SYNTHETIC_TESTS` list (currently 23 test files) as subprocesses — a file in `tests/` that is not registered there will NOT run automatically:
+Run individual synthetic tests while iterating. At the end of a full run, `run_tests.py` executes every entry of its `SYNTHETIC_TESTS` list as subprocesses — a file in `tests/` that is not registered there will NOT run automatically:
 
 ```bash
 python tests/test_cross_year_series.py
