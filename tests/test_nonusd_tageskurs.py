@@ -109,8 +109,9 @@ class NonUsdTageskurs(unittest.TestCase):
         report, _ = calculate(category='OPT', cost=-1000, pnl=-10, short=True)
         self.assertAlmostEqual(report['fx_correction_by_topf']['Topf2'], 100)
 
-    def test_futures_and_zero_pnl_option_assignments_are_excluded(self):
-        for category, pnl in [('FUT', 10), ('OPT', 0)]:
+    def test_futures_cfds_and_zero_pnl_options_are_excluded(self):
+        # FUT/CFD: the lot cost is a notional that never changes hands.
+        for category, pnl in [('FUT', 10), ('CFD', 10), ('OPT', 0)]:
             report, _ = calculate(category=category, pnl=pnl)
             self.assertAlmostEqual(report['fx_correction_total'], 0)
 

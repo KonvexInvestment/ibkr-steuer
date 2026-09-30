@@ -7905,10 +7905,13 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             if not report_date or report_date.year != tax_year:
                 continue
 
-            # Skip FUT — notional-based cost creates phantom FX gains
-            # (futures settle via margin, not full notional exchange)
+            # Skip FUT and CFD: their lot cost is the notional value, but no
+            # notional changes hands (futures settle via margin; a CFD opening
+            # moves only the commission). Correcting the notional would book
+            # phantom FX gains; the realized difference is already converted
+            # at its settlement rate.
             category = lot.get('assetCategory', '')
-            if category == 'FUT':
+            if category in ('FUT', 'CFD'):
                 continue
 
             # Skip assigned/exercised options (fifoPnlRealized ≈ 0):

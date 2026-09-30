@@ -30,7 +30,7 @@ import calculate_tax_report
 # Bump when the snapshot payload layout OR the computed values for the same
 # input change; stale session_state snapshots from an older code version are
 # then recomputed instead of rendered.
-SCHEMA_VERSION = 7  # Tageskurs-Korrektur zum Kurs des Handelstags (tradeDate).
+SCHEMA_VERSION = 8  # CFD-Lots aus der Tageskurs-Korrektur ausgeschlossen.
 # Bump when the view-model/export layout changes (part of the view key).
 VIEW_SCHEMA_VERSION = 1
 
