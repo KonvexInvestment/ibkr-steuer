@@ -3,7 +3,7 @@
 Der Check vergleicht unsere Kategoriesummen mit IBKRs unkorrigierten
 CSV-Summen. Alle Stillhalter-Korrekturen muessen dafuer zurueckgerechnet
 werden: bei Aktien ueber stk/etf_correction_cy, bei Future-Optionen ueber
-audit['future_assignment_corrections'] (Realfall audit1: 6EZ4, 325,91 EUR).
+audit['future_assignment_corrections'] (Realfall: Put auf einen Euro-FX-Future).
 Ohne den Future-Addback meldete der Check nach jeder FOP-Andienung eine
 Abweichung in Praemienhoehe, obwohl die Rechnung stimmte.
 

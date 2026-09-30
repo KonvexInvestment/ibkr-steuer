@@ -1280,7 +1280,7 @@ def test_unapplied_correction_is_tracked_and_warned():
 def test_call_assignment_short_cover_correction_on_buy_row():
     """TC23: Call-Andienung ohne Bestand: Praemie sitzt im spaeteren Short-Cover.
 
-    Audit-Realfall SPY/BITO/MPW: Die Andienung eroeffnet einen Aktien-Short
+    Realfall: Die Andienung eroeffnet einen Aktien-Short
     (SELL, PnL=0, oc=O); IBKR realisiert den PnL inkl. Praemie erst beim
     Rueckkauf. Die Korrektur muss auf die BUY-Row des Cover-Tags (per
     Short-Lot-Match openDateTime == Andienungstag), nicht auf den Andienungstag.
@@ -1885,15 +1885,15 @@ def test_cross_year_assignment_matches_prior_sell_across_date_formats():
 def test_occ_renamed_series_close_matches_original_sell():
     """TC33: OCC-Umbenennung (Spinoff): Close unter MMM1 schliesst den SELL unter MMM.
 
-    Real-Fall Konvex 2024 (Solventum-Spinoff der 3M Company, 01.04.2024): Put
+    Realfall (Solventum-Spinoff der 3M Company, 01.04.2024): Put
     verkauft unter MMM, nach der Kapitalmassnahme unter MMM1 zurueckgekauft.
     Ohne Familien-Matching galt der SELL als offen -> Praemie doppelt erfasst
     (Zufluss-Praemie UND Rueckkauf-PnL) plus falsche unmatched-Warnung.
     """
     trades = [
         make_sell("2024-01-23", 1, 1.40, strike="80", expiry="2024-07-19",
-                  underlying="MMM", commission=-0.80076),
-        make_buy_close("2024-04-11", 1, 0.25, 113.40239, strike="80",
+                  underlying="MMM", commission=-0.80),
+        make_buy_close("2024-04-11", 1, 0.25, 113.40, strike="80",
                        expiry="2024-07-19", underlying="MMM1"),
     ]
     rd = calculate_for_trades(trades, tax_year=2024)
@@ -1903,7 +1903,7 @@ def test_occ_renamed_series_close_matches_original_sell():
                  label="TC33 zufluss_premium_eur")
     unmatched = audit.get("zufluss_unmatched", [])
     assert unmatched == [], f"TC33: unerwartete unmatched-Warnung: {unmatched}"
-    assert_close(rd.get("options_gain_eur", 0), 113.40239,
+    assert_close(rd.get("options_gain_eur", 0), 113.40,
                  label="TC33 options_gain (nur Rueckkauf-PnL, keine Doppelzaehlung)")
     # Transparenz: Familien-Match wird als occ_rename_match getrackt (GUI-Hinweis)
     renames = audit.get("occ_rename_matches", [])
@@ -1913,7 +1913,7 @@ def test_occ_renamed_series_close_matches_original_sell():
     assert renames[0]["quantity"] == 1
 
     print("  TC33 OCC-Umbenennung: MMM1-Close matcht MMM-SELL, keine Doppelzaehlung: OK")
-    print("    options_gain 113.40 EUR statt 252.64 EUR, occ_rename_match getrackt")
+    print("    options_gain nur Rueckkauf-PnL, occ_rename_match getrackt")
 
 
 def test_occ_family_prefers_exact_series():
@@ -3112,7 +3112,7 @@ def test_cross_year_future_assignment_missing_delivery_warns_from_lot():
 
 
 def test_future_assignment_fee_stays_in_future_basis():
-    """TC57: Realmuster audit1 (6EZ4): IBKR-Basis = Strike - Netto-Praemie +
+    """TC57: Realmuster (Put auf Euro-FX-Future): IBKR-Basis = Strike - Netto-Praemie +
     Andienungsgebuehr. Nur die Netto-Praemie verlaesst den FUT-PnL; die
     Gebuehr bleibt Anschaffungsnebenkosten des Termingeschaefts."""
     sell = _future_option_sell(

@@ -335,13 +335,14 @@ def extract_fx_multi_xml(xml_files, output_dir):
     #
     # WICHTIG: NICHT ueber transactionID allein deduplizieren. IBKR vergibt dieselbe
     # transactionID fuer jede Folgebuchung derselben Position — alle taeglichen
-    # MTM-Abrechnungen eines Futures teilen sich eine ID (Beleg: audit1_2024.xml,
-    # tid 654722380 traegt 40+ Zeilen "M6E 18MAR24 Position MTM" an verschiedenen
-    # Tagen mit verschiedenen Betraegen). Auch am selben Tag kollidieren fachlich
-    # verschiedene Buchungen (tid 2389736669: "USD Borrow Fees" -19,63 und
-    # "SYEP Interest" +1,82). Ein ID-Key loeschte diese Zeilen als vermeintliche
-    # Duplikate: audit1 verlor netto -2.004,15 USD, audit2 -39.693,75 USD, wodurch
-    # der kumulierte Saldo und damit die FIFO-Naeherung (Option C) verfaelscht wurde.
+    # MTM-Abrechnungen eines Futures teilen sich eine ID (in echten Exporten
+    # 40+ Zeilen "... Position MTM" an verschiedenen Tagen mit verschiedenen
+    # Betraegen). Auch am selben Tag kollidieren fachlich verschiedene
+    # Buchungen (z.B. "USD Borrow Fees" und "SYEP Interest" unter einer ID).
+    # Ein ID-Key loeschte diese Zeilen als vermeintliche Duplikate, in echten
+    # Exporten mit Netto-Betraegen im vier- bis fuenfstelligen USD-Bereich;
+    # der kumulierte Saldo und damit die FIFO-Naeherung (Option C) wurden
+    # dadurch verfaelscht.
     #
     # Beim Merge mehrerer XMLs sind Wiederholungen aus ueberlappenden
     # Exportzeiträumen nur dann Duplikate, wenn alle sechs fachlichen
