@@ -530,6 +530,7 @@ def full_trigger_report():
             'underlying_symbol_aliases': {'CON': ['CONd']},
             'stillhalter_corrections_dropped': [{'symbol': 'DDD'}],
             'stillhalter_open_short': [{'symbol': 'EEE'}],
+            'prior_year_withholding': [{'isin': 'US0000000001', 'amount_eur': 5.0, 'fund': True}],
             'future_assignment_corrections': [
                 {'assignment_symbol': 'FFF P100', 'future_symbol': 'FFF',
                  'mode': 'deferred_close', 'quantity': 1.0,
@@ -573,6 +574,7 @@ NOTICE_REGISTRY = {
     'occ_rename_matches', 'underlying_symbol_aliases',
     'stillhalter_corrections_dropped', 'stillhalter_open_short',
     'future_assignment_corrections', 'closed_lots_missing',
+    'prior_year_withholding', 'withholding_refund_surplus',
 }
 
 
@@ -764,6 +766,24 @@ def test_closed_lots_missing_is_critical_with_put_assignments():
               ui_model.collect_notices(calls_only)}['closed_lots_missing']
     assert notice['severity'] == 'normal'
     assert 'Put-Andienung' not in notice['body']
+
+
+
+def test_withholding_refund_surplus_is_flagged():
+    """Erstattungsueberhang im Jahr mindert still andere Anrechnungen;
+    negatives Zeile 41 ist nicht eintragbar und daher kritisch."""
+    def notice(report):
+        return {n['id']: n for n in
+                ui_model.collect_notices(report)}.get('withholding_refund_surplus')
+    assert notice(make_report()) is None
+    fund_surplus = make_report(kap_inv={'etf_by_isin': {
+        'US0000000011': {'ticker': 'FUNDA', 'wht': 2.0}}})
+    assert notice(fund_surplus)['severity'] == 'normal'
+    assert 'FUNDA' in notice(fund_surplus)['body']
+    negative = make_report(withholding_tax_eur=-5.0,
+                           zeile_41_withholding_tax_eur=-5.0)
+    assert notice(negative)['severity'] == 'kritisch'
+    assert 'nicht eintragbar' in notice(negative)['body']
 
 
 if __name__ == '__main__':
