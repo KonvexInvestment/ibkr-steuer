@@ -48,6 +48,7 @@ FIELDS = ['zeile_19', 'zeile_20', 'zeile_22', 'zeile_23', 'zeile_41',
 
 SYNTHETIC_TESTS = [
     ("Tageskurs-alle-Fremdwaehrungen", "tests/test_nonusd_tageskurs.py"),
+    ("Kontoinformation-Fallback", "tests/test_account_info_fallback.py"),
     ("Tageskurs-Bruttozuordnung", "tests/test_tageskurs_gross_bucket.py"),
     ("Cross-Year-Series-Tests", "tests/test_cross_year_series.py"),
     ("Quarterly-History-Extraction", "tests/test_quarterly_history_extraction.py"),

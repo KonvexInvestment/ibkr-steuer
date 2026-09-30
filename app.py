@@ -4293,8 +4293,8 @@ Die IBKR Flex Query XML wird in einzelne CSV-Dateien zerlegt. Jede XML-Sektion e
 | `<StmtFunds>` | Dividenden, Zinsen, Steuern, Gebühren. Felder: `activityCode`, `amount`, `fxRateToBase`, `reportDate`, `transactionID` | Bei einer einzelnen XML-Datei vollständig übernommen; Split-/Quartals-XMLs werden bereits beim Merge dedupliziert. Die Berechnung dedupliziert anschließend nochmals defensiv (Schritt 2) |
 | `<FIFOPerformanceSummaryInBase>` | Aggregierter PnL pro Instrument. Felder: `assetCategory`, `isin`, `totalRealizedPnl` | Fallback für fehlende Trades (z.B. T-Bill Maturity) |
 | `<FxTransactions>` | FX-Gewinne/-Verluste. Felder: `fxCurrency`, `realizedPL`, `reportDate` | Nur `levelOfDetail=TRANSACTION` |
-| `<AccountInformation>` | Basiswährung (`currency`), Kontotyp | Einzelner Eintrag |
-| `<FlexStatement>` | Berichtszeitraum → Steuerjahr aus `toDate` | Automatisch erkannt |
+| `<AccountInformation>` | Basiswährung (`currency`), Kontotyp | Einzelner Eintrag; fehlt die Sektion, wird die Basiswährung aus den Kontostandszeilen der Buchungen abgeleitet, sonst bricht die Verarbeitung mit einer Fehlermeldung ab |
+| `<FlexStatement>` | Berichtszeitraum → Steuerjahr aus `toDate` | Automatisch erkannt, auch ohne `<AccountInformation>` |
 
 **Multi-XML (Vorjahre):** Trades aus allen XMLs werden in eine gemeinsame `trades.csv` zusammengeführt (für Stillhalter-Matching über Jahresgrenzen). FX-Kontobewegungen werden chronologisch gemergt; als Duplikat gilt dabei eine Zeile, bei der alle sechs Schlüsselfelder übereinstimmen: Währung, Datum, `transactionID`, Buchungstext, Betrag und Saldo. Ein Schlüssel allein aus `transactionID` wäre falsch: IBKR vergibt dieselbe ID für jede Folgebuchung derselben Position, etwa für alle täglichen Abrechnungen eines Futures.
 
