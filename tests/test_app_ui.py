@@ -421,13 +421,30 @@ def test_mixed_valid_and_non_flex_xml_is_a_hard_error():
         "Keine ausgewählte XML darf still aus dem Steuerreport fallen"
 
 
+def test_incomplete_flex_query_is_a_plain_error_without_snapshot():
+    """F3a: fehlen symbol/conid/underlyingSymbol, lehnt die Extraktion den
+    Export ab. Die App zeigt das als Nutzerfehler, nicht als Absturz."""
+    reduced = SYNTHETIC_BODY.replace(' symbol="AAPL"', '').replace(
+        ' symbol="FAKE"', '').replace(' conid="1"', '').replace(
+        ' conid="2"', '')
+    at = run_app(make_dataset([("reduced.xml", make_xml(body=reduced))]))
+    assert_no_exception(at, "unvollständige Flex Query")
+    rendered = all_markdown(at)
+    assert "Berechnung nicht möglich" in rendered
+    assert "Flex Query unvollständig" in rendered
+    assert "Symbol, Conid" in rendered
+    assert "(reduced.xml)" in rendered, "Meldung nennt den Originalnamen"
+    assert 'snapshot' not in at.session_state
+
+
 def test_anonymous_fills_reach_ui_and_exports():
     """F3b: identische Ausfuehrungen bleiben bis zur KAP-INV-Ausgabe erhalten."""
     import io
     from openpyxl import load_workbook
 
     fill = '''<Trade accountId="U123" assetCategory="STK" subCategory="ETF"
-        isin="US9219468850" currency="USD" dateTime="2025-03-03 10:00:00"
+        symbol="VWOB" conid="4" isin="US9219468850" currency="USD"
+        dateTime="2025-03-03 10:00:00"
         buySell="SELL" openClose="C" quantity="-100" closePrice="60.37"
         fifoPnlRealized="-129.014815" fxRateToBase="0.91973"
         transactionType="ExchTrade" multiplier="1" />'''
@@ -656,7 +673,7 @@ def test_guidance_copy_and_rechenwege_grouping():
 
     kap_body = SYNTHETIC_BODY.replace(
         'assetCategory="STK" subCategory="COMMON" symbol="AAPL"',
-        'assetCategory="OPT" subCategory="" '
+        'assetCategory="OPT" subCategory="" underlyingSymbol="AAPL" '
         'symbol="AAPL  250620C00200000"',
         1,
     )
@@ -702,6 +719,7 @@ if __name__ == '__main__':
         test_fx_currency_guidance_escapes_xml_content,
         test_quarterly_fx_fills_reach_final_values,
         test_mixed_valid_and_non_flex_xml_is_a_hard_error,
+        test_incomplete_flex_query_is_a_plain_error_without_snapshot,
         test_anonymous_fills_reach_ui_and_exports,
         test_multi_statement_xml_is_a_hard_error,
         test_overlapping_periods_are_a_hard_error,

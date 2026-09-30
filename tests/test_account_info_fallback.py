@@ -86,7 +86,7 @@ class AccountInfoFallback(unittest.TestCase):
     def test_trades_at_rate_one_identify_the_base_currency(self):
         trade = ('<Trades><Trade levelOfDetail="EXECUTION" '
                  'assetCategory="STK" currency="USD" fxRateToBase="1" '
-                 'symbol="SYN" dateTime="2024-03-01 10:00:00" '
+                 'symbol="SYN" conid="1" dateTime="2024-03-01 10:00:00" '
                  'tradeDate="2024-03-01" /></Trades>')
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, 'out')

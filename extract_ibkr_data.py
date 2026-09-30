@@ -38,6 +38,11 @@ def get_statement_period(stmt):
     return normalize_ibkr_date(raw_from), normalize_ibkr_date(raw_to)
 
 
+class FlexExportError(ValueError):
+    """The export lacks data the tax logic needs; the user must fix the
+    Flex Query. Shown in the GUI as a plain message, not as a crash."""
+
+
 def account_info_from_root(root, source_name=''):
     """AccountInformation of the first FlexStatement, never a silent default.
 
@@ -71,7 +76,7 @@ def account_info_from_root(root, source_name=''):
                 currencies.add(row.get('currency'))
     if len(currencies) != 1:
         name = f" ({source_name})" if source_name else ''
-        raise ValueError(
+        raise FlexExportError(
             f"Basiswährung nicht bestimmbar{name}: Der Export enthält keine "
             "Sektion \"Account Information\" mit Währung, und aus den "
             "Buchungen lässt sich keine eindeutige Basiswährung ableiten. "
@@ -83,6 +88,50 @@ def account_info_from_root(root, source_name=''):
         data['accountId'] = stmt.get('accountId', '')
     data['account_info_source'] = 'derived'
     return data
+
+
+# Trade fields without which assignments cannot be linked to the delivered
+# stock: premiums would then be taxed twice (as Stillhalterprämie and inside
+# the stock or fund result). Values are the field names in the Flex Query UI.
+REQUIRED_TRADE_FIELDS = {'symbol': 'Symbol', 'conid': 'Conid'}
+REQUIRED_OPTION_FIELDS = {'underlyingSymbol': 'Underlying Symbol'}
+
+
+def validate_trade_fields(root, source_name=''):
+    """Fail loudly when the Flex Query omits trade fields the tax logic needs.
+
+    A field counts as missing only if no execution row carries it, i.e. it
+    was not selected in the Flex Query at all. Real exports from a reduced
+    query lacked symbol, underlyingSymbol and conid and were computed
+    silently wrong (put premiums doubled in KAP-INV and Topf 1).
+    """
+    stmt = root.find('.//FlexStatement')
+    scope = stmt if stmt is not None else root
+    trades = scope.find('.//Trades')
+    rows = [
+        row for row in (trades if trades is not None else [])
+        if row.tag == 'Trade'
+        and row.get('levelOfDetail', '') in ('', 'EXECUTION')
+    ]
+    if not rows:
+        return
+    missing = [label for field, label in REQUIRED_TRADE_FIELDS.items()
+               if not any(row.get(field) for row in rows)]
+    options = [row for row in rows
+               if row.get('assetCategory') in ('OPT', 'FOP', 'FSFOP')]
+    if options:
+        missing += [label for field, label in REQUIRED_OPTION_FIELDS.items()
+                    if not any(row.get(field) for row in options)]
+    if missing:
+        name = f" ({source_name})" if source_name else ''
+        raise FlexExportError(
+            f"Flex Query unvollständig{name}: In der Sektion Trades fehlen "
+            f"die Felder {', '.join(missing)}. Ohne sie lassen sich "
+            "Andienungen nicht der gelieferten Aktie zuordnen, Prämien "
+            "würden doppelt versteuert. Bitte in der Flex Query unter Trades "
+            "diese Felder aktivieren (am einfachsten alle Felder auswählen) "
+            "und neu exportieren."
+        )
 
 
 def extract_conversion_rates(root):
@@ -235,6 +284,11 @@ def extract_fx_multi_xml(xml_files, output_dir):
 
         existing_keys = {key for _, key in trade_occurrence_keys(existing_trades)}
         added_history_trades = 0
+
+        # Validate outside the try below: that loop only logs its errors.
+        for xml_path in history_xmls:
+            validate_trade_fields(ET.parse(xml_path).getroot(),
+                                  os.path.basename(xml_path))
 
         for xml_path in history_xmls:
             try:
@@ -436,8 +490,9 @@ def extract_quarterly_xmls(xml_files, output_dir):
         # All merged exports of one tax year must share the base currency,
         # otherwise their base-currency amounts cannot be summed.
         info = account_info_from_root(root, os.path.basename(xml_path))
+        validate_trade_fields(root, os.path.basename(xml_path))
         if acct_data is not None and info['currency'] != base_curr:
-            raise ValueError(
+            raise FlexExportError(
                 "Unterschiedliche Basiswährungen im selben Steuerjahr: "
                 f"{base_curr} und {info['currency']} "
                 f"({os.path.basename(xml_path)}). Bitte alle Exporte eines "
@@ -764,6 +819,7 @@ def parse_ibkr_xml(xml_file_path, output_dir):
     # Base currency before any CSV is written: a failure must not leave a
     # half-extracted directory behind.
     acct_data = account_info_from_root(root, os.path.basename(xml_file_path))
+    validate_trade_fields(root, os.path.basename(xml_file_path))
     if acct_data.get('account_info_source') == 'derived':
         print(f"WARNUNG: Keine Account Information im Export; Basiswährung "
               f"{acct_data['currency']} aus den Buchungen abgeleitet.")

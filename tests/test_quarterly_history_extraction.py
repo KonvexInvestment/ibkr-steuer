@@ -74,7 +74,8 @@ def test_quarterly_tax_year_with_history_keeps_tax_year_sections():
       <Trades>
         <Trade tradeID="HIST_OPT_SELL" levelOfDetail="EXECUTION" assetCategory="OPT"
                transactionType="ExchTrade" buySell="SELL" quantity="-1"
-               symbol="SYN 100 P" dateTime="2024-12-20 10:00:00"
+               symbol="SYN 100 P" conid="900" underlyingSymbol="SYN"
+               dateTime="2024-12-20 10:00:00"
                tradeDate="2024-12-20" reportDate="2024-12-20"
                closePrice="1.00" fifoPnlRealized="0" />
       </Trades>
@@ -113,7 +114,7 @@ def test_quarterly_tax_year_with_history_keeps_tax_year_sections():
       <Trades>
         <Trade tradeID="BUY_Q2" levelOfDetail="EXECUTION" assetCategory="STK"
                transactionType="ExchTrade" buySell="BUY" quantity="10"
-               symbol="DIV" dateTime="2025-04-10 10:00:00"
+               symbol="DIV" conid="1" dateTime="2025-04-10 10:00:00"
                tradeDate="2025-04-10" reportDate="2025-04-10"
                closePrice="90" fifoPnlRealized="0" />
         <Trade levelOfDetail="CLOSED_LOT" assetCategory="STK" currency="USD"
@@ -127,7 +128,7 @@ def test_quarterly_tax_year_with_history_keeps_tax_year_sections():
       <Trades>
         <Trade tradeID="SELL_Q4" levelOfDetail="EXECUTION" assetCategory="STK"
                transactionType="ExchTrade" buySell="SELL" quantity="-10"
-               symbol="DIV" dateTime="2025-11-20 10:00:00"
+               symbol="DIV" conid="1" dateTime="2025-11-20 10:00:00"
                tradeDate="2025-11-20" reportDate="2025-11-20"
                closePrice="100" fifoPnlRealized="100" />
       </Trades>
@@ -310,7 +311,7 @@ def test_pure_quarterly_merge_keeps_repeated_transaction_id_rows():
 def test_quarterly_merge_preserves_fill_and_lot_multiplicity():
     """F4: gleicher Zeitstempel/Menge ist keine eindeutige Buchungs-ID."""
     trade = '''<Trade levelOfDetail="EXECUTION" assetCategory="STK"
-        symbol="TEST" isin="US0000000001" currency="USD" buySell="SELL"
+        symbol="TEST" conid="2" isin="US0000000001" currency="USD" buySell="SELL"
         dateTime="2025-02-03 10:00:00" quantity="-2" closePrice="100"
         fifoPnlRealized="10" ibCommission="-1" />'''
     lot = '''<Lot levelOfDetail="CLOSED_LOT" assetCategory="STK"
@@ -422,14 +423,14 @@ def test_history_trade_merge_preserves_multiplicity_across_repeated_exports():
     from calculate_tax_report import _dedupe_trades
 
     fill = '''<Trade dateTime="2024-05-06 10:00:00" assetCategory="STK"
-        isin="US0000000001" buySell="SELL" quantity="-100"
+        symbol="TEST" conid="3" isin="US0000000001" buySell="SELL" quantity="-100"
         closePrice="60" fifoPnlRealized="-129" ibCommission="-1" />'''
     variant = fill.replace('ibCommission="-1"', 'ibCommission="-2"')
     identified = fill.replace('<Trade ', '<Trade tradeID="KNOWN" ')
     with tempfile.TemporaryDirectory() as tmp:
         main = write_xml(tmp, 'main.xml', '2025-01-01', '2025-12-31',
-                         '<Trades><Trade tradeID="CURRENT" '
-                         'dateTime="2025-02-03 10:00:00" /></Trades>')
+                         '<Trades><Trade tradeID="CURRENT" symbol="CUR" '
+                         'conid="5" dateTime="2025-02-03 10:00:00" /></Trades>')
         shorter = write_xml(tmp, 'shorter.xml', '2024-01-01', '2024-06-30',
                             '<Trades>' + fill * 2 + identified + '</Trades>')
         full = write_xml(tmp, 'full.xml', '2024-01-01', '2024-12-31',
@@ -439,7 +440,7 @@ def test_history_trade_merge_preserves_multiplicity_across_repeated_exports():
         repeated = write_xml(tmp, 'repeated.xml', '20240101', '20241231',
                              '<Trades>' + fill.replace(
                                  '2024-05-06 10:00:00', '20240506;100000').replace(
-                                 '<Trade ', '<Trade symbol="" ') * 3
+                                 '<Trade ', '<Trade description="" ') * 3
                              + variant + identified + '</Trades>')
         out = os.path.join(tmp, 'out')
         os.mkdir(out)
@@ -460,7 +461,8 @@ def test_anonymous_trade_totals_match_single_quarterly_and_history_paths():
     from run_tests import compute_user_facing
 
     fill = '''<Trade accountId="U123" assetCategory="STK" subCategory="ETF"
-        isin="US9219468850" currency="USD" dateTime="2025-03-03 10:00:00"
+        symbol="VWOB" conid="4" isin="US9219468850" currency="USD"
+        dateTime="2025-03-03 10:00:00"
         buySell="SELL" openClose="C" quantity="-100" closePrice="60.37"
         fifoPnlRealized="-129.014815" fxRateToBase="0.91973"
         transactionType="ExchTrade" multiplier="1" />'''
