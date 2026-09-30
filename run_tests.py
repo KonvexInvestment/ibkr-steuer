@@ -100,6 +100,91 @@ def compute_user_facing(rd):
     }
 
 
+def tageskurs_rate_mismatches(rd, out_dir):
+    """Unabhaengige Gegenprobe der Tageskurs-Korrektur gegen IBKRs Daten.
+
+    Auf EUR-Basiskonten gilt in allen echten Exporten: Ein Boersen-Fill
+    (ExchTrade) traegt als fxRateToBase IBKRs Tageskurs (ConversionRate)
+    seines tradeDate. Fuer jede Lot-Seite, deren eroeffnender bzw.
+    schliessender Fill im Export steht, prueft die Gegenprobe deshalb:
+    Kurstag == tradeDate des Fills; Kurs == fxRateToBase des Fills
+    (ExchTrade) bzw. == ConversionRate des tradeDate (BookTrade, dessen
+    fxRateToBase der 16:20-Settlement-Kurs ist). So prueft der Test gegen
+    IBKR statt gegen den eigenen Code. CASH, TradeCancel und Fills
+    ausserhalb des Exports werden uebersprungen.
+
+    Rueckgabe (problems, compared_sides). Gibt es Details, aber keine
+    einzige verglichene Seite, ist das selbst ein Problem: dann ist die
+    Zuordnung Detail -> Lot -> Fill gebrochen und der Test waere wertlos.
+    """
+    from calculate_tax_report import load_csv, safe_float
+
+    details = rd.get('fx_correction_details', []) or []
+    if rd.get('base_currency') != 'EUR' or not details:
+        return [], 0
+    trades_path = os.path.join(out_dir, 'trades.csv')
+    lots_path = os.path.join(out_dir, 'closed_lots.csv')
+    if not (os.path.exists(trades_path) and os.path.exists(lots_path)):
+        return [], 0
+    conversion = {}
+    rates_path = os.path.join(out_dir, 'conversion_rates.csv')
+    if os.path.exists(rates_path):
+        for row in load_csv(rates_path):
+            if row.get('toCurrency') == 'EUR':
+                conversion[(row.get('fromCurrency', ''),
+                            row.get('reportDate', ''))] = safe_float(
+                                row.get('rate'), 0)
+    fills = {}
+    for trade in load_csv(trades_path):
+        kind = trade.get('transactionType')
+        if kind in ('ExchTrade', 'BookTrade') and \
+                trade.get('assetCategory') != 'CASH':
+            fills[(trade.get('conid', ''), trade.get('dateTime', ''))] = (
+                kind, (trade.get('tradeDate') or '')[:10],
+                safe_float(trade.get('fxRateToBase'), 0))
+    expected = {}
+    for lot in load_csv(lots_path):
+        key = (lot.get('symbol', ''), lot.get('openDateTime', ''),
+               (lot.get('reportDate') or lot.get('dateTime') or '')[:10],
+               lot.get('quantity', ''))
+        conid = lot.get('conid', '')
+        expected.setdefault(key, []).append((
+            fills.get((conid, lot.get('openDateTime', ''))),
+            fills.get((conid, lot.get('dateTime', ''))),
+        ))
+    problems = []
+    compared = 0
+    for detail in details:
+        key = (detail.get('symbol', ''), detail.get('openDateTime', ''),
+               detail.get('reportDate', ''), detail.get('quantity', ''))
+        currency = detail.get('currency', '')
+        for open_fill, close_fill in expected.get(key, []):
+            for side, used, used_day, fill in (
+                    ('Kauf', detail.get('fx_open'),
+                     detail.get('fx_open_date'), open_fill),
+                    ('Verkauf', detail.get('fx_close'),
+                     detail.get('fx_close_date'), close_fill)):
+                if not fill:
+                    continue
+                kind, trade_day, fill_rate = fill
+                ibkr = (fill_rate if kind == 'ExchTrade'
+                        else conversion.get((currency, trade_day)))
+                compared += 1
+                if used_day and trade_day and used_day != trade_day:
+                    problems.append(
+                        f"Tageskurs {side} {key[0]}: Kurstag {used_day}, "
+                        f"IBKR-tradeDate {trade_day} ({kind})")
+                elif ibkr and abs(used - ibkr) > 1e-6 * max(1.0, abs(ibkr)):
+                    problems.append(
+                        f"Tageskurs {side} {key[0]} ({trade_day}, {kind}): "
+                        f"verwendet {used}, IBKR {ibkr}")
+    if compared == 0:
+        problems.append(
+            "Tageskurs-Gegenprobe ohne Abdeckung: kein Lot liess sich einem "
+            "IBKR-Fill zuordnen (Zuordnung Detail -> Lot -> Fill pruefen)")
+    return problems, compared
+
+
 def run_tests():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(script_dir)
@@ -150,11 +235,15 @@ def run_tests():
             import io, contextlib
             with contextlib.redirect_stdout(io.StringIO()):
                 rd = calculate_tax(out_dir)
+            rate_problems, rate_sides = tageskurs_rate_mismatches(rd, out_dir)
 
         # GUI-defaults anwenden (Tageskurs+InvStG+Zufluss aktiv, DBA-Beta aus)
         user = compute_user_facing(rd)
 
-        mismatches = []
+        mismatches = list(rate_problems[:10])
+        if len(rate_problems) > 10:
+            mismatches.append(
+                f"... {len(rate_problems) - 10} weitere Tageskurs-Abweichungen")
         missing_fields = []
         audit = rd.get('audit', {}) or {}
         stillhalter_details = audit.get('stillhalter_details', []) or []
@@ -193,7 +282,9 @@ def run_tests():
             failed += 1
         else:
             z19 = exp['expected']['zeile_19']
-            print(f"  OK    {name:20s} Z19={z19:>12.2f}  ({exp['description']})")
+            print(f"  OK    {name:20s} Z19={z19:>12.2f}  ({exp['description']})"
+                  + (f"  [Tageskurs-Gegenprobe: {rate_sides} Vergleiche]"
+                     if rate_sides else ''))
             passed += 1
 
     print(f"\n{'='*60}")
