@@ -14,6 +14,7 @@ from extract_ibkr_data import (
     extract_quarterly_xmls,
     parse_ibkr_xml,
 )
+from ibkr_dates import coverage_start, covers_year_start
 
 
 def write_xml(tmp, name, from_date, to_date, body):
@@ -568,6 +569,55 @@ def test_parse_ibkr_xml_rejects_non_flex_xml():
             raise AssertionError("XML ohne FlexStatement muss sichtbar abgewiesen werden")
 
 
+def test_statement_coverage_start_is_written_for_every_path():
+    """Der Beginn der lueckenlosen Abdeckung entscheidet, ob eine
+    Netto-Erstattung ohne Ausschuettung im Export einem Vorjahr zugeordnet
+    werden darf (Quartalsexport: Ausschuettung im Quartal davor)."""
+    periods = {
+        "q1": ("2025-01-01", "2025-03-31"), "q2": ("2025-04-01", "2025-06-30"),
+        "q3": ("2025-07-01", "2025-09-30"), "q4": ("2025-10-01", "2025-12-31"),
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = {
+            name: write_xml(tmp, f"{name}.xml", start, end, f"""
+      <StmtFunds>
+        <StatementOfFunds transactionID="{name}" levelOfDetail="BaseCurrency"
+               activityCode="DIV" date="{start}" reportDate="{start}"
+               currency="EUR" amount="10" fxRateToBase="1" />
+      </StmtFunds>
+""")
+            for name, (start, end) in periods.items()
+        }
+
+        def coverage(names):
+            out_dir = tempfile.mkdtemp(dir=tmp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                if len(names) == 1:
+                    parse_ibkr_xml(paths[names[0]], out_dir)
+                else:
+                    extract_quarterly_xmls([paths[n] for n in names], out_dir)
+            info = read_csv(os.path.join(out_dir, "account_info.csv"))[0]
+            return info["statement_coverage_from"]
+
+        assert coverage(["q2"]) == "2025-04-01"
+        assert coverage(["q1", "q2", "q3", "q4"]) == "2025-01-01"
+        assert coverage(["q4", "q2", "q3"]) == "2025-04-01"
+        assert coverage(["q1", "q3", "q4"]) == "2025-07-01", "Luecke Q2"
+
+    # Wochenenden und Neujahr unterbrechen die Abdeckung nicht.
+    assert coverage_start([("2025-01-01", "2025-04-04"),
+                           ("2025-04-07", "2025-06-30")]) == "2025-01-01"
+    assert coverage_start([("2025-01-01", "2025-03-31"),
+                           ("2025-04-07", "2025-06-30")]) == "2025-04-07"
+    assert coverage_start([]) == ""
+    assert covers_year_start("2025-01-01", 2025)
+    assert covers_year_start("2024-12-31", 2025)
+    assert covers_year_start("2022-01-03", 2022), "1.1. Samstag, 2.1. Sonntag"
+    assert covers_year_start("2025-01-02", 2025), "nur Neujahr davor"
+    assert not covers_year_start("2025-01-03", 2025), "2.1.2025 war Handelstag"
+    assert not covers_year_start("", 2025)
+
+
 if __name__ == "__main__":
     test_mixed_period_formats_sort_and_normalize_quarterly_xmls()
     print("OK: gemischte Quartals-Datumsformate werden normalisiert")
@@ -593,3 +643,5 @@ if __name__ == "__main__":
     print("OK: kaputtes XML wird sichtbar abgewiesen")
     test_parse_ibkr_xml_rejects_non_flex_xml()
     print("OK: Nicht-Flex-XML wird sichtbar abgewiesen")
+    test_statement_coverage_start_is_written_for_every_path()
+    print("OK: Exportbeginn wird fuer Einzel- und Quartalsimport geschrieben")

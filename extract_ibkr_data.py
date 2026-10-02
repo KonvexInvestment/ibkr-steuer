@@ -6,6 +6,7 @@ import hashlib
 from collections import Counter
 
 from ibkr_dates import (
+    coverage_start,
     is_supported_ibkr_date,
     normalize_ibkr_date,
     normalize_ibkr_row,
@@ -458,6 +459,7 @@ def extract_quarterly_xmls(xml_files, output_dir):
     tax_year = None
     acct_data = None
     fx_trans_count = 0
+    statement_periods = []
     documents_seen = set()
 
     def occurrence_key(attrib, occurrences, period):
@@ -482,6 +484,7 @@ def extract_quarterly_xmls(xml_files, output_dir):
             continue
         documents_seen.add(document_key)
         period = (from_date, to_date)
+        statement_periods.append(period)
         trade_occurrences = Counter()
         lot_occurrences = Counter()
         fx_occurrences = Counter()
@@ -775,6 +778,10 @@ def extract_quarterly_xmls(xml_files, output_dir):
     # AccountInfo
     if acct_data:
         acct_data['tax_year'] = tax_year or ''
+        # Start of the gapless coverage: without it, a refund whose
+        # distribution is missing from the export proves no year.
+        acct_data['statement_coverage_from'] = coverage_start(
+            statement_periods)
         acct_data['fx_transactions_count'] = str(fx_trans_count)
         acct_path = os.path.join(output_dir, 'account_info.csv')
         with open(acct_path, 'w', newline='', encoding='utf-8') as f:
@@ -988,8 +995,10 @@ def parse_ibkr_xml(xml_file_path, output_dir):
     # Detect tax year from FlexStatement period
     flex_stmt = root.find('.//FlexStatement')
     tax_year_detected = None
+    coverage_from = ''
     if flex_stmt is not None:
         from_date, to_date = get_statement_period(flex_stmt)
+        coverage_from = coverage_start([(from_date, to_date)])
         if to_date and len(to_date) >= 4:
             tax_year_detected = to_date[:4]
             print(f"Steuerjahr erkannt: {tax_year_detected} "
@@ -1028,6 +1037,7 @@ def parse_ibkr_xml(xml_file_path, output_dir):
     acct_data['fx_transactions_count'] = str(fx_trans_count)
     if tax_year_detected:
         acct_data['tax_year'] = tax_year_detected
+    acct_data['statement_coverage_from'] = coverage_from
     acct_path = os.path.join(output_dir, 'account_info.csv')
     with open(acct_path, 'w', newline='', encoding='utf-8') as f:
         headers = sorted(acct_data.keys())

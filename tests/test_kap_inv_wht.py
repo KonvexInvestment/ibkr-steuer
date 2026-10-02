@@ -24,13 +24,16 @@ from calculate_tax_report import (
 )
 
 
-def calculate_for_funds(funds, dba_beta=False):
+def calculate_for_funds(funds, dba_beta=False, coverage_from=None):
     fieldnames = sorted({k for row in funds for k in row})
+    info = {"currency": "EUR", "tax_year": "2025", "fx_transactions_count": "0"}
+    if coverage_from is not None:
+        info["statement_coverage_from"] = coverage_from
     with tempfile.TemporaryDirectory() as tmp:
         with open(os.path.join(tmp, "account_info.csv"), "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["currency", "tax_year", "fx_transactions_count"])
+            writer = csv.DictWriter(f, fieldnames=list(info))
             writer.writeheader()
-            writer.writerow({"currency": "EUR", "tax_year": "2025", "fx_transactions_count": "0"})
+            writer.writerow(info)
         with open(os.path.join(tmp, "statement_of_funds.csv"), "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -330,18 +333,70 @@ def test_action_id_links_misdated_second_correction_to_prior_year():
     assert {i["distribution_year"] for i in prior} == {2024}
 
 
-def test_orphan_net_refund_belongs_to_an_earlier_year():
-    # Keine Ausschuettung zur actionID im Steuerjahr, netto Erstattung:
-    # der erstattete Einbehalt liegt nicht in diesem Jahr.
+def test_orphan_net_refund_belongs_to_an_earlier_year_with_full_year_export():
+    # Keine Ausschuettung zur actionID im Export, netto Erstattung, alle
+    # Zeilen auf den Buchungstag datiert (Realmuster Februar-Korrektur).
+    # Deckt der Export das Jahr ab 1. Januar ab, lag der erstattete
+    # Einbehalt vor dem Steuerjahr. Ein Ausschuettungsjahr ist nicht belegt.
     common = {"currency": "EUR", "isin": "US0000000012", "symbol": "STKB",
               "actionID": "A2", "reportDate": "2025-02-13",
               "date": "2025-02-13"}
-    rd = calculate_for_funds([
+    rows = [
         {**common, "activityCode": "WHT", "amount": "4"},
         {**common, "activityCode": "WHT", "amount": "-3"},
-    ])
-    assert rd["withholding_tax_eur"] == 0
-    assert len(rd["audit"]["prior_year_withholding"]) == 2
+    ]
+    for coverage_from in ("2025-01-01", "2025-01-02", "2024-12-31"):
+        rd = calculate_for_funds(rows, coverage_from=coverage_from)
+        assert rd["withholding_tax_eur"] == 0
+        assert rd["audit"]["withholding_year_unresolved"] == []
+        prior = rd["audit"]["prior_year_withholding"]
+        assert sorted(i["amount_eur"] for i in prior) == [-3, 4]
+        assert {i["distribution_year"] for i in prior} == {None}
+
+
+def test_orphan_net_refund_without_full_year_coverage_is_unresolved():
+    # Gleiche Gruppe, aber der Export beginnt nach dem 1. Januar oder sein
+    # Beginn ist unbekannt: das fehlende Gegenstueck belegt kein Jahr. Die
+    # Gruppe bleibt im Steuerjahr und wird Prueffall.
+    common = {"currency": "EUR", "isin": "US0000000012", "symbol": "STKB",
+              "actionID": "A2", "reportDate": "2025-02-13",
+              "date": "2025-02-13"}
+    rows = [
+        {**common, "activityCode": "WHT", "amount": "4"},
+        {**common, "activityCode": "WHT", "amount": "-3"},
+    ]
+    for coverage_from in (None, "", "2025-01-03", "2025-02-01"):
+        rd = calculate_for_funds(rows, coverage_from=coverage_from)
+        assert rd["withholding_tax_eur"] == -1
+        assert rd["audit"]["prior_year_withholding"] == []
+        unresolved = rd["audit"]["withholding_year_unresolved"]
+        assert sorted(i["amount_eur"] for i in unresolved) == [-3, 4]
+        assert {i["coverage_from"] for i in unresolved} == {coverage_from or ""}
+
+
+def test_quarter_export_refund_is_not_moved_to_a_prior_year():
+    # Ausschuettung mit 15 EUR Einbehalt in Q1, 5 EUR Erstattung in Q2.
+    # Nur Q2 hochgeladen: kein Vorjahresfall (vorher als "Ausschuettung
+    # 2025" aus Zeile 41 genommen), sondern im Jahr verrechnet + Prueffall.
+    # Q1 und Q2 zusammen: Erstattung gehoert zur Q1-Ausschuettung.
+    common = {"currency": "EUR", "isin": "US0378331005", "symbol": "AAPL",
+              "actionID": "Q1DIV"}
+    q1 = [
+        {**common, "activityCode": "DIV", "reportDate": "2025-02-14",
+         "date": "2025-02-14", "amount": "100"},
+        {**common, "activityCode": "WHT", "reportDate": "2025-02-14",
+         "date": "2025-02-14", "amount": "-15"},
+    ]
+    q2 = [{**common, "activityCode": "WHT", "reportDate": "2025-05-10",
+           "date": "2025-05-10", "amount": "5"}]
+    rd = calculate_for_funds(q2, coverage_from="2025-04-01")
+    assert rd["audit"]["prior_year_withholding"] == []
+    assert [i["amount_eur"] for i in rd["audit"]["withholding_year_unresolved"]] == [5]
+    assert rd["zeile_41_withholding_tax_eur"] == -5
+    rd = calculate_for_funds(q1 + q2, coverage_from="2025-01-01")
+    assert rd["audit"]["prior_year_withholding"] == []
+    assert rd["audit"]["withholding_year_unresolved"] == []
+    assert rd["zeile_41_withholding_tax_eur"] == 10
 
 
 def test_orphan_withholding_without_distribution_stays_in_the_year():
@@ -646,7 +701,9 @@ if __name__ == "__main__":
     test_prior_year_corrections_of_stocks_leave_current_year_tax_intact()
     test_year_boundary_withholding_stays_with_its_dividend()
     test_action_id_links_misdated_second_correction_to_prior_year()
-    test_orphan_net_refund_belongs_to_an_earlier_year()
+    test_orphan_net_refund_belongs_to_an_earlier_year_with_full_year_export()
+    test_orphan_net_refund_without_full_year_coverage_is_unresolved()
+    test_quarter_export_refund_is_not_moved_to_a_prior_year()
     test_orphan_withholding_without_distribution_stays_in_the_year()
     test_year_boundary_is_resolved_by_action_id()
     test_german_tax_with_prior_year_date_is_not_moved()

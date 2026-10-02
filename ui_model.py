@@ -891,8 +891,9 @@ def collect_notices(report, context=None):
                    item.get('distribution_year'))
             groups[key] = groups.get(key, 0.0) + item.get('amount_eur', 0)
         ranked = sorted(groups.items(), key=lambda kv: -abs(kv[1]))
+        before = f"vor {report.get('tax_year')}" if report.get('tax_year') else '?'
         listed = '; '.join(
-            f"{name} {year or '?'}: {amount:+,.2f} EUR"
+            f"{name} {year or before}: {amount:+,.2f} EUR"
             for (name, year), amount in ranked[:6])
         if len(ranked) > 6:
             listed += f"; {len(ranked) - 6} weitere"
@@ -913,6 +914,55 @@ def collect_notices(report, context=None):
             "können Ausschüttungen dieses Jahres später noch korrigiert "
             "werden.",
             'prueffaelle', len(prior_wht), prior_wht,
+        ))
+
+    # Netto-Erstattung ohne Ausschuettung im Export und ohne Vorjahresdatum:
+    # das Jahr der Ausschuettung ist nicht belegt (z.B. Export ab
+    # Quartalsmitte). Sie bleibt im Steuerjahr und wird hier sichtbar.
+    unresolved_wht = audit.get('withholding_year_unresolved', []) or []
+    if unresolved_wht:
+        net = sum(i.get('amount_eur', 0) for i in unresolved_wht)
+        by_name = {}
+        for item in unresolved_wht:
+            name = item.get('symbol') or item.get('isin') or '?'
+            by_name[name] = by_name.get(name, 0.0) + item.get('amount_eur', 0)
+        ranked = sorted(by_name.items(), key=lambda kv: -abs(kv[1]))
+        listed = '; '.join(f"{name}: {amount:+,.2f} EUR"
+                           for name, amount in ranked[:6])
+        if len(ranked) > 6:
+            listed += f"; {len(ranked) - 6} weitere"
+        starts = sorted({
+            calculate_tax_report.format_german_date(i.get('coverage_from'))
+            for i in unresolved_wht} - {''})
+        unknown = any(not calculate_tax_report.format_german_date(
+            i.get('coverage_from')) for i in unresolved_wht)
+        coverage = []
+        if starts:
+            coverage.append(
+                "Die hochgeladenen Exporte decken das Jahr erst ab "
+                f"{', '.join(starts)} lückenlos ab (späterer Beginn oder "
+                "Lücke zwischen zwei Exporten)")
+        if unknown:
+            coverage.append(
+                "Für " + ("ein Konto" if starts else "diese Daten")
+                + " ist der Exportzeitraum nicht bekannt (vor diesem Stand "
+                "extrahierte Daten; bitte die XML neu einlesen)")
+        coverage = '. '.join(coverage)
+        notices.append(_notice(
+            'withholding_year_unresolved', 'prueffall', 'normal',
+            'Quellensteuer-Erstattung ohne zugehörige Ausschüttung',
+            f"{len(unresolved_wht)} Buchung(en) ergeben netto eine "
+            "Erstattung ausländischer Quellensteuer "
+            f"({net:+,.2f} EUR; {listed}), ohne dass der Export die "
+            "zugehörige Ausschüttung oder ein Datum aus einem früheren Jahr "
+            f"enthält. {coverage}. Die Ausschüttung kann deshalb in diesem "
+            "Jahr außerhalb der Exporte oder in einem früheren Jahr liegen. "
+            "Die Erstattung ist in Zeile 41 dieses Jahres verrechnet und "
+            "mindert sie, bei Fonds im Standardmodus nach Teilfreistellung. "
+            "Betrifft sie eine Ausschüttung eines früheren Jahres, gehört sie "
+            "zur Anrechnung jenes Jahres. Mit lückenlosen Exporten ab dem "
+            "1. Januar ordnet das Tool die Erstattung selbst zu.",
+            'prueffaelle', len(unresolved_wht), unresolved_wht,
         ))
 
     # Erstattungsueberhang im Steuerjahr: eine Netto-Erstattung je Fonds
@@ -940,9 +990,10 @@ def collect_notices(report, context=None):
             "die Anrechnung anderer Erträge"
             + (f"; Zeile 41 wäre mit {line_41:,.2f} EUR negativ und so "
                "nicht eintragbar" if line_41 < -0.005 else '')
-            + ". Vermutlich gehört die Erstattung zu einer früheren "
-            "Ausschüttung, die IBKR ohne erkennbaren Bezug gebucht hat. "
-            "Bitte die Buchungen prüfen.",
+            + ". Vermutlich gehört die Erstattung zu einer Ausschüttung, "
+            "die nicht in diesem Export enthalten ist: aus einem früheren "
+            "Jahr oder aus diesem Jahr vor Beginn des Exports. Bitte die "
+            "Buchungen prüfen.",
             'prueffaelle', max(len(parts), 1), None,
         ))
 

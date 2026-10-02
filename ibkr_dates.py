@@ -9,7 +9,7 @@ bleiben.
 """
 
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 
 DATE_FIELDS = frozenset({
@@ -113,3 +113,48 @@ def unsupported_date_fields(row):
         if row.get(field) not in (None, '')
         and not is_supported_ibkr_date(row.get(field))
     ]
+
+
+def _no_trading_day_between(after, before):
+    """Whether only weekends and 1 January lie strictly between two dates."""
+    day = after + timedelta(days=1)
+    while day < before:
+        if day.weekday() < 5 and (day.month, day.day) != (1, 1):
+            return False
+        day += timedelta(days=1)
+    return True
+
+
+def coverage_start(periods):
+    """Start of the gapless coverage that ends with the latest period.
+
+    ``periods`` are ``(fromDate, toDate)`` pairs of the statements of one
+    account. A gap of only weekends and 1 January does not interrupt the
+    coverage: IBKR statements often start on the first trading day.
+    Returns ``''`` without a complete period.
+    """
+    parsed = sorted(
+        (start, end) for start, end in (
+            (parse_ibkr_date(f), parse_ibkr_date(t)) for f, t in periods)
+        if start and end
+    )
+    if not parsed:
+        return ''
+    blocks = [list(parsed[0])]
+    for start, end in parsed[1:]:
+        last = blocks[-1]
+        if start <= last[1] or _no_trading_day_between(last[1], start):
+            last[1] = max(last[1], end)
+        else:
+            blocks.append([start, end])
+    return max(blocks, key=lambda block: block[1])[0].isoformat()
+
+
+def covers_year_start(coverage_from, year):
+    """Whether a coverage starting at ``coverage_from`` includes every
+    trading day of ``year`` from 1 January on. Unknown start: False."""
+    start = parse_ibkr_date(coverage_from)
+    if start is None:
+        return False
+    return (start <= date(year, 1, 1)
+            or _no_trading_day_between(date(year - 1, 12, 31), start))

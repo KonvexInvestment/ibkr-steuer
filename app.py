@@ -862,13 +862,21 @@ def classify_xmls(xml_files):
                     ),
                 })
                 continue
+            # Same base currency as the extraction: AccountInformation,
+            # otherwise derived from the bookings. If it cannot be
+            # determined, the extraction rejects the file with its message.
+            try:
+                currency = extract_ibkr_data.account_info_from_root(
+                    root, xml_file.name)['currency']
+            except extract_ibkr_data.FlexExportError:
+                currency = ''
             entry = {
                 'file': xml_file,
                 'from_date': normalize_ibkr_date(raw_from_date),
                 'to_date': normalize_ibkr_date(raw_to_date),
                 'name': xml_file.name,
                 'account_name': acct.get('name', '') if acct is not None else '',
-                'currency': acct.get('currency', 'EUR') if acct is not None else 'EUR',
+                'currency': currency,
             }
             accounts.setdefault(account_id, []).append(entry)
         except Exception as exc:
@@ -1211,6 +1219,7 @@ def merge_report_data(reports):
         'future_assignment_corrections': [],
         'stillhalter_open_short': [],
         'prior_year_withholding': [],
+        'withholding_year_unresolved': [],
         'stk_correction_cy': sum(r.get('audit', {}).get('stk_correction_cy', 0) for r in reports),
         'etf_correction_cy': sum(r.get('audit', {}).get('etf_correction_cy', 0) for r in reports),
         'put_nosell_premium_eur': sum(r.get('audit', {}).get('put_nosell_premium_eur', 0) for r in reports),
@@ -1306,6 +1315,8 @@ def merge_report_data(reports):
         merged_audit['stillhalter_open_short'].extend(a.get('stillhalter_open_short', []))
         merged_audit['prior_year_withholding'].extend(
             a.get('prior_year_withholding', []) or [])
+        merged_audit['withholding_year_unresolved'].extend(
+            a.get('withholding_year_unresolved', []) or [])
         merged_audit['transaction_tax'].setdefault('details', []).extend(
             a.get('transaction_tax', {}).get('details', [])
         )
@@ -1842,7 +1853,7 @@ def _run_compute(dataset, csv_entry, dom, requested_key, generation):
             if len(accounts_to_process) > 1:
                 currencies = {
                     xs[-1]['currency'] for xs in accounts_to_process.values()
-                }
+                } - {''}
                 if len(currencies) > 1:
                     raise UploadValidationError(
                         "Unterschiedliche Basiswährungen erkannt: "
@@ -4266,7 +4277,7 @@ Ausländische Quellensteuern auf Dividenden und Zinsen (z.B. 15% US-Quellensteue
 
 Deutsche Dividendensteuer aus Buchungen mit `- DE Steuer` wird dagegen in Kapitalertragsteuer (Zeile 37) und Solidaritätszuschlag (Zeile 38) aufgeteilt. Wenn das Steuerprogramm diese Zeilen ohne Steuerbescheinigung nach §45a EStG sperrt, bietet "Variante B" eine technische Ersatzdarstellung über Zeile 19 bzw. 41 (Checkbox im Bereich Anlage KAP). Sie ist kein amtlich belegter Ersatz für die Steuerbescheinigung und sollte vor der Abgabe mit Finanzamt oder Steuerberatung abgestimmt werden.
 
-Korrekturen früherer Ausschüttungen: Erstattet oder belastet IBKR Quellensteuer nachträglich für eine Ausschüttung eines früheren Jahres (typisch sind die Reklassifizierungen von US-Fonds im Februar), gehört die Korrektur zur Anrechnung im Jahr der Ausschüttung. Sie fließt nicht in Zeile 41 dieses Jahres, sondern erscheint als Prüffall mit Wertpapier, Ausschüttungsjahr und Betrag. Die Zuordnung erfolgt über IBKRs `actionID`, die Ausschüttung, Einbehalt und Erstattung verbindet.
+Korrekturen früherer Ausschüttungen: Erstattet oder belastet IBKR Quellensteuer nachträglich für eine Ausschüttung eines früheren Jahres (typisch sind die Reklassifizierungen von US-Fonds im Februar), gehört die Korrektur zur Anrechnung im Jahr der Ausschüttung. Sie fließt nicht in Zeile 41 dieses Jahres, sondern erscheint als Prüffall mit Wertpapier, Ausschüttungsjahr und Betrag. Die Zuordnung erfolgt über IBKRs `actionID`, die Ausschüttung, Einbehalt und Erstattung verbindet. Eine Erstattung, zu der der Export weder die Ausschüttung noch ein Datum aus einem früheren Jahr enthält, gehört ebenfalls zu einer früheren Ausschüttung, wenn die hochgeladenen Exporte das Steuerjahr lückenlos ab dem 1. Januar abdecken. Beginnen sie später, kann die Ausschüttung auch im selben Jahr vor Exportbeginn liegen: Dann bleibt die Erstattung in Zeile 41 dieses Jahres und erscheint als eigener Prüffall.
 
 Sonderfall deutscher Investmentfonds: Behält IBKR deutsche Kapitalertragsteuer auf einem DE-Fonds ein, wird sie weder in Zeile 41 angerechnet noch automatisch in Zeile 37/38 eingetragen. §32d Abs. 5 EStG erfasst nur ausländische Steuern, und die auszahlende Stelle berücksichtigt die Teilfreistellung bereits beim Steuerabzug (§43a Abs. 2 EStG). Der Betrag erscheint als Prüffall ("DE-Steuer auf Fonds") und muss anhand der IBKR-Abrechnung manuell zugeordnet werden.
 
@@ -4346,7 +4357,7 @@ Tageskurs-Methode: PnL (EUR) = Erlös × FX_Verkaufstag − AK × FX_Kauftag
 
 **IBKR-Methode (Standard):** Rechnet den Netto-PnL komplett zum Schlusskurs um.
 
-**Tageskurs-Methode (§20 Abs. 4 S. 1 EStG, optional):** *"Bei nicht in Euro getätigten Geschäften sind die Einnahmen im Zeitpunkt der Veräußerung und die Anschaffungskosten im Zeitpunkt der Anschaffung in Euro umzurechnen."* Verwendet die CLOSED_LOT-Zeilen der Flex Query (Trades, Levels of Detail: Closed Lots). Korrigiert werden alle Lots in einer Fremdwährung (USD, CHF, GBP, JPY, HKD usw.), jede Währung mit ihrer eigenen Kursreihe. Futures und CFDs werden ausgeschlossen (Kostenbasis = Nominalwert, bei der Eröffnung fließt kein Nominal), ebenso angediente oder ausgeübte Optionen (die Prämie ist bereits zum Kurs des Verkaufstags erfasst). Korrektur: `AK × (FX_Schlusskurs - FX_Kaufkurs)` pro Lot; AK ist vorzeichenbehaftet (Long positiv, Short negativ), dadurch kehrt sich die Richtung bei Short-Positionen automatisch um. Kursquelle bei EUR-Basiskonten: IBKRs Tageskurs der jeweiligen Währung (`ConversionRate`). Fehlt er im Export, dient das Tagesmittel der `fxRateToBase`-Kurse der Trades als Ersatz: der Intraday-Kurs der ExchTrades, an reinen Verfall-/Andienungstagen der Settlement-Kurs der BookTrades (16:20). Bei USD-Basiskonten: Kurs der Währung zu USD × USD/EUR-Tageskurs. Stichtag ist jeweils der Handelstag von Kauf und Verkauf (IBKR `tradeDate`), nicht das Kalenderdatum des IBKR-Zeitstempels in US-Ostküstenzeit: Käufe an asiatischen Börsen und im US-Nachthandel fallen dort auf den Vorabend. Liegt der Kauf vor dem Zeitraum des Exports, wird der früheste verfügbare Kurs verwendet; für exakte Werte das XML des Vorjahres mit hochladen.
+**Tageskurs-Methode (§20 Abs. 4 S. 1 EStG, optional):** *"Bei nicht in Euro getätigten Geschäften sind die Einnahmen im Zeitpunkt der Veräußerung und die Anschaffungskosten im Zeitpunkt der Anschaffung in Euro umzurechnen."* Verwendet die CLOSED_LOT-Zeilen der Flex Query (Trades, Levels of Detail: Closed Lots). Korrigiert werden alle Lots in einer Fremdwährung (USD, CHF, GBP, JPY, HKD usw.), jede Währung mit ihrer eigenen Kursreihe. Futures und CFDs werden ausgeschlossen (Kostenbasis = Nominalwert, bei der Eröffnung fließt kein Nominal), ebenso angediente oder ausgeübte Optionen (die Prämie ist bereits zum Kurs des Verkaufstags erfasst). Korrektur: `AK × (FX_Schlusskurs - FX_Kaufkurs)` pro Lot; AK ist vorzeichenbehaftet (Long positiv, Short negativ), dadurch kehrt sich die Richtung bei Short-Positionen automatisch um. Kursquelle bei EUR-Basiskonten: IBKRs Tageskurs der jeweiligen Währung (`ConversionRate`). Fehlt er für einen Tag, dient das Tagesmittel der `fxRateToBase`-Kurse der Trades dieses Tages als Ersatz (ohne stornierte Trades und Devisentausch): der Intraday-Kurs der ExchTrades, an reinen Verfall-/Andienungstagen der Settlement-Kurs der BookTrades (16:20). Bei USD-Basiskonten: Kurs der Währung zu USD × USD/EUR-Tageskurs. Stichtag ist jeweils der Handelstag von Kauf und Verkauf (IBKR `tradeDate`), nicht das Kalenderdatum des IBKR-Zeitstempels in US-Ostküstenzeit: Käufe an asiatischen Börsen und im US-Nachthandel fallen dort auf den Vorabend. Liegt der Kauf vor dem Zeitraum des Exports, wird der früheste verfügbare Kurs verwendet; für exakte Werte das XML des Vorjahres mit hochladen.
 
 | Feld | Bedeutung |
 |---|---|
@@ -4441,7 +4452,7 @@ Buchungscodes außerhalb dieser Tabelle werden nicht stillschweigend übergangen
 
 **Währungsumrechnung (EUR-Basis):** `amount` ist bereits in EUR (BaseCurrency-Ansicht). Keine weitere Umrechnung nötig.
 
-**Jahresfilter:** `reportDate.year == Steuerjahr`. Ausnahme ausländische Quellensteuer: Korrekturen einer Ausschüttung aus einem früheren Jahr gehören zur Anrechnung des Ausschüttungsjahres. Erkannt werden sie über die `actionID`: Gehört keine im Steuerjahr gebuchte Ausschüttung dazu und trägt eine Zeile der Gruppe ein Vorjahresdatum oder erstattet die Gruppe netto, fließen sie nicht in Zeile 41 dieses Jahres und erscheinen als Prüffall. Ohne `actionID` gilt: Vorjahresdatum und keine Dividende mit gleicher ISIN und gleichem Datum im Steuerjahr. Typisch sind die Reklassifizierungen von US-Fonds im Februar.
+**Jahresfilter:** `reportDate.year == Steuerjahr`. Ausnahme ausländische Quellensteuer: Korrekturen einer Ausschüttung aus einem früheren Jahr gehören zur Anrechnung des Ausschüttungsjahres. Erkannt werden sie über die `actionID`: Gehört keine im Steuerjahr gebuchte Ausschüttung dazu und trägt eine Zeile der Gruppe ein Vorjahresdatum, fließen sie nicht in Zeile 41 dieses Jahres und erscheinen als Prüffall. Erstattet eine solche Gruppe netto, ohne dass eine Zeile ein Vorjahresdatum trägt, gilt sie nur dann als Vorjahresfall, wenn die hochgeladenen Exporte das Steuerjahr lückenlos ab dem 1. Januar abdecken (Wochenenden und Neujahr zählen nicht als Lücke). Sonst bleibt sie im Steuerjahr und erscheint als Prüffall „Quellensteuer-Erstattung ohne zugehörige Ausschüttung“. Ohne `actionID` gilt: Vorjahresdatum und keine Dividende mit gleicher ISIN und gleichem Datum im Steuerjahr. Typisch sind die Reklassifizierungen von US-Fonds im Februar.
 
 ---
 
@@ -5034,7 +5045,24 @@ def _build_text_report():
             prior_wht_export += (
                 f"  {str(item.get('reportDate', ''))[:10]} "
                 f"{str(item.get('symbol') or item.get('isin') or ''):<12} "
-                f"Ausschüttung {item.get('distribution_year') or '?'} "
+                f"Ausschüttung {item.get('distribution_year') or ('vor ' + str(d.get('tax_year', '')))} "
+                f"{'Fonds ' if item.get('fund') else ''}"
+                f"{fmt_de(float(item.get('amount_eur') or 0)):>10} EUR\n")
+    unresolved_wht_items = audit.get('withholding_year_unresolved', []) or []
+    if unresolved_wht_items:
+        unresolved_wht_net = sum(float(i.get('amount_eur') or 0)
+                                 for i in unresolved_wht_items)
+        prior_wht_export += (
+            "\nQUELLENSTEUER-ERSTATTUNGEN OHNE ZUGEHÖRIGE AUSSCHÜTTUNG "
+            "(PRÜFFALL)\n"
+            f"  {len(unresolved_wht_items)} Buchung(en), netto "
+            f"{fmt_de(unresolved_wht_net)} EUR (positiv = Erstattung). In "
+            "Zeile 41 dieses Jahres verrechnet; der Export belegt nicht, in "
+            "welchem Jahr die zugehörige Ausschüttung lag.\n")
+        for item in unresolved_wht_items:
+            prior_wht_export += (
+                f"  {str(item.get('reportDate', ''))[:10]} "
+                f"{str(item.get('symbol') or item.get('isin') or ''):<12} "
                 f"{'Fonds ' if item.get('fund') else ''}"
                 f"{fmt_de(float(item.get('amount_eur') or 0)):>10} EUR\n")
 
