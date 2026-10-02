@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from collections import Counter, defaultdict, deque
 
 from ibkr_dates import (
+    covers_year_start,
     normalize_ibkr_datetime,
     normalize_ibkr_row,
     parse_ibkr_date,
@@ -4804,6 +4805,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     # 0. Detect base currency and tax year from account_info.csv
     base_currency = 'EUR'  # default — most IBKR accounts for German tax filers are EUR-based
     account_id = ''
+    statement_coverage_from = ''  # unbekannt: Exportbeginn nicht belegt
     xml_has_fx_data = False
     acct_path = os.path.join(ib_tax_dir, 'account_info.csv')
     if os.path.exists(acct_path):
@@ -4811,6 +4813,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         if acct_rows:
             base_currency = acct_rows[0].get('currency', 'EUR')
             account_id = acct_rows[0].get('accountId', '')
+            statement_coverage_from = acct_rows[0].get(
+                'statement_coverage_from', '')
             fx_count = int(acct_rows[0].get('fx_transactions_count', '-1'))
             xml_has_fx_data = fx_count > 0
             if tax_year is None:
@@ -6831,8 +6835,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     #   (auch am Jahreswechsel: Dividende vom 31.12. mit Buchung 02.01.);
     # - sonst gehoert die Gruppe zu einer frueheren Ausschuettung, wenn eine
     #   ihrer Zeilen ein Vorjahresdatum traegt (IBKR datiert Zweitkorrekturen
-    #   teils auf den Buchungstag) oder wenn sie netto erstattet (einer
-    #   Erstattung ging ein Einbehalt voraus, der nicht in diesem Jahr liegt);
+    #   teils auf den Buchungstag);
+    # - eine Netto-Erstattung ohne Vorjahresdatum (einer Erstattung ging ein
+    #   Einbehalt voraus, der nicht im Export steht) gehoert nur dann zu
+    #   einer frueheren Ausschuettung, wenn der Export das Steuerjahr
+    #   lueckenlos ab 1. Januar abdeckt; sonst kann die Ausschuettung im
+    #   selben Jahr vor Exportbeginn liegen (Quartalsexport). Dann bleibt sie
+    #   im Steuerjahr (mindert Zeile 41) und wird Prueffall
+    #   (withholding_year_unresolved);
     # - netto einbehaltene Steuer ohne Ausschuettung (z.B. 871(m) auf
     #   Derivate) bleibt im Steuerjahr.
     # Ohne actionID: Vorjahresdatum und keine Ausschuettung mit gleicher
@@ -6863,8 +6873,17 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         action_id for action_id, rows in _orphan_withholding.items()
         if any((d := parse_date(r.get('date'))) is not None
                and d.year < tax_year for r in rows)
-        or sum(safe_float(r.get('amount')) for r in rows) > 0
     }
+    _net_refund_actions = {
+        action_id for action_id, rows in _orphan_withholding.items()
+        if action_id not in prior_year_withholding_actions
+        and sum(safe_float(r.get('amount')) for r in rows) > 0
+    }
+    if covers_year_start(statement_coverage_from, tax_year):
+        prior_year_withholding_actions |= _net_refund_actions
+        unresolved_withholding_actions = set()
+    else:
+        unresolved_withholding_actions = _net_refund_actions
 
     def _is_prior_year_withholding(row, entitlement_date):
         if is_german_dividend_tax_row(row):
@@ -6881,13 +6900,16 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     def _distribution_year(row):
         # Jahr der zugrunde liegenden Ausschuettung: fruehestes date der
         # actionID-Gruppe (Zweitkorrekturen tragen teils den Buchungstag).
+        # None, wenn keine Zeile ein Vorjahresdatum traegt: dann ist nur
+        # belegt, dass die Ausschuettung vor dem Steuerjahr lag.
         rows = _orphan_withholding.get((row.get('actionID') or '').strip(),
                                        [row])
         years = [d.year for r in rows
                  if (d := parse_date(r.get('date'))) is not None]
-        return min(years) if years else None
+        return min(years) if years and min(years) < tax_year else None
 
     prior_year_withholding = []
+    withholding_year_unresolved = []
 
     funds_processed = 0
     funds_skipped_year = 0
@@ -7065,6 +7087,20 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     'fund': is_etf_fund,
                 })
                 continue
+            action_id = (f.get('actionID') or '').strip()
+            if (action_id in unresolved_withholding_actions
+                    and not is_german_dividend_tax_row(f)):
+                withholding_year_unresolved.append({
+                    'isin': (f.get('isin') or '').strip(),
+                    'symbol': f.get('symbol', ''),
+                    'description': f.get('activityDescription', ''),
+                    'actionID': action_id,
+                    'date': (f.get('date') or '')[:10],
+                    'reportDate': (f.get('reportDate') or '')[:10],
+                    'amount_eur': amount_eur,
+                    'fund': is_etf_fund,
+                    'coverage_from': statement_coverage_from,
+                })
             if is_german_dividend_tax_row(f) and not is_etf_fund:
                 domestic_withholding_tax_eur += amount_eur
             elif is_german_dividend_tax_row(f) and is_etf_fund:
@@ -7102,6 +7138,13 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
               f"{prior_net:+,.2f} EUR (positiv = Erstattung). Nicht in "
               f"Zeile 41 dieses Jahres, sie betreffen die Anrechnung des "
               f"Ausschüttungsjahres.")
+    if withholding_year_unresolved:
+        unresolved_net = sum(item['amount_eur']
+                             for item in withholding_year_unresolved)
+        print(f"  (!) WARNUNG: Quellensteuer-Erstattungen ohne zugehörige Ausschüttung: "
+              f"{len(withholding_year_unresolved)} Buchung(en), netto "
+              f"{unresolved_net:+,.2f} EUR. Jahr der Ausschüttung nicht "
+              f"belegt, im Steuerjahr verrechnet (Prüffall).")
 
     # Ausländische QSt: Vorzeichen invertieren, nicht absolut setzen. So bleibt
     # ein Erstattungsüberschuss im Bericht negativ statt zur Scheingutschrift zu werden.
@@ -8615,6 +8658,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             "raw_div_base": raw_div_base,
             "raw_tax_base": raw_tax_base,
             "prior_year_withholding": prior_year_withholding,
+            # Netto-Erstattungen ohne Ausschuettung und ohne Vorjahresdatum:
+            # im Steuerjahr verrechnet, Jahr nicht belegt (Prueffall).
+            "withholding_year_unresolved": withholding_year_unresolved,
             "added_from_summary": added_from_summary,
             "usd_to_eur_rates_count": len(usd_to_eur_rates),
             "ecb_rates_used": ecb_rates_used,

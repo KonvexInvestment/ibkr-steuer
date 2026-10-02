@@ -531,6 +531,8 @@ def full_trigger_report():
             'stillhalter_corrections_dropped': [{'symbol': 'DDD'}],
             'stillhalter_open_short': [{'symbol': 'EEE'}],
             'prior_year_withholding': [{'isin': 'US0000000001', 'amount_eur': 5.0, 'fund': True}],
+            'withholding_year_unresolved': [{'isin': 'US0000000002', 'symbol': 'FUNDB',
+                                             'amount_eur': 2.0, 'fund': False}],
             'future_assignment_corrections': [
                 {'assignment_symbol': 'FFF P100', 'future_symbol': 'FFF',
                  'mode': 'deferred_close', 'quantity': 1.0,
@@ -575,6 +577,7 @@ NOTICE_REGISTRY = {
     'stillhalter_corrections_dropped', 'stillhalter_open_short',
     'future_assignment_corrections', 'closed_lots_missing',
     'prior_year_withholding', 'withholding_refund_surplus',
+    'withholding_year_unresolved',
 }
 
 
@@ -784,6 +787,49 @@ def test_withholding_refund_surplus_is_flagged():
                            zeile_41_withholding_tax_eur=-5.0)
     assert notice(negative)['severity'] == 'kritisch'
     assert 'nicht eintragbar' in notice(negative)['body']
+
+
+def test_withholding_year_unresolved_is_flagged():
+    """Netto-Erstattung ohne Ausschuettung und ohne Vorjahresdatum: bleibt
+    im Jahr, die Notice nennt Wertpapier und Betrag und erklaert beide
+    moeglichen Jahre."""
+    def notice(report):
+        return {n['id']: n for n in
+                ui_model.collect_notices(report)}.get('withholding_year_unresolved')
+    assert notice(make_report()) is None
+    items = [{'symbol': 'FUNDB', 'amount_eur': 4.0, 'fund': True,
+              'coverage_from': '2025-04-01'},
+             {'symbol': 'FUNDB', 'amount_eur': -3.0, 'fund': True,
+              'coverage_from': '2025-04-01'}]
+    found = notice(make_report(audit={'withholding_year_unresolved': items}))
+    assert found['class'] == 'prueffall' and found['severity'] == 'normal'
+    assert found['count'] == 2
+    assert 'FUNDB: +1.00 EUR' in found['body']
+    assert 'Zeile 41 dieses Jahres verrechnet' in found['body']
+    assert 'erst ab 01.04.2025 lückenlos ab' in found['body']
+    assert 'nicht bekannt' not in found['body']
+    unknown = [dict(i, coverage_from='') for i in items]
+    found = notice(make_report(audit={'withholding_year_unresolved': unknown}))
+    assert 'Für diese Daten ist der Exportzeitraum nicht bekannt' in found['body']
+    assert 'XML neu einlesen' in found['body']
+    mixed = [items[0], dict(items[1], symbol='FUNDE', coverage_from='')]
+    found = notice(make_report(audit={'withholding_year_unresolved': mixed}))
+    assert 'erst ab 01.04.2025' in found['body']
+    assert 'Für ein Konto ist der Exportzeitraum nicht bekannt' in found['body']
+
+
+def test_prior_year_withholding_without_dated_year_reads_before_tax_year():
+    """Ohne Vorjahresdatum ist nur belegt, dass die Ausschuettung vor dem
+    Steuerjahr lag; die Notice nennt nie das Steuerjahr selbst."""
+    report = make_report(audit={'prior_year_withholding': [
+        {'symbol': 'FUNDC', 'amount_eur': 1.26, 'fund': True,
+         'distribution_year': None},
+        {'symbol': 'FUNDD', 'amount_eur': 3.0, 'fund': True,
+         'distribution_year': 2024}]})
+    body = {n['id']: n for n in ui_model.collect_notices(report)}[
+        'prior_year_withholding']['body']
+    assert 'FUNDC vor 2025: +1.26 EUR' in body
+    assert 'FUNDD 2024: +3.00 EUR' in body
 
 
 if __name__ == '__main__':
