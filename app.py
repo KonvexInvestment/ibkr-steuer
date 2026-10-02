@@ -862,13 +862,21 @@ def classify_xmls(xml_files):
                     ),
                 })
                 continue
+            # Same base currency as the extraction: AccountInformation,
+            # otherwise derived from the bookings. If it cannot be
+            # determined, the extraction rejects the file with its message.
+            try:
+                currency = extract_ibkr_data.account_info_from_root(
+                    root, xml_file.name)['currency']
+            except extract_ibkr_data.FlexExportError:
+                currency = ''
             entry = {
                 'file': xml_file,
                 'from_date': normalize_ibkr_date(raw_from_date),
                 'to_date': normalize_ibkr_date(raw_to_date),
                 'name': xml_file.name,
                 'account_name': acct.get('name', '') if acct is not None else '',
-                'currency': acct.get('currency', 'EUR') if acct is not None else 'EUR',
+                'currency': currency,
             }
             accounts.setdefault(account_id, []).append(entry)
         except Exception as exc:
@@ -1845,7 +1853,7 @@ def _run_compute(dataset, csv_entry, dom, requested_key, generation):
             if len(accounts_to_process) > 1:
                 currencies = {
                     xs[-1]['currency'] for xs in accounts_to_process.values()
-                }
+                } - {''}
                 if len(currencies) > 1:
                     raise UploadValidationError(
                         "Unterschiedliche Basiswährungen erkannt: "
@@ -4349,7 +4357,7 @@ Tageskurs-Methode: PnL (EUR) = Erlös × FX_Verkaufstag − AK × FX_Kauftag
 
 **IBKR-Methode (Standard):** Rechnet den Netto-PnL komplett zum Schlusskurs um.
 
-**Tageskurs-Methode (§20 Abs. 4 S. 1 EStG, optional):** *"Bei nicht in Euro getätigten Geschäften sind die Einnahmen im Zeitpunkt der Veräußerung und die Anschaffungskosten im Zeitpunkt der Anschaffung in Euro umzurechnen."* Verwendet die CLOSED_LOT-Zeilen der Flex Query (Trades, Levels of Detail: Closed Lots). Korrigiert werden alle Lots in einer Fremdwährung (USD, CHF, GBP, JPY, HKD usw.), jede Währung mit ihrer eigenen Kursreihe. Futures und CFDs werden ausgeschlossen (Kostenbasis = Nominalwert, bei der Eröffnung fließt kein Nominal), ebenso angediente oder ausgeübte Optionen (die Prämie ist bereits zum Kurs des Verkaufstags erfasst). Korrektur: `AK × (FX_Schlusskurs - FX_Kaufkurs)` pro Lot; AK ist vorzeichenbehaftet (Long positiv, Short negativ), dadurch kehrt sich die Richtung bei Short-Positionen automatisch um. Kursquelle bei EUR-Basiskonten: IBKRs Tageskurs der jeweiligen Währung (`ConversionRate`). Fehlt er im Export, dient das Tagesmittel der `fxRateToBase`-Kurse der Trades als Ersatz: der Intraday-Kurs der ExchTrades, an reinen Verfall-/Andienungstagen der Settlement-Kurs der BookTrades (16:20). Bei USD-Basiskonten: Kurs der Währung zu USD × USD/EUR-Tageskurs. Stichtag ist jeweils der Handelstag von Kauf und Verkauf (IBKR `tradeDate`), nicht das Kalenderdatum des IBKR-Zeitstempels in US-Ostküstenzeit: Käufe an asiatischen Börsen und im US-Nachthandel fallen dort auf den Vorabend. Liegt der Kauf vor dem Zeitraum des Exports, wird der früheste verfügbare Kurs verwendet; für exakte Werte das XML des Vorjahres mit hochladen.
+**Tageskurs-Methode (§20 Abs. 4 S. 1 EStG, optional):** *"Bei nicht in Euro getätigten Geschäften sind die Einnahmen im Zeitpunkt der Veräußerung und die Anschaffungskosten im Zeitpunkt der Anschaffung in Euro umzurechnen."* Verwendet die CLOSED_LOT-Zeilen der Flex Query (Trades, Levels of Detail: Closed Lots). Korrigiert werden alle Lots in einer Fremdwährung (USD, CHF, GBP, JPY, HKD usw.), jede Währung mit ihrer eigenen Kursreihe. Futures und CFDs werden ausgeschlossen (Kostenbasis = Nominalwert, bei der Eröffnung fließt kein Nominal), ebenso angediente oder ausgeübte Optionen (die Prämie ist bereits zum Kurs des Verkaufstags erfasst). Korrektur: `AK × (FX_Schlusskurs - FX_Kaufkurs)` pro Lot; AK ist vorzeichenbehaftet (Long positiv, Short negativ), dadurch kehrt sich die Richtung bei Short-Positionen automatisch um. Kursquelle bei EUR-Basiskonten: IBKRs Tageskurs der jeweiligen Währung (`ConversionRate`). Fehlt er für einen Tag, dient das Tagesmittel der `fxRateToBase`-Kurse der Trades dieses Tages als Ersatz (ohne stornierte Trades und Devisentausch): der Intraday-Kurs der ExchTrades, an reinen Verfall-/Andienungstagen der Settlement-Kurs der BookTrades (16:20). Bei USD-Basiskonten: Kurs der Währung zu USD × USD/EUR-Tageskurs. Stichtag ist jeweils der Handelstag von Kauf und Verkauf (IBKR `tradeDate`), nicht das Kalenderdatum des IBKR-Zeitstempels in US-Ostküstenzeit: Käufe an asiatischen Börsen und im US-Nachthandel fallen dort auf den Vorabend. Liegt der Kauf vor dem Zeitraum des Exports, wird der früheste verfügbare Kurs verwendet; für exakte Werte das XML des Vorjahres mit hochladen.
 
 | Feld | Bedeutung |
 |---|---|

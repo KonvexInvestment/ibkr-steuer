@@ -7973,6 +7973,12 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             dt = (trade.get('tradeDate') or trade.get('dateTime') or '')[:10]
             if not currency or fx <= 0 or not dt:
                 continue
+            # Cancelled fills and currency conversions do not carry the
+            # instrument's daily rate (automatic conversions deviate from
+            # ConversionRate in real exports).
+            if (trade.get('transactionType') == 'TradeCancel'
+                    or trade.get('assetCategory') == 'CASH'):
+                continue
             if base_currency == 'USD':
                 # fxRateToBase is currency -> USD, not currency -> EUR.
                 trade_day = parse_date(dt)
@@ -7998,14 +8004,11 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     values = (daily_exch[currency].get(day)
                               or daily_book[currency][day])
                     fx_map[day] = sum(values) / len(values)
-            official = conv_rates_by_currency.get(currency, {})
-            if official:
-                # EUR-base: preserve the authoritative ConversionRate series.
-                # USD-base: retain the historical baseline for uncovered days.
-                if base_currency == 'EUR':
-                    fx_map = dict(official)
-                else:
-                    fx_map.update(official)
+            # ConversionRate wins on the days it covers; trade rates stay for
+            # the remaining days. Replacing the whole series would drop a
+            # purchase rate the export does carry and fall back to the
+            # nearest earlier official rate instead.
+            fx_map.update(conv_rates_by_currency.get(currency, {}))
             fx_maps[currency] = fx_map
 
         fx_dates_by_currency = {c: sorted(rates) for c, rates in fx_maps.items()}
