@@ -24,13 +24,17 @@ from calculate_tax_report import (
 )
 
 
-def calculate_for_funds(funds, dba_beta=False):
+def calculate_for_funds(funds, dba_beta=False, coverage_from="2025-01-01"):
+    # coverage_from: Beginn der lueckenlosen Abdeckung; None = Feld fehlt.
     fieldnames = sorted({k for row in funds for k in row})
+    info = {"currency": "EUR", "tax_year": "2025", "fx_transactions_count": "0"}
+    if coverage_from is not None:
+        info["statement_coverage_from"] = coverage_from
     with tempfile.TemporaryDirectory() as tmp:
         with open(os.path.join(tmp, "account_info.csv"), "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["currency", "tax_year", "fx_transactions_count"])
+            writer = csv.DictWriter(f, fieldnames=list(info))
             writer.writeheader()
-            writer.writerow({"currency": "EUR", "tax_year": "2025", "fx_transactions_count": "0"})
+            writer.writerow(info)
         with open(os.path.join(tmp, "statement_of_funds.csv"), "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -248,15 +252,227 @@ def test_paid_short_distributions_are_excluded_from_form_lines():
     assert any("gezahlte" in w.lower() for w in form["warnings"])
 
 
-def test_report_date_sets_tax_year_and_entitlement_date_is_preserved():
-    # Erstattung mit Bezugsdatum im Vorjahr (date=2024), aber Buchung im
-    # Steuerjahr (reportDate=2025): reportDate bestimmt die Zuordnung,
-    # das historische Bezugsdatum bleibt am Event erhalten.
+def test_prior_year_refund_is_kept_out_of_line_41():
+    # F5: Erstattung fuer eine Vorjahres-Ausschuettung (date=2024), gebucht
+    # im Steuerjahr (reportDate=2025), ohne Dividende im Steuerjahr. Sie
+    # gehoert zur Anrechnung 2024 und darf Zeile 41 fuer 2025 weder kuerzen
+    # noch negativ machen (vorher: Beta-Prueffall, Standardmodus still).
+    row = {
+        "activityCode": "WHT",
+        "reportDate": "2025-02-05",
+        "date": "2024-12-15",
+        "amount": "27.44",
+        "currency": "EUR",
+        "subCategory": "ETF",
+        "isin": "US4642874329",
+        "symbol": "TLT",
+    }
+    for beta in (False, True):
+        rd = calculate_for_funds([row], dba_beta=beta)
+        assert rd["kap_inv"]["wht_events"] == []
+        assert rd["kap_inv"]["etf_wht_eur"] == 0
+        assert rd["zeile_41_withholding_tax_eur"] == 0
+        prior = rd["audit"]["prior_year_withholding"]
+        assert len(prior) == 1
+        assert prior[0]["amount_eur"] == 27.44
+        assert prior[0]["fund"] is True
+        assert (prior[0]["date"], prior[0]["reportDate"]) == (
+            "2024-12-15", "2025-02-05")
+
+
+def test_prior_year_corrections_of_stocks_leave_current_year_tax_intact():
+    # Reale Februar-Reklassifizierung: Erstattung plus neuer, kleinerer
+    # Einbehalt auf eine Vorjahres-Ausschuettung. Beide gehoeren ins
+    # Vorjahr; der Einbehalt des Steuerjahres bleibt unveraendert.
+    common = {"currency": "EUR", "isin": "US0378331005", "symbol": "AAPL"}
+    rd = calculate_for_funds([
+        {**common, "activityCode": "DIV", "reportDate": "2025-05-15",
+         "date": "2025-05-15", "amount": "100"},
+        {**common, "activityCode": "WHT", "reportDate": "2025-05-15",
+         "date": "2025-05-15", "amount": "-15"},
+        {**common, "activityCode": "WHT", "reportDate": "2025-02-13",
+         "date": "2024-11-14", "amount": "30"},
+        {**common, "activityCode": "WHT", "reportDate": "2025-02-13",
+         "date": "2024-11-14", "amount": "-12"},
+    ])
+    assert rd["withholding_tax_eur"] == 15
+    assert rd["zeile_41_withholding_tax_eur"] == 15
+    assert sorted(i["amount_eur"] for i in rd["audit"]["prior_year_withholding"]) == [-12, 30]
+
+
+def test_year_boundary_withholding_stays_with_its_dividend():
+    # Dividende vom 31.12. mit Buchung am 02.01.: Dividende und Steuer
+    # gehoeren beide ins Buchungsjahr (Zuflussprinzip), nichts wird verschoben.
+    common = {"currency": "EUR", "isin": "US0378331005", "symbol": "AAPL",
+              "reportDate": "2025-01-02", "date": "2024-12-31"}
+    rd = calculate_for_funds([
+        {**common, "activityCode": "DIV", "amount": "100"},
+        {**common, "activityCode": "WHT", "amount": "-15"},
+    ])
+    assert rd["dividends_eur"] == 100
+    assert rd["zeile_41_withholding_tax_eur"] == 15
+    assert rd["audit"]["prior_year_withholding"] == []
+
+
+def test_action_id_links_misdated_second_correction_to_prior_year():
+    # Realmuster: Die Zweitkorrektur traegt als date den Buchungstag
+    # (2025-03-04), gehoert ueber die actionID aber zur Ausschuettung vom
+    # Januar 2024. Die ganze actionID-Gruppe gehoert ins Vorjahr.
+    common = {"currency": "EUR", "subCategory": "ETF",
+              "isin": "US0000000011", "symbol": "FUNDA", "actionID": "A1"}
+    rd = calculate_for_funds([
+        {**common, "activityCode": "WHT", "reportDate": "2025-02-13",
+         "date": "2024-01-31", "amount": "10"},
+        {**common, "activityCode": "WHT", "reportDate": "2025-03-04",
+         "date": "2025-03-04", "amount": "9"},
+        {**common, "activityCode": "WHT", "reportDate": "2025-03-04",
+         "date": "2025-03-04", "amount": "-6.5"},
+    ])
+    assert rd["kap_inv"]["etf_wht_eur"] == 0
+    prior = rd["audit"]["prior_year_withholding"]
+    assert len(prior) == 3
+    assert {i["distribution_year"] for i in prior} == {2024}
+
+
+def test_orphan_net_refund_belongs_to_an_earlier_year_with_full_year_export():
+    # Keine Ausschuettung zur actionID im Export, netto Erstattung, alle
+    # Zeilen auf den Buchungstag datiert (Realmuster Februar-Korrektur).
+    # Deckt der Export das Jahr ab 1. Januar ab, lag der erstattete
+    # Einbehalt vor dem Steuerjahr. Ein Ausschuettungsjahr ist nicht belegt.
+    common = {"currency": "EUR", "isin": "US0000000012", "symbol": "STKB",
+              "actionID": "A2", "reportDate": "2025-02-13",
+              "date": "2025-02-13"}
+    rows = [
+        {**common, "activityCode": "WHT", "amount": "4"},
+        {**common, "activityCode": "WHT", "amount": "-3"},
+    ]
+    for coverage_from in ("2025-01-01", "2025-01-02", "2024-12-31"):
+        rd = calculate_for_funds(rows, coverage_from=coverage_from)
+        assert rd["withholding_tax_eur"] == 0
+        assert rd["audit"]["withholding_year_unresolved"] == []
+        prior = rd["audit"]["prior_year_withholding"]
+        assert sorted(i["amount_eur"] for i in prior) == [-3, 4]
+        assert {i["distribution_year"] for i in prior} == {None}
+
+
+def test_orphan_net_refund_without_full_year_coverage_is_unresolved():
+    # Gleiche Gruppe, aber der Export beginnt nach dem 1. Januar oder sein
+    # Beginn ist unbekannt: das fehlende Gegenstueck belegt kein Jahr. Die
+    # Gruppe bleibt im Steuerjahr und wird Prueffall.
+    common = {"currency": "EUR", "isin": "US0000000012", "symbol": "STKB",
+              "actionID": "A2", "reportDate": "2025-02-13",
+              "date": "2025-02-13"}
+    rows = [
+        {**common, "activityCode": "WHT", "amount": "4"},
+        {**common, "activityCode": "WHT", "amount": "-3"},
+    ]
+    for coverage_from in (None, "", "2025-01-03", "2025-02-01"):
+        rd = calculate_for_funds(rows, coverage_from=coverage_from)
+        assert rd["withholding_tax_eur"] == -1
+        assert rd["audit"]["prior_year_withholding"] == []
+        unresolved = rd["audit"]["withholding_year_unresolved"]
+        assert sorted(i["amount_eur"] for i in unresolved) == [-3, 4]
+        assert {i["coverage_from"] for i in unresolved} == {coverage_from or ""}
+
+
+def test_quarter_export_refund_is_not_moved_to_a_prior_year():
+    # Ausschuettung mit 15 EUR Einbehalt in Q1, 5 EUR Erstattung in Q2.
+    # Nur Q2 hochgeladen: kein Vorjahresfall (vorher als "Ausschuettung
+    # 2025" aus Zeile 41 genommen), sondern im Jahr verrechnet + Prueffall.
+    # Q1 und Q2 zusammen: Erstattung gehoert zur Q1-Ausschuettung.
+    common = {"currency": "EUR", "isin": "US0378331005", "symbol": "AAPL",
+              "actionID": "Q1DIV"}
+    q1 = [
+        {**common, "activityCode": "DIV", "reportDate": "2025-02-14",
+         "date": "2025-02-14", "amount": "100"},
+        {**common, "activityCode": "WHT", "reportDate": "2025-02-14",
+         "date": "2025-02-14", "amount": "-15"},
+    ]
+    q2 = [{**common, "activityCode": "WHT", "reportDate": "2025-05-10",
+           "date": "2025-05-10", "amount": "5"}]
+    rd = calculate_for_funds(q2, coverage_from="2025-04-01")
+    assert rd["audit"]["prior_year_withholding"] == []
+    assert [i["amount_eur"] for i in rd["audit"]["withholding_year_unresolved"]] == [5]
+    assert rd["zeile_41_withholding_tax_eur"] == -5
+    rd = calculate_for_funds(q1 + q2, coverage_from="2025-01-01")
+    assert rd["audit"]["prior_year_withholding"] == []
+    assert rd["audit"]["withholding_year_unresolved"] == []
+    assert rd["zeile_41_withholding_tax_eur"] == 10
+
+
+def test_orphan_withholding_without_distribution_stays_in_the_year():
+    # Muster 871(m): Steuer auf eine Dividenden-Aequivalenz eines
+    # Derivats, ohne DIV-Zeile. Netto Einbehalt, bleibt im Steuerjahr.
+    rd = calculate_for_funds([
+        {"activityCode": "WHT", "currency": "EUR", "isin": "US0000000013",
+         "symbol": "DERIV", "actionID": "A3", "reportDate": "2025-09-24",
+         "date": "2025-09-24", "amount": "-5"},
+    ])
+    assert rd["zeile_41_withholding_tax_eur"] == 5
+    assert rd["audit"]["prior_year_withholding"] == []
+
+
+def test_year_end_distribution_booked_in_january_needs_coverage():
+    # Dividende vom 31.12.2024, gebucht mit Einbehalt am 02.01.2025,
+    # Erstattung im April. Nur Q2 hochgeladen: das Vorjahresdatum belegt
+    # nicht, dass die Ausschuettung im Vorjahr gebucht wurde. Die Erstattung
+    # bleibt im Jahr und wird Prueffall. Mit Q1 und Q2 gehoert sie ueber
+    # die actionID zur 2025 gebuchten Dividende.
+    for action_id in ("YE", ""):
+        common = {"currency": "EUR", "isin": "US0378331005",
+                  "symbol": "AAPL", "actionID": action_id}
+        q1 = [
+            {**common, "activityCode": "DIV", "reportDate": "2025-01-02",
+             "date": "2024-12-31", "amount": "100"},
+            {**common, "activityCode": "WHT", "reportDate": "2025-01-02",
+             "date": "2024-12-31", "amount": "-15"},
+        ]
+        q2 = [{**common, "activityCode": "WHT", "reportDate": "2025-04-10",
+               "date": "2024-12-31", "amount": "5"}]
+        rd = calculate_for_funds(q2, coverage_from="2025-04-01")
+        assert rd["audit"]["prior_year_withholding"] == [], action_id
+        unresolved = rd["audit"]["withholding_year_unresolved"]
+        assert [i["amount_eur"] for i in unresolved] == [5], action_id
+        assert rd["zeile_41_withholding_tax_eur"] == -5, action_id
+        rd = calculate_for_funds(q1 + q2, coverage_from="2025-01-01")
+        assert rd["audit"]["prior_year_withholding"] == [], action_id
+        assert rd["audit"]["withholding_year_unresolved"] == [], action_id
+        assert rd["zeile_41_withholding_tax_eur"] == 10, action_id
+
+
+def test_year_boundary_is_resolved_by_action_id():
+    common = {"currency": "EUR", "isin": "US0378331005", "symbol": "AAPL",
+              "actionID": "A4"}
+    rd = calculate_for_funds([
+        {**common, "activityCode": "DIV", "reportDate": "2025-01-02",
+         "date": "2024-12-31", "amount": "100"},
+        {**common, "activityCode": "WHT", "reportDate": "2025-01-02",
+         "date": "2024-12-31", "amount": "-15"},
+        {**common, "activityCode": "WHT", "reportDate": "2025-02-13",
+         "date": "2024-12-31", "amount": "5"},
+    ])
+    assert rd["zeile_41_withholding_tax_eur"] == 10
+    assert rd["audit"]["prior_year_withholding"] == []
+
+
+def test_german_tax_with_prior_year_date_is_not_moved():
+    rd = calculate_for_funds([
+        {"activityCode": "", "currency": "EUR", "isin": "DE0007164600",
+         "symbol": "SAP", "actionID": "A5", "reportDate": "2025-02-13",
+         "date": "2024-05-15", "amount": "-26",
+         "activityDescription": "SAP(DE0007164600) Cash Dividend - DE Steuer"},
+    ])
+    assert rd["audit"]["prior_year_withholding"] == []
+
+
+def test_booking_and_entitlement_dates_stay_visible_in_review():
+    # Beta: Erstattung im selben Jahr ohne zuordenbare Ausschuettung bleibt
+    # Prueffall; Buchungs- und Bezugsdatum werden getrennt ausgewiesen.
     rd = calculate_for_funds([
         {
             "activityCode": "WHT",
             "reportDate": "2025-02-05",
-            "date": "2024-12-15",
+            "date": "2025-01-15",
             "amount": "27.44",
             "currency": "EUR",
             "subCategory": "ETF",
@@ -267,7 +483,7 @@ def test_report_date_sets_tax_year_and_entitlement_date_is_preserved():
     events = rd["kap_inv"]["wht_events"]
     assert len(events) == 1
     event = events[0]
-    assert event["date"] == "2024-12-15"
+    assert event["date"] == "2025-01-15"
     assert event["report_dates"] == ["2025-02-05"]
     assert event["status"] == "unmatched_refund"
 
@@ -276,7 +492,7 @@ def test_report_date_sets_tax_year_and_entitlement_date_is_preserved():
     )
     assert len(rows) == 1
     assert rows[0]["booking_date"] == "05.02.2025"
-    assert rows[0]["entitlement_date"] == "15.12.2024"
+    assert rows[0]["entitlement_date"] == "15.01.2025"
 
 
 def test_review_rows_carry_product_identity():
@@ -510,7 +726,18 @@ if __name__ == "__main__":
     test_multi_account_sums_finished_credits_without_global_recap()
     test_verified_us_funds_have_treaty_rate()
     test_paid_short_distributions_are_excluded_from_form_lines()
-    test_report_date_sets_tax_year_and_entitlement_date_is_preserved()
+    test_prior_year_refund_is_kept_out_of_line_41()
+    test_prior_year_corrections_of_stocks_leave_current_year_tax_intact()
+    test_year_boundary_withholding_stays_with_its_dividend()
+    test_action_id_links_misdated_second_correction_to_prior_year()
+    test_orphan_net_refund_belongs_to_an_earlier_year_with_full_year_export()
+    test_orphan_net_refund_without_full_year_coverage_is_unresolved()
+    test_quarter_export_refund_is_not_moved_to_a_prior_year()
+    test_orphan_withholding_without_distribution_stays_in_the_year()
+    test_year_end_distribution_booked_in_january_needs_coverage()
+    test_year_boundary_is_resolved_by_action_id()
+    test_german_tax_with_prior_year_date_is_not_moved()
+    test_booking_and_entitlement_dates_stay_visible_in_review()
     test_review_rows_carry_product_identity()
     test_status_labels_are_user_facing_with_safe_fallback()
     test_mode_comparison_sums_per_account_and_never_recalculates_merged()
