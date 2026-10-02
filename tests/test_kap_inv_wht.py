@@ -24,7 +24,8 @@ from calculate_tax_report import (
 )
 
 
-def calculate_for_funds(funds, dba_beta=False, coverage_from=None):
+def calculate_for_funds(funds, dba_beta=False, coverage_from="2025-01-01"):
+    # coverage_from: Beginn der lueckenlosen Abdeckung; None = Feld fehlt.
     fieldnames = sorted({k for row in funds for k in row})
     info = {"currency": "EUR", "tax_year": "2025", "fx_transactions_count": "0"}
     if coverage_from is not None:
@@ -411,6 +412,34 @@ def test_orphan_withholding_without_distribution_stays_in_the_year():
     assert rd["audit"]["prior_year_withholding"] == []
 
 
+def test_year_end_distribution_booked_in_january_needs_coverage():
+    # Dividende vom 31.12.2024, gebucht mit Einbehalt am 02.01.2025,
+    # Erstattung im April. Nur Q2 hochgeladen: das Vorjahresdatum belegt
+    # nicht, dass die Ausschuettung im Vorjahr gebucht wurde. Die Erstattung
+    # bleibt im Jahr und wird Prueffall. Mit Q1 und Q2 gehoert sie ueber
+    # die actionID zur 2025 gebuchten Dividende.
+    for action_id in ("YE", ""):
+        common = {"currency": "EUR", "isin": "US0378331005",
+                  "symbol": "AAPL", "actionID": action_id}
+        q1 = [
+            {**common, "activityCode": "DIV", "reportDate": "2025-01-02",
+             "date": "2024-12-31", "amount": "100"},
+            {**common, "activityCode": "WHT", "reportDate": "2025-01-02",
+             "date": "2024-12-31", "amount": "-15"},
+        ]
+        q2 = [{**common, "activityCode": "WHT", "reportDate": "2025-04-10",
+               "date": "2024-12-31", "amount": "5"}]
+        rd = calculate_for_funds(q2, coverage_from="2025-04-01")
+        assert rd["audit"]["prior_year_withholding"] == [], action_id
+        unresolved = rd["audit"]["withholding_year_unresolved"]
+        assert [i["amount_eur"] for i in unresolved] == [5], action_id
+        assert rd["zeile_41_withholding_tax_eur"] == -5, action_id
+        rd = calculate_for_funds(q1 + q2, coverage_from="2025-01-01")
+        assert rd["audit"]["prior_year_withholding"] == [], action_id
+        assert rd["audit"]["withholding_year_unresolved"] == [], action_id
+        assert rd["zeile_41_withholding_tax_eur"] == 10, action_id
+
+
 def test_year_boundary_is_resolved_by_action_id():
     common = {"currency": "EUR", "isin": "US0378331005", "symbol": "AAPL",
               "actionID": "A4"}
@@ -705,6 +734,7 @@ if __name__ == "__main__":
     test_orphan_net_refund_without_full_year_coverage_is_unresolved()
     test_quarter_export_refund_is_not_moved_to_a_prior_year()
     test_orphan_withholding_without_distribution_stays_in_the_year()
+    test_year_end_distribution_booked_in_january_needs_coverage()
     test_year_boundary_is_resolved_by_action_id()
     test_german_tax_with_prior_year_date_is_not_moved()
     test_booking_and_entitlement_dates_stay_visible_in_review()
