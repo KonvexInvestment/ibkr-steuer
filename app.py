@@ -862,13 +862,21 @@ def classify_xmls(xml_files):
                     ),
                 })
                 continue
+            # Same base currency as the extraction: AccountInformation,
+            # otherwise derived from the bookings. If it cannot be
+            # determined, the extraction rejects the file with its message.
+            try:
+                currency = extract_ibkr_data.account_info_from_root(
+                    root, xml_file.name)['currency']
+            except extract_ibkr_data.FlexExportError:
+                currency = ''
             entry = {
                 'file': xml_file,
                 'from_date': normalize_ibkr_date(raw_from_date),
                 'to_date': normalize_ibkr_date(raw_to_date),
                 'name': xml_file.name,
                 'account_name': acct.get('name', '') if acct is not None else '',
-                'currency': acct.get('currency', 'EUR') if acct is not None else 'EUR',
+                'currency': currency,
             }
             accounts.setdefault(account_id, []).append(entry)
         except Exception as exc:
@@ -1839,7 +1847,7 @@ def _run_compute(dataset, csv_entry, dom, requested_key, generation):
             if len(accounts_to_process) > 1:
                 currencies = {
                     xs[-1]['currency'] for xs in accounts_to_process.values()
-                }
+                } - {''}
                 if len(currencies) > 1:
                     raise UploadValidationError(
                         "Unterschiedliche Basiswährungen erkannt: "

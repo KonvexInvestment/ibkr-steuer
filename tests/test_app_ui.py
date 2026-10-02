@@ -499,6 +499,51 @@ def test_overlapping_periods_are_a_hard_error():
         "Ueberlappende Zeitraeume duerfen keinen Snapshot committen"
 
 
+def make_usd_xml(account, with_account_info):
+    """USD-Konto; ohne AccountInformation nur aus den BaseCurrency-Buchungen
+    als USD erkennbar."""
+    body = f"""
+      <Trades>
+        <Trade accountId="{account}" assetCategory="STK" subCategory="COMMON" symbol="AAPL" description="APPLE" conid="1" isin="US0378331005" tradeID="t{account}" reportDate="2025-03-10" dateTime="2025-03-10 10:00:00" buySell="SELL" openClose="C" quantity="-10" tradePrice="200" closePrice="200" proceeds="2000" cost="-1800" fifoPnlRealized="200" fxRateToBase="1" ibCommission="-1" currency="USD" levelOfDetail="EXECUTION" transactionType="ExchTrade" multiplier="1" />
+      </Trades>
+      <StmtFunds>
+        <StatementOfFundsLine accountId="{account}" currency="USD" fxRateToBase="1" assetCategory="STK" symbol="AAPL" isin="US0378331005" reportDate="2025-05-15" date="2025-05-15" activityCode="DIV" activityDescription="AAPL Cash Dividend" amount="100" transactionID="f{account}" levelOfDetail="BaseCurrency" />
+      </StmtFunds>
+"""
+    xml = make_xml(body=body, account=account)
+    info = f'<AccountInformation accountId="{account}" name="Synthetic" currency="EUR" />'
+    replacement = info.replace('currency="EUR"', 'currency="USD"') if with_account_info else ''
+    return xml.replace(info, replacement)
+
+
+def test_base_currency_check_derives_missing_account_information():
+    """Konto B hat keine AccountInformation; die Extraktion leitet USD aus
+    den Buchungen ab. Die Upload-Prüfung muss dieselbe Währung sehen,
+    sonst meldet sie zwei USD-Konten als Währungskonflikt."""
+    at = run_app(make_dataset([
+        ("a.xml", make_usd_xml("U1", with_account_info=True)),
+        ("b.xml", make_usd_xml("U2", with_account_info=False)),
+    ]))
+    assert_no_exception(at, "zwei USD-Konten")
+    rendered = all_markdown(at)
+    assert "Unterschiedliche Basiswährungen" not in rendered
+    assert 'snapshot' in at.session_state
+    assert "2 Konten" in rendered
+
+
+def test_base_currency_conflict_is_found_without_account_information():
+    """Umgekehrt: Ein EUR-Konto und ein USD-Konto ohne AccountInformation
+    sind ein Konflikt, kein stiller EUR-Default."""
+    at = run_app(make_dataset([
+        ("eur.xml", make_xml(account="U1")),
+        ("usd.xml", make_usd_xml("U2", with_account_info=False)),
+    ]))
+    assert_no_exception(at, "EUR + abgeleitetes USD")
+    rendered = all_markdown(at)
+    assert "Unterschiedliche Basiswährungen erkannt: EUR, USD" in rendered
+    assert 'snapshot' not in at.session_state
+
+
 def test_partnership_trade_is_visible_in_export_summary():
     uso_xml = make_xml().replace(
         'symbol="FAKE" description="FAKE ETF" conid="2" '
@@ -723,6 +768,8 @@ if __name__ == '__main__':
         test_anonymous_fills_reach_ui_and_exports,
         test_multi_statement_xml_is_a_hard_error,
         test_overlapping_periods_are_a_hard_error,
+        test_base_currency_check_derives_missing_account_information,
+        test_base_currency_conflict_is_found_without_account_information,
         test_partnership_trade_is_visible_in_export_summary,
         test_future_option_assignment_is_transparent_in_ui,
         test_transaction_tax_daily_aggregate_is_transparent_in_ui,
