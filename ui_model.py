@@ -30,7 +30,7 @@ import calculate_tax_report
 # Bump when the snapshot payload layout OR the computed values for the same
 # input change; stale session_state snapshots from an older code version are
 # then recomputed instead of rendered.
-SCHEMA_VERSION = 9  # Quellensteuer-Korrekturen fuer Vorjahres-Ausschuettungen.
+SCHEMA_VERSION = 10  # Vorjahreszuordnung der Quellensteuer nur bei Abdeckung ab 1. Januar.
 # Bump when the view-model/export layout changes (part of the view key).
 VIEW_SCHEMA_VERSION = 1
 
@@ -916,9 +916,9 @@ def collect_notices(report, context=None):
             'prueffaelle', len(prior_wht), prior_wht,
         ))
 
-    # Netto-Erstattung ohne Ausschuettung im Export und ohne Vorjahresdatum:
-    # das Jahr der Ausschuettung ist nicht belegt (z.B. Export ab
-    # Quartalsmitte). Sie bleibt im Steuerjahr und wird hier sichtbar.
+    # Korrektur einer Ausschuettung, die nicht im Export steht, bei Abdeckung
+    # erst nach dem 1. Januar: das Jahr der Ausschuettung ist nicht belegt
+    # (z.B. Quartalsexport). Sie bleibt im Steuerjahr und wird hier sichtbar.
     unresolved_wht = audit.get('withholding_year_unresolved', []) or []
     if unresolved_wht:
         net = sum(i.get('amount_eur', 0) for i in unresolved_wht)
@@ -950,18 +950,18 @@ def collect_notices(report, context=None):
         coverage = '. '.join(coverage)
         notices.append(_notice(
             'withholding_year_unresolved', 'prueffall', 'normal',
-            'Quellensteuer-Erstattung ohne zugehörige Ausschüttung',
-            f"{len(unresolved_wht)} Buchung(en) ergeben netto eine "
-            "Erstattung ausländischer Quellensteuer "
-            f"({net:+,.2f} EUR; {listed}), ohne dass der Export die "
-            "zugehörige Ausschüttung oder ein Datum aus einem früheren Jahr "
-            f"enthält. {coverage}. Die Ausschüttung kann deshalb in diesem "
-            "Jahr außerhalb der Exporte oder in einem früheren Jahr liegen. "
-            "Die Erstattung ist in Zeile 41 dieses Jahres verrechnet und "
-            "mindert sie, bei Fonds im Standardmodus nach Teilfreistellung. "
-            "Betrifft sie eine Ausschüttung eines früheren Jahres, gehört sie "
-            "zur Anrechnung jenes Jahres. Mit lückenlosen Exporten ab dem "
-            "1. Januar ordnet das Tool die Erstattung selbst zu.",
+            'Quellensteuer-Korrektur ohne zugehörige Ausschüttung',
+            f"{len(unresolved_wht)} Buchung(en) korrigieren die ausländische "
+            "Quellensteuer von Ausschüttungen, die nicht im Export stehen "
+            f"(netto {net:+,.2f} EUR, positiv = Erstattung; {listed}). "
+            f"{coverage}. Die Ausschüttungen können deshalb in diesem Jahr "
+            "außerhalb der Exporte gebucht sein, auch eine Ausschüttung vom "
+            "Jahresende, die erst im Januar gebucht wurde, oder zu einem "
+            "früheren Jahr gehören. Die Buchungen sind in Zeile 41 dieses "
+            "Jahres verrechnet, bei Fonds im Standardmodus nach "
+            "Teilfreistellung. Betreffen sie eine Ausschüttung eines früheren "
+            "Jahres, gehören sie zur Anrechnung jenes Jahres. Mit lückenlosen "
+            "Exporten ab dem 1. Januar ordnet das Tool sie selbst zu.",
             'prueffaelle', len(unresolved_wht), unresolved_wht,
         ))
 

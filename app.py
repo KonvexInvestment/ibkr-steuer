@@ -4277,7 +4277,7 @@ Ausländische Quellensteuern auf Dividenden und Zinsen (z.B. 15% US-Quellensteue
 
 Deutsche Dividendensteuer aus Buchungen mit `- DE Steuer` wird dagegen in Kapitalertragsteuer (Zeile 37) und Solidaritätszuschlag (Zeile 38) aufgeteilt. Wenn das Steuerprogramm diese Zeilen ohne Steuerbescheinigung nach §45a EStG sperrt, bietet "Variante B" eine technische Ersatzdarstellung über Zeile 19 bzw. 41 (Checkbox im Bereich Anlage KAP). Sie ist kein amtlich belegter Ersatz für die Steuerbescheinigung und sollte vor der Abgabe mit Finanzamt oder Steuerberatung abgestimmt werden.
 
-Korrekturen früherer Ausschüttungen: Erstattet oder belastet IBKR Quellensteuer nachträglich für eine Ausschüttung eines früheren Jahres (typisch sind die Reklassifizierungen von US-Fonds im Februar), gehört die Korrektur zur Anrechnung im Jahr der Ausschüttung. Sie fließt nicht in Zeile 41 dieses Jahres, sondern erscheint als Prüffall mit Wertpapier, Ausschüttungsjahr und Betrag. Die Zuordnung erfolgt über IBKRs `actionID`, die Ausschüttung, Einbehalt und Erstattung verbindet. Eine Erstattung, zu der der Export weder die Ausschüttung noch ein Datum aus einem früheren Jahr enthält, gehört ebenfalls zu einer früheren Ausschüttung, wenn die hochgeladenen Exporte das Steuerjahr lückenlos ab dem 1. Januar abdecken. Beginnen sie später, kann die Ausschüttung auch im selben Jahr vor Exportbeginn liegen: Dann bleibt die Erstattung in Zeile 41 dieses Jahres und erscheint als eigener Prüffall.
+Korrekturen früherer Ausschüttungen: Erstattet oder belastet IBKR Quellensteuer nachträglich für eine Ausschüttung eines früheren Jahres (typisch sind die Reklassifizierungen von US-Fonds im Februar), gehört die Korrektur zur Anrechnung im Jahr der Ausschüttung. Sie fließt nicht in Zeile 41 dieses Jahres, sondern erscheint als Prüffall mit Wertpapier, Ausschüttungsjahr und Betrag. Die Zuordnung erfolgt über IBKRs `actionID`, die Ausschüttung, Einbehalt und Erstattung verbindet. Eine Erstattung, zu der der Export weder die Ausschüttung noch ein Datum aus einem früheren Jahr enthält, gehört ebenfalls zu einer früheren Ausschüttung. Beides gilt nur, wenn die hochgeladenen Exporte das Steuerjahr lückenlos ab dem 1. Januar abdecken. Beginnen sie später, kann die Ausschüttung auch im Steuerjahr vor Exportbeginn gebucht sein, etwa eine Dividende vom 31. Dezember mit Buchung im Januar: Dann bleibt die Korrektur in Zeile 41 dieses Jahres und erscheint als eigener Prüffall.
 
 Sonderfall deutscher Investmentfonds: Behält IBKR deutsche Kapitalertragsteuer auf einem DE-Fonds ein, wird sie weder in Zeile 41 angerechnet noch automatisch in Zeile 37/38 eingetragen. §32d Abs. 5 EStG erfasst nur ausländische Steuern, und die auszahlende Stelle berücksichtigt die Teilfreistellung bereits beim Steuerabzug (§43a Abs. 2 EStG). Der Betrag erscheint als Prüffall ("DE-Steuer auf Fonds") und muss anhand der IBKR-Abrechnung manuell zugeordnet werden.
 
@@ -4452,7 +4452,7 @@ Buchungscodes außerhalb dieser Tabelle werden nicht stillschweigend übergangen
 
 **Währungsumrechnung (EUR-Basis):** `amount` ist bereits in EUR (BaseCurrency-Ansicht). Keine weitere Umrechnung nötig.
 
-**Jahresfilter:** `reportDate.year == Steuerjahr`. Ausnahme ausländische Quellensteuer: Korrekturen einer Ausschüttung aus einem früheren Jahr gehören zur Anrechnung des Ausschüttungsjahres. Erkannt werden sie über die `actionID`: Gehört keine im Steuerjahr gebuchte Ausschüttung dazu und trägt eine Zeile der Gruppe ein Vorjahresdatum, fließen sie nicht in Zeile 41 dieses Jahres und erscheinen als Prüffall. Erstattet eine solche Gruppe netto, ohne dass eine Zeile ein Vorjahresdatum trägt, gilt sie nur dann als Vorjahresfall, wenn die hochgeladenen Exporte das Steuerjahr lückenlos ab dem 1. Januar abdecken (Wochenenden und Neujahr zählen nicht als Lücke). Sonst bleibt sie im Steuerjahr und erscheint als Prüffall „Quellensteuer-Erstattung ohne zugehörige Ausschüttung“. Ohne `actionID` gilt: Vorjahresdatum und keine Dividende mit gleicher ISIN und gleichem Datum im Steuerjahr. Typisch sind die Reklassifizierungen von US-Fonds im Februar.
+**Jahresfilter:** `reportDate.year == Steuerjahr`. Ausnahme ausländische Quellensteuer: Korrekturen einer Ausschüttung aus einem früheren Jahr gehören zur Anrechnung des Ausschüttungsjahres. Erkannt werden sie über die `actionID`: Gehört keine im Steuerjahr gebuchte Ausschüttung dazu und trägt eine Zeile der Gruppe ein Vorjahresdatum oder erstattet die Gruppe netto, fließen sie nicht in Zeile 41 dieses Jahres und erscheinen als Prüffall. Ohne `actionID` gilt: Vorjahresdatum und keine Dividende mit gleicher ISIN und gleichem Datum im Steuerjahr. Beides setzt voraus, dass die hochgeladenen Exporte das Steuerjahr lückenlos ab dem 1. Januar abdecken (Wochenenden und Neujahr zählen nicht als Lücke). Sonst bleiben die Buchungen im Steuerjahr und erscheinen als Prüffall „Quellensteuer-Korrektur ohne zugehörige Ausschüttung“. Typisch sind die Reklassifizierungen von US-Fonds im Februar.
 
 ---
 
@@ -5053,12 +5053,14 @@ def _build_text_report():
         unresolved_wht_net = sum(float(i.get('amount_eur') or 0)
                                  for i in unresolved_wht_items)
         prior_wht_export += (
-            "\nQUELLENSTEUER-ERSTATTUNGEN OHNE ZUGEHÖRIGE AUSSCHÜTTUNG "
+            "\nQUELLENSTEUER-KORREKTUREN OHNE ZUGEHÖRIGE AUSSCHÜTTUNG "
             "(PRÜFFALL)\n"
             f"  {len(unresolved_wht_items)} Buchung(en), netto "
             f"{fmt_de(unresolved_wht_net)} EUR (positiv = Erstattung). In "
-            "Zeile 41 dieses Jahres verrechnet; der Export belegt nicht, in "
-            "welchem Jahr die zugehörige Ausschüttung lag.\n")
+            "Zeile 41 dieses Jahres verrechnet; eine lückenlose Abdeckung "
+            "ab dem 1. Januar ist nicht belegt (Beginn später, Lücke oder "
+            "unbekannt), deshalb auch nicht, in welchem Jahr die zugehörige "
+            "Ausschüttung gebucht wurde.\n")
         for item in unresolved_wht_items:
             prior_wht_export += (
                 f"  {str(item.get('reportDate', ''))[:10]} "
