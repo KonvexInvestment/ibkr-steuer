@@ -19,7 +19,7 @@ def calculate(currency='CHF', category='STK', cost=1000, pnl=10,
               open_time='2025-01-02 10:00:00', close_time='2025-02-01 10:00:00',
               extra_rates=(), lot_conid='123', drop_opening=False,
               lot_open_time=None, lot_tx='open', lot_trade_date='',
-              extra_trades=()):
+              extra_trades=(), official_days=('2025-01-02', '2025-02-01')):
     # open_time/close_time are IBKR's ET timestamps; tradeDate stays the
     # local trading day (2025-01-02 / 2025-02-01), as on Asian listings.
     symbol = 'SPY' if etf else 'TEST'
@@ -54,17 +54,20 @@ def calculate(currency='CHF', category='STK', cost=1000, pnl=10,
                fxRateToBase=str(close_fx))
     rates = [dict(reportDate=day, fromCurrency=curr, toCurrency='EUR', rate=str(rate))
              for curr, pair in [(currency, (1.1, 1)), ('USD', (.5, .5))]
-             for day, rate in zip(['2025-01-02', '2025-02-01'], pair)]
+             for day, rate in zip(['2025-01-02', '2025-02-01'], pair)
+             if curr == 'USD' or day in official_days]
     rates += [dict(reportDate=day, fromCurrency=currency, toCurrency='EUR',
                    rate=str(rate)) for day, rate in extra_rates]
     trades = ([closing] if drop_opening else [opening, closing])
-    trades += [dict(common, tradeID=f'x{i}', transactionID=f'x{i}',
-                    conid=f'x{i}', dateTime=when, tradeDate=when[:10],
-                    reportDate=when[:10], transactionType='ExchTrade',
-                    buySell='BUY', openCloseIndicator='O', cost='1',
-                    proceeds='-1', tradePrice='1', fifoPnlRealized='0',
-                    fxRateToBase=str(rate), ibCommission='0')
-               for i, (when, rate) in enumerate(extra_trades)]
+    # extra_trades: (ET timestamp, fxRateToBase[, field overrides])
+    trades += [{**dict(common, tradeID=f'x{i}', transactionID=f'x{i}',
+                       conid=f'x{i}', dateTime=when, tradeDate=when[:10],
+                       reportDate=when[:10], transactionType='ExchTrade',
+                       buySell='BUY', openCloseIndicator='O', cost='1',
+                       proceeds='-1', tradePrice='1', fifoPnlRealized='0',
+                       fxRateToBase=str(rate), ibCommission='0'),
+                **(rest[0] if rest else {})}
+               for i, (when, rate, *rest) in enumerate(extra_trades)]
     with tempfile.TemporaryDirectory() as tmp:
         for name, rows in [('trades', trades), ('closed_lots', [lot]),
                            ('account_info', [dict(currency=base, tax_year='2025', fx_transactions_count='0')]),
@@ -166,6 +169,31 @@ class NonUsdTageskurs(unittest.TestCase):
         # Another fill booked on the ET day must not blend into the rate.
         report, _ = calculate(official=False, open_time='2025-01-01 21:00:00',
                               extra_trades=[('2025-01-01 10:00:00', 1.3)])
+        detail = report['fx_correction_details'][0]
+        self.assertAlmostEqual(detail['fx_open'], 1.1)
+        self.assertAlmostEqual(report['fx_correction_total'], -100)
+
+    def test_conversion_rate_gap_keeps_the_purchase_fill_rate(self):
+        # ConversionRate covers the currency but not the purchase day. The
+        # opening fill's own rate must survive instead of being replaced by
+        # the nearest official rate (1.00): otherwise +10 instead of -90.
+        for base in ('EUR', 'USD'):
+            with self.subTest(base=base):
+                report, final = calculate(
+                    base=base, official_days=('2025-02-01',),
+                    extra_rates=[('2024-12-31', 1.0)])
+                detail = report['fx_correction_details'][0]
+                self.assertAlmostEqual(detail['fx_open'], 1.1)
+                self.assertAlmostEqual(detail['fx_close'], 1.0)
+                self.assertAlmostEqual(final['topf_1'], -90)
+
+    def test_cancelled_fills_and_conversions_stay_out_of_the_rate_series(self):
+        # A cancelled fill and an automatic currency conversion on the
+        # purchase day carry other rates; they must not blend into it.
+        report, _ = calculate(official=False, extra_trades=[
+            ('2025-01-02 11:00:00', 1.3, {'transactionType': 'TradeCancel'}),
+            ('2025-01-02 12:00:00', 1.3, {'assetCategory': 'CASH'}),
+        ])
         detail = report['fx_correction_details'][0]
         self.assertAlmostEqual(detail['fx_open'], 1.1)
         self.assertAlmostEqual(report['fx_correction_total'], -100)
