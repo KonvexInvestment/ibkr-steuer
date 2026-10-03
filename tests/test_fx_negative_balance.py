@@ -760,7 +760,7 @@ def tc26_opt_out_keeps_debt_repayment():
 def tc27_margin_days_use_ibkr_balance_column():
     """Margin-Tage kommen aus IBKRs balance-Spalte, nicht aus einer Eigenkumulation.
 
-    Realfall audit2: Bei gemergten Mehrjahres-Exporten driftet eine Kumulation ueber
+    Realfall: Bei gemergten Mehrjahres-Exporten driftet eine Kumulation ueber
     `amount` weg, sodass echte Schuldphasen unsichtbar blieben. Hier weicht die
     Kumulation bewusst vom gemeldeten Saldo ab.
     """

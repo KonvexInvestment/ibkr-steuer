@@ -312,7 +312,7 @@ def test_ambiguous_same_day_match_stays_manual_review():
 
 def _french_ftt_fixture(lot_ids=True, second_buy_quantity=97,
                         described_quantity=170):
-    """Realmuster U770 (Issue #89): HO, 0,3 % FTT als Tagesaggregat.
+    """Realmuster: franzoesische FTT (0,3 %) als Tagesaggregat.
 
     Kauf 19.06. in zwei Fills derselben Sekunde (73 + 97 = 170), eine
     TTAX-Zeile "French Daily Trade Charge Tax HO 170" ueber 78,96 EUR
@@ -539,7 +539,7 @@ def test_missing_or_mismatched_lots_stay_review_items():
 
 
 def test_trade_quantity_field_is_primary_quantity_source():
-    """Realbeleg: die TTAX-Zeile traegt tradeQuantity="170"/"25"/"1"; der
+    """Realbeleg: die TTAX-Zeile traegt die Stueckzahl (z.B. "25", "1"); der
     Text ist nur Fallback (italienische Zeilen: tradeQuantity="0")."""
     # Text ohne Stueckzahl, Feld belegt die Summe der Fills → Tagesaggregat.
     trades, funds, lots = _french_ftt_fixture()
