@@ -24,7 +24,7 @@ Automatische Berechnung von Anlage KAP, KAP-INV und SO aus Interactive Brokers F
 ## So funktioniert es
 
 1. In IBKR einloggen: Performance & Berichte → Flex-Abfragen
-2. Neue Flex Query anlegen: alle Sektionen aktivieren, Format XML, Zeitraum auf das gewünschte Steuerjahr. Im Abschnitt Trades unter Levels of Detail sowohl Executions als auch Closed Lots auswählen: Ohne Closed Lots entfallen Tageskurs-Korrektur, Kaufsteuer-Zuordnung (TTAX) und die Haltefrist-Prüfung für Anlage SO
+2. Neue Flex Query anlegen: alle Sektionen aktivieren und in jeder Sektion alle Felder auswählen, Format XML, Zeitraum auf das gewünschte Steuerjahr. Fehlen bei den Trades die Felder Symbol, Conid oder (bei Optionen) Underlying Symbol, bricht das Tool mit einer Fehlermeldung ab, weil sich Andienungen sonst nicht der Aktie zuordnen lassen. Im Abschnitt Trades unter Levels of Detail sowohl Executions als auch Closed Lots auswählen: Ohne Closed Lots entfallen Tageskurs-Korrektur, Kaufsteuer-Zuordnung (TTAX) und die Haltefrist-Prüfung für Anlage SO, und Prämien aus Put-Andienungen werden zusätzlich zur Stillhalterprämie im Veräußerungsergebnis versteuert
 3. XML-Datei herunterladen
 4. Auf der [Webseite](https://konvexinvestment.github.io/ibkr-steuer/) hochladen, fertig
 

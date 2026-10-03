@@ -38,6 +38,102 @@ def get_statement_period(stmt):
     return normalize_ibkr_date(raw_from), normalize_ibkr_date(raw_to)
 
 
+class FlexExportError(ValueError):
+    """The export lacks data the tax logic needs; the user must fix the
+    Flex Query. Shown in the GUI as a plain message, not as a crash."""
+
+
+def account_info_from_root(root, source_name=''):
+    """AccountInformation of the first FlexStatement, never a silent default.
+
+    Tax year and base currency used to exist only via AccountInformation;
+    exports without that section made the core fall back to tax year 2025
+    in EUR without any warning. Two real exports lack the section. The base
+    currency then comes from the StmtFunds rows at levelOfDetail
+    "BaseCurrency" (present in every real export), else from the currency of
+    trades with fxRateToBase 1. If neither is unique, raise instead of
+    guessing. Derived records carry account_info_source="derived".
+    """
+    stmt = root.find('.//FlexStatement')
+    scope = stmt if stmt is not None else root
+    acct = scope.find('.//AccountInformation')
+    data = acct.attrib.copy() if acct is not None else {}
+    if data.get('currency'):
+        return data
+    currencies = set()
+    funds = scope.find('.//StmtFunds')
+    for row in (funds if funds is not None else []):
+        if row.get('levelOfDetail') == 'BaseCurrency' and row.get('currency'):
+            currencies.add(row.get('currency'))
+    if not currencies:
+        trades = scope.find('.//Trades')
+        for row in (trades if trades is not None else []):
+            try:
+                is_base = float(row.get('fxRateToBase') or 0) == 1.0
+            except ValueError:
+                is_base = False
+            if is_base and row.get('currency'):
+                currencies.add(row.get('currency'))
+    if len(currencies) != 1:
+        name = f" ({source_name})" if source_name else ''
+        raise FlexExportError(
+            f"Basiswährung nicht bestimmbar{name}: Der Export enthält keine "
+            "Sektion \"Account Information\" mit Währung, und aus den "
+            "Buchungen lässt sich keine eindeutige Basiswährung ableiten. "
+            "Bitte in der Flex Query die Sektion Account Information "
+            "(mindestens Currency) aktivieren und neu exportieren."
+        )
+    data['currency'] = currencies.pop()
+    if not data.get('accountId') and stmt is not None:
+        data['accountId'] = stmt.get('accountId', '')
+    data['account_info_source'] = 'derived'
+    return data
+
+
+# Trade fields without which assignments cannot be linked to the delivered
+# stock: premiums would then be taxed twice (as Stillhalterprämie and inside
+# the stock or fund result). Values are the field names in the Flex Query UI.
+REQUIRED_TRADE_FIELDS = {'symbol': 'Symbol', 'conid': 'Conid'}
+REQUIRED_OPTION_FIELDS = {'underlyingSymbol': 'Underlying Symbol'}
+
+
+def validate_trade_fields(root, source_name=''):
+    """Fail loudly when the Flex Query omits trade fields the tax logic needs.
+
+    A field counts as missing only if no execution row carries it, i.e. it
+    was not selected in the Flex Query at all. Real exports from a reduced
+    query lacked symbol, underlyingSymbol and conid and were computed
+    silently wrong (put premiums doubled in KAP-INV and Topf 1).
+    """
+    stmt = root.find('.//FlexStatement')
+    scope = stmt if stmt is not None else root
+    trades = scope.find('.//Trades')
+    rows = [
+        row for row in (trades if trades is not None else [])
+        if row.tag == 'Trade'
+        and row.get('levelOfDetail', '') in ('', 'EXECUTION')
+    ]
+    if not rows:
+        return
+    missing = [label for field, label in REQUIRED_TRADE_FIELDS.items()
+               if not any(row.get(field) for row in rows)]
+    options = [row for row in rows
+               if row.get('assetCategory') in ('OPT', 'FOP', 'FSFOP')]
+    if options:
+        missing += [label for field, label in REQUIRED_OPTION_FIELDS.items()
+                    if not any(row.get(field) for row in options)]
+    if missing:
+        name = f" ({source_name})" if source_name else ''
+        raise FlexExportError(
+            f"Flex Query unvollständig{name}: In der Sektion Trades fehlen "
+            f"die Felder {', '.join(missing)}. Ohne sie lassen sich "
+            "Andienungen nicht der gelieferten Aktie zuordnen, Prämien "
+            "würden doppelt versteuert. Bitte in der Flex Query unter Trades "
+            "diese Felder aktivieren (am einfachsten alle Felder auswählen) "
+            "und neu exportieren."
+        )
+
+
 def extract_conversion_rates(root):
     """Extract ConversionRate elements (official IBKR daily rates) from XML."""
     rows = []
@@ -151,8 +247,8 @@ def extract_fx_multi_xml(xml_files, output_dir):
     # 2. Detect base currency from main XML
     tree = ET.parse(main_xml)
     root = tree.getroot()
-    acct = root.find('.//AccountInformation')
-    base_curr = acct.attrib.get('currency', 'EUR') if acct is not None else 'EUR'
+    base_curr = account_info_from_root(
+        root, os.path.basename(main_xml))['currency']
 
     # 3. Merge trades from history XMLs into trades.csv (for Stillhalter matching)
     if history_xmls:
@@ -188,6 +284,11 @@ def extract_fx_multi_xml(xml_files, output_dir):
 
         existing_keys = {key for _, key in trade_occurrence_keys(existing_trades)}
         added_history_trades = 0
+
+        # Validate outside the try below: that loop only logs its errors.
+        for xml_path in history_xmls:
+            validate_trade_fields(ET.parse(xml_path).getroot(),
+                                  os.path.basename(xml_path))
 
         for xml_path in history_xmls:
             try:
@@ -385,11 +486,23 @@ def extract_quarterly_xmls(xml_files, output_dir):
         fx_occurrences = Counter()
         print(f"  {os.path.basename(xml_path)}: {from_date} – {to_date}")
 
-        # AccountInfo (from first XML)
-        acct = root.find('.//AccountInformation')
-        if acct is not None and acct_data is None:
-            acct_data = acct.attrib.copy()
-            base_curr = acct_data.get('currency', 'EUR')
+        # AccountInfo: first XML, a real section wins over a derived one.
+        # All merged exports of one tax year must share the base currency,
+        # otherwise their base-currency amounts cannot be summed.
+        info = account_info_from_root(root, os.path.basename(xml_path))
+        validate_trade_fields(root, os.path.basename(xml_path))
+        if acct_data is not None and info['currency'] != base_curr:
+            raise FlexExportError(
+                "Unterschiedliche Basiswährungen im selben Steuerjahr: "
+                f"{base_curr} und {info['currency']} "
+                f"({os.path.basename(xml_path)}). Bitte alle Exporte eines "
+                "Jahres mit derselben Basiswährung erzeugen."
+            )
+        if acct_data is None or (
+                acct_data.get('account_info_source') == 'derived'
+                and info.get('account_info_source') != 'derived'):
+            acct_data = info
+            base_curr = info['currency']
         if to_date and (tax_year is None or to_date > tax_year):
             tax_year = to_date[:4]
 
@@ -703,6 +816,14 @@ def parse_ibkr_xml(xml_file_path, output_dir):
               f"Es wird NUR das erste Konto ({acct_ids[0]}) verarbeitet. "
               f"Bitte pro Konto eine eigene Flex Query erstellen.")
 
+    # Base currency before any CSV is written: a failure must not leave a
+    # half-extracted directory behind.
+    acct_data = account_info_from_root(root, os.path.basename(xml_file_path))
+    validate_trade_fields(root, os.path.basename(xml_file_path))
+    if acct_data.get('account_info_source') == 'derived':
+        print(f"WARNUNG: Keine Account Information im Export; Basiswährung "
+              f"{acct_data['currency']} aus den Buchungen abgeleitet.")
+
     # Define sections to extract
     # Mapping: XML Tag -> Output Filename
     sections = {
@@ -778,8 +899,7 @@ def parse_ibkr_xml(xml_file_path, output_dir):
         print(f"Saved {len(data_rows)} rows to {output_path}")
     # Extract FX transactions from StmtFunds (levelOfDetail="Currency", non-base currency)
     # These are needed for FIFO-based foreign currency gain/loss calculation
-    acct_info_node = root.find('.//AccountInformation')
-    base_curr = acct_info_node.attrib.get('currency', 'EUR') if acct_info_node is not None else 'EUR'
+    base_curr = acct_data['currency']
 
     fx_fields = ['date', 'settleDate', 'currency', 'fxRateToBase', 'activityCode',
                   'activityDescription', 'amount', 'debit', 'credit', 'balance',
@@ -902,20 +1022,18 @@ def parse_ibkr_xml(xml_file_path, output_dir):
     else:
         print(f"FxTransactions: Sektion nicht vorhanden")
 
-    # Extract AccountInformation (single element with base currency)
-    acct_info = acct_info_node
-    if acct_info is not None:
-        acct_data = acct_info.attrib.copy()
-        acct_data['fx_transactions_count'] = str(fx_trans_count)
-        if tax_year_detected:
-            acct_data['tax_year'] = tax_year_detected
-        acct_path = os.path.join(output_dir, 'account_info.csv')
-        with open(acct_path, 'w', newline='', encoding='utf-8') as f:
-            headers = sorted(acct_data.keys())
-            writer = csv.DictWriter(f, fieldnames=headers)
-            writer.writeheader()
-            writer.writerow(acct_data)
-        print(f"Saved account info (base currency: {acct_data.get('currency', '?')}) to {acct_path}")
+    # AccountInformation (or its derived minimum): always written, so the
+    # core never falls back to a default tax year or base currency.
+    acct_data['fx_transactions_count'] = str(fx_trans_count)
+    if tax_year_detected:
+        acct_data['tax_year'] = tax_year_detected
+    acct_path = os.path.join(output_dir, 'account_info.csv')
+    with open(acct_path, 'w', newline='', encoding='utf-8') as f:
+        headers = sorted(acct_data.keys())
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        writer.writerow(acct_data)
+    print(f"Saved account info (base currency: {acct_data.get('currency', '?')}) to {acct_path}")
 
 if __name__ == "__main__":
     if len(sys.argv) > 2:

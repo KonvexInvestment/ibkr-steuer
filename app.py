@@ -862,13 +862,21 @@ def classify_xmls(xml_files):
                     ),
                 })
                 continue
+            # Same base currency as the extraction: AccountInformation,
+            # otherwise derived from the bookings. If it cannot be
+            # determined, the extraction rejects the file with its message.
+            try:
+                currency = extract_ibkr_data.account_info_from_root(
+                    root, xml_file.name)['currency']
+            except extract_ibkr_data.FlexExportError:
+                currency = ''
             entry = {
                 'file': xml_file,
                 'from_date': normalize_ibkr_date(raw_from_date),
                 'to_date': normalize_ibkr_date(raw_to_date),
                 'name': xml_file.name,
                 'account_name': acct.get('name', '') if acct is not None else '',
-                'currency': acct.get('currency', 'EUR') if acct is not None else 'EUR',
+                'currency': currency,
             }
             accounts.setdefault(account_id, []).append(entry)
         except Exception as exc:
@@ -1839,7 +1847,7 @@ def _run_compute(dataset, csv_entry, dom, requested_key, generation):
             if len(accounts_to_process) > 1:
                 currencies = {
                     xs[-1]['currency'] for xs in accounts_to_process.values()
-                }
+                } - {''}
                 if len(currencies) > 1:
                     raise UploadValidationError(
                         "Unterschiedliche Basiswährungen erkannt: "
@@ -1879,24 +1887,32 @@ def _run_compute(dataset, csv_entry, dom, requested_key, generation):
                         with open(csv_report_path, "wb") as fh:
                             fh.write(csv_entry['data'])
 
+                    def _materialize(folder, entry):
+                        # Eigener Unterordner je Datei: Fehlermeldungen der
+                        # Extraktion nennen so den Originalnamen des Uploads,
+                        # ohne dass gleichnamige Dateien kollidieren.
+                        folder = os.path.join(tmp, folder)
+                        os.makedirs(folder, exist_ok=True)
+                        name = os.path.basename(entry.get('name') or '')
+                        if name in ('', '.', '..'):
+                            name = 'upload.xml'
+                        path = os.path.join(folder, name)
+                        with open(path, "wb") as fh:
+                            fh.write(entry['file'].getbuffer())
+                        return path
+
                     if is_quarterly:
-                        xml_paths = []
-                        for i, qxml in enumerate(xmls):
-                            qp = os.path.join(tmp, f"quarter_{i}.xml")
-                            with open(qp, "wb") as fh:
-                                fh.write(qxml['file'].getbuffer())
-                            xml_paths.append(qp)
+                        xml_paths = [
+                            _materialize(f"quarter_{i}", qxml)
+                            for i, qxml in enumerate(xmls)
+                        ]
                         extract_ibkr_data.extract_quarterly_xmls(xml_paths, tmp)
                     else:
-                        xml_path = os.path.join(tmp, "input.xml")
-                        with open(xml_path, "wb") as fh:
-                            fh.write(main_xml['file'].getbuffer())
-                        history_paths = []
-                        for i, hxml in enumerate(history_xmls):
-                            hp = os.path.join(tmp, f"history_{i}.xml")
-                            with open(hp, "wb") as fh:
-                                fh.write(hxml['file'].getbuffer())
-                            history_paths.append(hp)
+                        xml_path = _materialize("input", main_xml)
+                        history_paths = [
+                            _materialize(f"history_{i}", hxml)
+                            for i, hxml in enumerate(history_xmls)
+                        ]
                         if history_paths:
                             extract_ibkr_data.extract_fx_multi_xml(
                                 sorted(history_paths) + [xml_path], tmp
@@ -1967,7 +1983,8 @@ if not _cache_hit:
             _computed = _run_compute(
                 _dataset, _csv_entry, _dom, _requested_key, _generation,
             )
-    except (UploadValidationError, calculate_tax_report.FxCurrencyError) as exc:
+    except (UploadValidationError, calculate_tax_report.FxCurrencyError,
+            extract_ibkr_data.FlexExportError) as exc:
         st.markdown(notice_html({
             'class': 'fehler', 'severity': 'kritisch',
             'title': 'Berechnung nicht möglich', 'body': str(exc),
@@ -4289,12 +4306,12 @@ Die IBKR Flex Query XML wird in einzelne CSV-Dateien zerlegt. Jede XML-Sektion e
 
 | XML-Sektion | Inhalt | Filter |
 |---|---|---|
-| `<Trades>` | Alle Trades. Felder: `assetCategory`, `fifoPnlRealized`, `fxRateToBase`, `reportDate`, `buySell`, `transactionType` | `EXECUTION` → trades.csv, `CLOSED_LOT` → closed_lots.csv (für Tageskurs-Korrektur) |
+| `<Trades>` | Alle Trades. Felder: `assetCategory`, `fifoPnlRealized`, `fxRateToBase`, `reportDate`, `buySell`, `transactionType`; Pflicht sind `symbol`, `conid` und bei Optionen `underlyingSymbol`, sonst bricht die Verarbeitung mit einer Fehlermeldung ab | `EXECUTION` → trades.csv, `CLOSED_LOT` → closed_lots.csv (Tageskurs-Korrektur und Zuordnung von Put-Andienungen zu späteren Verkäufen) |
 | `<StmtFunds>` | Dividenden, Zinsen, Steuern, Gebühren. Felder: `activityCode`, `amount`, `fxRateToBase`, `reportDate`, `transactionID` | Bei einer einzelnen XML-Datei vollständig übernommen; Split-/Quartals-XMLs werden bereits beim Merge dedupliziert. Die Berechnung dedupliziert anschließend nochmals defensiv (Schritt 2) |
 | `<FIFOPerformanceSummaryInBase>` | Aggregierter PnL pro Instrument. Felder: `assetCategory`, `isin`, `totalRealizedPnl` | Fallback für fehlende Trades (z.B. T-Bill Maturity) |
 | `<FxTransactions>` | FX-Gewinne/-Verluste. Felder: `fxCurrency`, `realizedPL`, `reportDate` | Nur `levelOfDetail=TRANSACTION` |
-| `<AccountInformation>` | Basiswährung (`currency`), Kontotyp | Einzelner Eintrag |
-| `<FlexStatement>` | Berichtszeitraum → Steuerjahr aus `toDate` | Automatisch erkannt |
+| `<AccountInformation>` | Basiswährung (`currency`), Kontotyp | Einzelner Eintrag; fehlt die Sektion, wird die Basiswährung aus den Kontostandszeilen der Buchungen abgeleitet, sonst bricht die Verarbeitung mit einer Fehlermeldung ab |
+| `<FlexStatement>` | Berichtszeitraum → Steuerjahr aus `toDate` | Automatisch erkannt, auch ohne `<AccountInformation>` |
 
 **Multi-XML (Vorjahre):** Trades aus allen XMLs werden in eine gemeinsame `trades.csv` zusammengeführt (für Stillhalter-Matching über Jahresgrenzen). FX-Kontobewegungen werden chronologisch gemergt; als Duplikat gilt dabei eine Zeile, bei der alle sechs Schlüsselfelder übereinstimmen: Währung, Datum, `transactionID`, Buchungstext, Betrag und Saldo. Ein Schlüssel allein aus `transactionID` wäre falsch: IBKR vergibt dieselbe ID für jede Folgebuchung derselben Position, etwa für alle täglichen Abrechnungen eines Futures.
 
