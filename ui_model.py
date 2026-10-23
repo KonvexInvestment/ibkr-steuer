@@ -30,7 +30,7 @@ import calculate_tax_report
 # Bump when the snapshot payload layout OR the computed values for the same
 # input change; stale session_state snapshots from an older code version are
 # then recomputed instead of rendered.
-SCHEMA_VERSION = 9  # Tageskurs: ConversionRate ueberschreibt nur ihre eigenen Tage.
+SCHEMA_VERSION = 10  # Vorjahreszuordnung der Quellensteuer nur bei Abdeckung ab 1. Januar.
 # Bump when the view-model/export layout changes (part of the view key).
 VIEW_SCHEMA_VERSION = 1
 
@@ -874,6 +874,127 @@ def collect_notices(report, context=None):
             body,
             'prueffaelle', closing_without_lots,
             [dict(lot_coverage)],
+        ))
+
+    # Quellensteuer-Korrekturen fuer fruehere Ausschuettungen (z.B.
+    # Februar-Reklassifizierung von US-Fonds): nicht in Zeile 41 dieses
+    # Jahres, sondern Anrechnung des Ausschuettungsjahres.
+    prior_wht = audit.get('prior_year_withholding', []) or []
+    if prior_wht:
+        refunds = sum(i.get('amount_eur', 0) for i in prior_wht
+                      if i.get('amount_eur', 0) > 0)
+        charges = -sum(i.get('amount_eur', 0) for i in prior_wht
+                       if i.get('amount_eur', 0) < 0)
+        groups = {}
+        for item in prior_wht:
+            key = (item.get('symbol') or item.get('isin') or '?',
+                   item.get('distribution_year'))
+            groups[key] = groups.get(key, 0.0) + item.get('amount_eur', 0)
+        ranked = sorted(groups.items(), key=lambda kv: -abs(kv[1]))
+        before = f"vor {report.get('tax_year')}" if report.get('tax_year') else '?'
+        listed = '; '.join(
+            f"{name} {year or before}: {amount:+,.2f} EUR"
+            for (name, year), amount in ranked[:6])
+        if len(ranked) > 6:
+            listed += f"; {len(ranked) - 6} weitere"
+        notices.append(_notice(
+            'prior_year_withholding', 'prueffall', 'normal',
+            'Quellensteuer-Korrekturen für frühere Ausschüttungen',
+            f"{len(prior_wht)} Buchung(en) korrigieren die ausländische "
+            "Quellensteuer von Ausschüttungen früherer Jahre (Erstattungen "
+            f"{refunds:,.2f} EUR, Nachbelastungen {charges:,.2f} EUR; je "
+            f"Wertpapier und Ausschüttungsjahr: {listed}). Angerechnet wird "
+            "die Quellensteuer je Kapitalertrag; die Korrekturen gehören "
+            "deshalb zur Anrechnung im Jahr der Ausschüttung und sind nicht "
+            "in Zeile 41 dieses Jahres enthalten. Eine Erstattung mindert "
+            "die dort angerechnete Quellensteuer, bei Fonds nach "
+            "Teilfreistellung. Die Beträge sind zum Kurs am Buchungstag "
+            "umgerechnet. Ob der Bescheid jenes Jahres geändert werden muss, "
+            "bitte mit Finanzamt oder Steuerberatung klären. Umgekehrt "
+            "können Ausschüttungen dieses Jahres später noch korrigiert "
+            "werden.",
+            'prueffaelle', len(prior_wht), prior_wht,
+        ))
+
+    # Korrektur einer Ausschuettung, die nicht im Export steht, bei Abdeckung
+    # erst nach dem 1. Januar: das Jahr der Ausschuettung ist nicht belegt
+    # (z.B. Quartalsexport). Sie bleibt im Steuerjahr und wird hier sichtbar.
+    unresolved_wht = audit.get('withholding_year_unresolved', []) or []
+    if unresolved_wht:
+        net = sum(i.get('amount_eur', 0) for i in unresolved_wht)
+        by_name = {}
+        for item in unresolved_wht:
+            name = item.get('symbol') or item.get('isin') or '?'
+            by_name[name] = by_name.get(name, 0.0) + item.get('amount_eur', 0)
+        ranked = sorted(by_name.items(), key=lambda kv: -abs(kv[1]))
+        listed = '; '.join(f"{name}: {amount:+,.2f} EUR"
+                           for name, amount in ranked[:6])
+        if len(ranked) > 6:
+            listed += f"; {len(ranked) - 6} weitere"
+        starts = sorted({
+            calculate_tax_report.format_german_date(i.get('coverage_from'))
+            for i in unresolved_wht} - {''})
+        unknown = any(not calculate_tax_report.format_german_date(
+            i.get('coverage_from')) for i in unresolved_wht)
+        coverage = []
+        if starts:
+            coverage.append(
+                "Die hochgeladenen Exporte decken das Jahr erst ab "
+                f"{', '.join(starts)} lückenlos ab (späterer Beginn oder "
+                "Lücke zwischen zwei Exporten)")
+        if unknown:
+            coverage.append(
+                "Für " + ("ein Konto" if starts else "diese Daten")
+                + " ist der Exportzeitraum nicht bekannt (vor diesem Stand "
+                "extrahierte Daten; bitte die XML neu einlesen)")
+        coverage = '. '.join(coverage)
+        notices.append(_notice(
+            'withholding_year_unresolved', 'prueffall', 'normal',
+            'Quellensteuer-Korrektur ohne zugehörige Ausschüttung',
+            f"{len(unresolved_wht)} Buchung(en) korrigieren die ausländische "
+            "Quellensteuer von Ausschüttungen, die nicht im Export stehen "
+            f"(netto {net:+,.2f} EUR, positiv = Erstattung; {listed}). "
+            f"{coverage}. Die Ausschüttungen können deshalb in diesem Jahr "
+            "außerhalb der Exporte gebucht sein, auch eine Ausschüttung vom "
+            "Jahresende, die erst im Januar gebucht wurde, oder zu einem "
+            "früheren Jahr gehören. Die Buchungen sind in Zeile 41 dieses "
+            "Jahres verrechnet, bei Fonds im Standardmodus nach "
+            "Teilfreistellung. Betreffen sie eine Ausschüttung eines früheren "
+            "Jahres, gehören sie zur Anrechnung jenes Jahres. Mit lückenlosen "
+            "Exporten ab dem 1. Januar ordnet das Tool sie selbst zu.",
+            'prueffaelle', len(unresolved_wht), unresolved_wht,
+        ))
+
+    # Erstattungsueberhang im Steuerjahr: eine Netto-Erstattung je Fonds
+    # oder bei den Nicht-Fonds mindert still die Anrechnung anderer
+    # Ertraege; ein negatives Zeile 41 ist nicht eintragbar.
+    surplus_funds = [
+        (info.get('ticker') or isin, -float(info.get('wht') or 0))
+        for isin, info in (
+            (report.get('kap_inv', {}) or {}).get('etf_by_isin', {}) or {}
+        ).items()
+        if float(info.get('wht') or 0) > 0.005
+    ]
+    non_fund_wht = float(report.get('withholding_tax_eur') or 0)
+    line_41 = calculate_tax_report.get_kap_line_41_for_reporting(report)
+    if surplus_funds or non_fund_wht < -0.005 or line_41 < -0.005:
+        parts = [f"{name}: {amount:,.2f} EUR" for name, amount in surplus_funds]
+        if non_fund_wht < -0.005:
+            parts.append(f"Nicht-Fonds gesamt: {non_fund_wht:,.2f} EUR")
+        notices.append(_notice(
+            'withholding_refund_surplus', 'prueffall',
+            'kritisch' if line_41 < -0.005 else 'normal',
+            'Quellensteuer-Erstattung übersteigt den Einbehalt',
+            "Im Steuerjahr wurde mehr ausländische Quellensteuer erstattet "
+            f"als einbehalten ({'; '.join(parts)}). Der Überhang mindert "
+            "die Anrechnung anderer Erträge"
+            + (f"; Zeile 41 wäre mit {line_41:,.2f} EUR negativ und so "
+               "nicht eintragbar" if line_41 < -0.005 else '')
+            + ". Vermutlich gehört die Erstattung zu einer Ausschüttung, "
+            "die nicht in diesem Export enthalten ist: aus einem früheren "
+            "Jahr oder aus diesem Jahr vor Beginn des Exports. Bitte die "
+            "Buchungen prüfen.",
+            'prueffaelle', max(len(parts), 1), None,
         ))
 
     transaction_tax = audit.get('transaction_tax', {}) or {}

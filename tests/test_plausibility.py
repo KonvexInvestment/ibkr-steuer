@@ -118,10 +118,42 @@ def test_stock_correction_addback_still_applies():
     print("  OK  Aktien- und Future-Addback wirken unabhaengig")
 
 
+def test_prior_year_withholding_is_added_back():
+    """F5: IBKRs Jahressumme enthaelt Quellensteuer-Korrekturen fuer
+    Vorjahres-Ausschuettungen, Zeile 41 nicht. Der Vergleich rechnet sie
+    zurueck (Fonds-Anteil nur, wenn KAP-INV aktiv und im Vergleich ist)."""
+    def wht_row(plaus):
+        return next(r for r in plaus['rows'] if r['label'] == 'Quellensteuer')
+    audit = {'stillhalter_premium_eur': 20,
+             'future_assignment_corrections': [{'amount_eur': 20}],
+             'prior_year_withholding': [
+                 {'amount_eur': 30.0, 'fund': False},
+                 {'amount_eur': -12.0, 'fund': False},
+                 {'amount_eur': 50.0, 'fund': True},
+             ]}
+    # Eigene Einbehalte 15 EUR; IBKR netto: 15 - (30 - 12) = -3 (Erstattung)
+    report = base_report(withholding_tax_eur=15, audit=audit,
+                         csv_income_totals={'withholding_tax_eur': 3})
+    row = wht_row(build_plausibility(report, TOGGLES))
+    assert row['match'], row
+    without = base_report(withholding_tax_eur=15,
+                          csv_income_totals={'withholding_tax_eur': 3})
+    assert not wht_row(build_plausibility(without, TOGGLES))['match']
+    # Mit KAP-INV im Vergleich zaehlen auch Fonds-Korrekturen, selbst wenn
+    # sie die einzige Fondsaktivitaet sind (kein etf_by_isin-Eintrag).
+    with_fund = build_plausibility(
+        base_report(withholding_tax_eur=15, audit=audit,
+                    csv_income_totals={'withholding_tax_eur': 53}),
+        {'invstg': True})
+    assert wht_row(with_fund)['match'], wht_row(with_fund)
+    print("  OK  Vorjahres-Quellensteuerkorrekturen werden zurueckgerechnet")
+
+
 if __name__ == '__main__':
     print("Plausibilitaetscheck: Stillhalter-Addbacks")
     test_future_assignment_correction_is_added_back()
     test_same_numbers_without_correction_entry_would_mismatch()
     test_report_without_future_corrections_is_unchanged()
     test_stock_correction_addback_still_applies()
+    test_prior_year_withholding_is_added_back()
     print("OK: Plausibilitaetscheck rechnet Aktien- und Future-Korrekturen zurueck")

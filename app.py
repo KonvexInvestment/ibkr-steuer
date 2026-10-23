@@ -1218,6 +1218,8 @@ def merge_report_data(reports):
         'stillhalter_corrections_dropped': [],
         'future_assignment_corrections': [],
         'stillhalter_open_short': [],
+        'prior_year_withholding': [],
+        'withholding_year_unresolved': [],
         'stk_correction_cy': sum(r.get('audit', {}).get('stk_correction_cy', 0) for r in reports),
         'etf_correction_cy': sum(r.get('audit', {}).get('etf_correction_cy', 0) for r in reports),
         'put_nosell_premium_eur': sum(r.get('audit', {}).get('put_nosell_premium_eur', 0) for r in reports),
@@ -1311,6 +1313,10 @@ def merge_report_data(reports):
         merged_audit['future_assignment_corrections'].extend(
             a.get('future_assignment_corrections', []))
         merged_audit['stillhalter_open_short'].extend(a.get('stillhalter_open_short', []))
+        merged_audit['prior_year_withholding'].extend(
+            a.get('prior_year_withholding', []) or [])
+        merged_audit['withholding_year_unresolved'].extend(
+            a.get('withholding_year_unresolved', []) or [])
         merged_audit['transaction_tax'].setdefault('details', []).extend(
             a.get('transaction_tax', {}).get('details', [])
         )
@@ -2083,6 +2089,16 @@ def build_plausibility(d, toggles):
     if has_etf and invstg_on:
         our_div += kap_inv_data.get('etf_dividends_raw_eur', 0)
         our_wht += kap_inv_data.get('etf_wht_eur', 0)
+    # Quellensteuer-Korrekturen fuer Vorjahres-Ausschuettungen zaehlt IBKR in
+    # der Jahressumme mit; das Tool ordnet sie dem Ausschuettungsjahr zu.
+    for item in audit.get('prior_year_withholding', []) or []:
+        # Fonds-Korrekturen nur, wenn der Vergleich Fonds-QSt enthaelt;
+        # bewusst ohne has_etf: sind sie die einzige Fondsaktivitaet des
+        # Jahres, gibt es keinen etf_by_isin-Eintrag.
+        if item.get('fund') and not invstg_on:
+            continue
+        our_wht += calculate_tax_report.get_withholding_tax_for_reporting(
+            item.get('amount_eur', 0))
 
     rows = [
         ("Aktien (Topf 1) Netto", ibkr_stk.get('net', 0),
@@ -4261,6 +4277,8 @@ Ausländische Quellensteuern auf Dividenden und Zinsen (z.B. 15% US-Quellensteue
 
 Deutsche Dividendensteuer aus Buchungen mit `- DE Steuer` wird dagegen in Kapitalertragsteuer (Zeile 37) und Solidaritätszuschlag (Zeile 38) aufgeteilt. Wenn das Steuerprogramm diese Zeilen ohne Steuerbescheinigung nach §45a EStG sperrt, bietet "Variante B" eine technische Ersatzdarstellung über Zeile 19 bzw. 41 (Checkbox im Bereich Anlage KAP). Sie ist kein amtlich belegter Ersatz für die Steuerbescheinigung und sollte vor der Abgabe mit Finanzamt oder Steuerberatung abgestimmt werden.
 
+Korrekturen früherer Ausschüttungen: Erstattet oder belastet IBKR Quellensteuer nachträglich für eine Ausschüttung eines früheren Jahres (typisch sind die Reklassifizierungen von US-Fonds im Februar), gehört die Korrektur zur Anrechnung im Jahr der Ausschüttung. Sie fließt nicht in Zeile 41 dieses Jahres, sondern erscheint als Prüffall mit Wertpapier, Ausschüttungsjahr und Betrag. Die Zuordnung erfolgt über IBKRs `actionID`, die Ausschüttung, Einbehalt und Erstattung verbindet. Eine Erstattung, zu der der Export weder die Ausschüttung noch ein Datum aus einem früheren Jahr enthält, gehört ebenfalls zu einer früheren Ausschüttung. Beides gilt nur, wenn die hochgeladenen Exporte das Steuerjahr lückenlos ab dem 1. Januar abdecken. Beginnen sie später, kann die Ausschüttung auch im Steuerjahr vor Exportbeginn gebucht sein, etwa eine Dividende vom 31. Dezember mit Buchung im Januar: Dann bleibt die Korrektur in Zeile 41 dieses Jahres und erscheint als eigener Prüffall.
+
 Sonderfall deutscher Investmentfonds: Behält IBKR deutsche Kapitalertragsteuer auf einem DE-Fonds ein, wird sie weder in Zeile 41 angerechnet noch automatisch in Zeile 37/38 eingetragen. §32d Abs. 5 EStG erfasst nur ausländische Steuern, und die auszahlende Stelle berücksichtigt die Teilfreistellung bereits beim Steuerabzug (§43a Abs. 2 EStG). Der Betrag erscheint als Prüffall ("DE-Steuer auf Fonds") und muss anhand der IBKR-Abrechnung manuell zugeordnet werden.
 
 ---
@@ -4422,7 +4440,7 @@ Aus `statement_of_funds.csv` werden Cash-Positionen nach `activityCode` zugeordn
 | `INTP` | Stückzinsen (beim Kauf gezahlt) | Negative Einnahmen, Topf 2 (BMF Rn. 51) |
 | `DINT` | Debit Interest (Sollzinsen, Leihgebühren, CFD-Finanzierung) | **Nicht** in Topf 2. Werbungskosten, nach §20 Abs. 9 EStG durch den Sparer-Pauschbetrag abgegolten; nur nachrichtlich |
 | `CFD` | CFD-Zinsen und -Gebühren | Habenzinsen in Topf 2, Finanzierungskosten wie `DINT` nur nachrichtlich |
-| `FRTAX` / `WHT` | Quellensteuer (Withholding Tax) | Zeile 41 (anrechenbar). Ausnahmen: deutsche Kapitalertragsteuer auf DE-Wertpapieren geht nach Zeile 37/38; liegt sie auf einem DE-Fonds, wird sie als Prüffall gemeldet, da §32d Abs. 5 EStG nur ausländische Steuern erfasst und die Formularzuordnung nicht automatisierbar ist |
+| `FRTAX` / `WHT` | Quellensteuer (Withholding Tax) | Zeile 41 (anrechenbar). Ausnahmen: deutsche Kapitalertragsteuer auf DE-Wertpapieren geht nach Zeile 37/38; liegt sie auf einem DE-Fonds, wird sie als Prüffall gemeldet, da §32d Abs. 5 EStG nur ausländische Steuern erfasst und die Formularzuordnung nicht automatisierbar ist. Korrekturen für Ausschüttungen früherer Jahre gehören zur Anrechnung jenes Jahres und erscheinen als Prüffall |
 | `OFEE` / `STAX` | Gebühren, Umsatzsteuer | Nicht abziehbar (§20 Abs. 9), nur nachrichtlich |
 | `TTAX` | Transaktionssteuer | Nach §20 Abs. 4 EStG ergebniswirksam. IBKR bucht Finanztransaktionssteuern (French Daily Trade Charge Tax 0,3 %, seit 1. April 2025 0,4 %; Spanish Daily Trade Charge Tax 0,2 %) als Tagesaggregat pro Wertpapier. Die Stückzahl der Buchung (Feld `tradeQuantity`, ersatzweise Ende des Buchungstexts) ist die Summe der Kauf-Fills des Tages, bei Käufen und Verkäufen am selben Tag der Nettoerwerb (Käufe abzüglich Verkäufe); der Betrag wird nach Transaktionswert auf die Kauf-Fills verteilt. Verkaufssteuer mindert den Schluss-Trade sofort, Kaufsteuer wird über das geschlossene Lot anteilig bis zum Verkauf getragen; mehrere Schluss-Fills zur selben Sekunde teilen sich ein Lot mengenproportional. Bereits in `Trade.taxes` enthaltene Beträge werden nicht doppelt abgezogen. Prüffall bleiben Buchungen ohne konsistente Zuordnung (Stückzahl passt nicht, gemischte Richtungen, Verkauf ohne CLOSED_LOT-Beleg, Export ohne CLOSED_LOT-Zeilen), Steuern auf Stillhalter-Eröffnungen (Zufluss im Eröffnungsjahr, §11 EStG) sowie Instrumente mit eigenem Rechenweg (Anlage SO, Personengesellschaften). Jede Buchung steht mit Status und Grund im Bereich Rechenwege |
 | `BUY` / `SELL` / `ADJ` / `ASSIGN` / `EXE` | Trade- und Settlement-Buchungen | Übersprungen; das realisierte Ergebnis kommt aus den Trade-Daten |
@@ -4434,7 +4452,7 @@ Buchungscodes außerhalb dieser Tabelle werden nicht stillschweigend übergangen
 
 **Währungsumrechnung (EUR-Basis):** `amount` ist bereits in EUR (BaseCurrency-Ansicht). Keine weitere Umrechnung nötig.
 
-**Jahresfilter:** `reportDate.year == Steuerjahr`. Steuer-Rückforderungen (Tax Reclaims) aus Vorjahren, die im Steuerjahr gebucht werden, sind korrekt dem Buchungsjahr zugeordnet.
+**Jahresfilter:** `reportDate.year == Steuerjahr`. Ausnahme ausländische Quellensteuer: Korrekturen einer Ausschüttung aus einem früheren Jahr gehören zur Anrechnung des Ausschüttungsjahres. Erkannt werden sie über die `actionID`: Gehört keine im Steuerjahr gebuchte Ausschüttung dazu und trägt eine Zeile der Gruppe ein Vorjahresdatum oder erstattet die Gruppe netto, fließen sie nicht in Zeile 41 dieses Jahres und erscheinen als Prüffall. Ohne `actionID` gilt: Vorjahresdatum und keine Dividende mit gleicher ISIN und gleichem Datum im Steuerjahr. Beides setzt voraus, dass die hochgeladenen Exporte das Steuerjahr lückenlos ab dem 1. Januar abdecken (Wochenenden und Neujahr zählen nicht als Lücke). Sonst bleiben die Buchungen im Steuerjahr und erscheinen als Prüffall „Quellensteuer-Korrektur ohne zugehörige Ausschüttung“. Typisch sind die Reklassifizierungen von US-Fonds im Februar.
 
 ---
 
@@ -4487,7 +4505,8 @@ Zeile 22 = |Verluste ohne Aktien| (positiver Betrag)
 Zeile 23 = |Aktienverluste| (positiver Betrag)
 Zeile 41 = Quellensteuer außerhalb der Fonds
            + anrechenbare Fonds-Quellensteuer aus KAP-INV
-           (Erstattungsüberschüsse bleiben als negative Korrektur erhalten)
+           (Erstattungsüberschüsse bleiben als negative Korrektur erhalten;
+            Korrekturen für Vorjahres-Ausschüttungen gehören ins Ausschüttungsjahr)
 ```
 
 **Anlage KAP-INV (wenn InvStG aktiviert):**
@@ -5011,6 +5030,44 @@ def _build_text_report():
                     item.get('reason')))
             ttax_export += line + "\n"
 
+    prior_wht_export = ""
+    prior_wht_items = audit.get('prior_year_withholding', []) or []
+    if prior_wht_items:
+        prior_wht_net = sum(float(i.get('amount_eur') or 0)
+                            for i in prior_wht_items)
+        prior_wht_export = (
+            "\nQUELLENSTEUER-KORREKTUREN FÜR FRÜHERE AUSSCHÜTTUNGEN\n"
+            f"  {len(prior_wht_items)} Buchung(en), netto "
+            f"{fmt_de(prior_wht_net)} EUR (positiv = Erstattung). Nicht in "
+            "Zeile 41 dieses Jahres: sie gehören zur Anrechnung im Jahr der "
+            "Ausschüttung.\n")
+        for item in prior_wht_items:
+            prior_wht_export += (
+                f"  {str(item.get('reportDate', ''))[:10]} "
+                f"{str(item.get('symbol') or item.get('isin') or ''):<12} "
+                f"Ausschüttung {item.get('distribution_year') or ('vor ' + str(d.get('tax_year', '')))} "
+                f"{'Fonds ' if item.get('fund') else ''}"
+                f"{fmt_de(float(item.get('amount_eur') or 0)):>10} EUR\n")
+    unresolved_wht_items = audit.get('withholding_year_unresolved', []) or []
+    if unresolved_wht_items:
+        unresolved_wht_net = sum(float(i.get('amount_eur') or 0)
+                                 for i in unresolved_wht_items)
+        prior_wht_export += (
+            "\nQUELLENSTEUER-KORREKTUREN OHNE ZUGEHÖRIGE AUSSCHÜTTUNG "
+            "(PRÜFFALL)\n"
+            f"  {len(unresolved_wht_items)} Buchung(en), netto "
+            f"{fmt_de(unresolved_wht_net)} EUR (positiv = Erstattung). In "
+            "Zeile 41 dieses Jahres verrechnet; eine lückenlose Abdeckung "
+            "ab dem 1. Januar ist nicht belegt (Beginn später, Lücke oder "
+            "unbekannt), deshalb auch nicht, in welchem Jahr die zugehörige "
+            "Ausschüttung gebucht wurde.\n")
+        for item in unresolved_wht_items:
+            prior_wht_export += (
+                f"  {str(item.get('reportDate', ''))[:10]} "
+                f"{str(item.get('symbol') or item.get('isin') or ''):<12} "
+                f"{'Fonds ' if item.get('fund') else ''}"
+                f"{fmt_de(float(item.get('amount_eur') or 0)):>10} EUR\n")
+
     inv_export = ""
     kap_inv_entries_export = ""
     if has_etf_data and invstg_aktiv:
@@ -5187,7 +5244,7 @@ TOPF 2: SONSTIGES (inkl. Termingeschäfte){fx_partial_suffix}
   Sonstige Verluste:    {fmt_de(final['options_loss']):>14} EUR
   ─────────────────────────────────────────────────
   Saldo Sonstiges:       {fmt_de(final['topf_2']):>14} EUR
-{topf2_detail_export}{special_products_export}{fx_export}{sh_export}{ttax_export}{inv_export}
+{topf2_detail_export}{special_products_export}{fx_export}{sh_export}{ttax_export}{prior_wht_export}{inv_export}
 ═══════════════════════════════════════════════════
 ANLAGE KAP EINTRAGUNGEN
 {"" if abs(final['zeile_7']) <= 0.01 else f"  Zeile 7 (inländischer Steuerabzug): {fmt_de(final['zeile_7']):>7} EUR" + chr(10) + f"  Zeile 37 (Kapitalertragsteuer): {fmt_de(final['zeile_37']):>10} EUR" + chr(10) + f"  Zeile 38 (Solidaritätszuschlag): {fmt_de(final['zeile_38']):>9} EUR" + chr(10)}
