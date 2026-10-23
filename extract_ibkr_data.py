@@ -91,6 +91,38 @@ def account_info_from_root(root, source_name=''):
     return data
 
 
+def corporate_actions_section(root):
+    """'present' oder 'missing': Ist die Sektion CorporateActions im Export?
+
+    Ohne sie bleibt ein Aktiensplit zwischen Andienung und Verkauf
+    unsichtbar (Issue #98). Eine ausgewählte, aber leere Sektion steht als
+    leeres Element im XML und zählt als vorhanden.
+    """
+    stmt = root.find('.//FlexStatement')
+    scope = stmt if stmt is not None else root
+    return 'present' if scope.find('.//CorporateActions') is not None \
+        else 'missing'
+
+
+def closing_transaction_id(lot, execution):
+    """transactionID der Ausführung, die ein CLOSED_LOT schließt.
+
+    IBKR liefert dafür kein Feld; die transactionID des Lots zeigt auf die
+    Eröffnung. Die Lots stehen aber direkt hinter ihrer schließenden
+    EXECUTION (in allen lokal geprüften echten Exporten ohne Ausnahme).
+    Der Kern braucht die Zuordnung für die Tageskurs-Bruttozuordnung je
+    Ausführung, weil mehrere Ausführungen derselben Sekunde häufig sind.
+    Leer, wenn die vorangehende Ausführung nicht dasselbe Instrument zum
+    selben Zeitpunkt ist.
+    """
+    if not execution:
+        return ''
+    if (execution.get('conid') != lot.get('conid')
+            or execution.get('dateTime') != lot.get('dateTime')):
+        return ''
+    return execution.get('transactionID') or ''
+
+
 # Trade fields without which assignments cannot be linked to the delivered
 # stock: premiums would then be taxed twice (as Stillhalterprämie and inside
 # the stock or fund result). Values are the field names in the Flex Query UI.
@@ -186,13 +218,41 @@ def extract_trades_from_root(root):
     return rows, headers
 
 
+# Identität einer CorporateActions-Zeile für beide Merge-Pfade. Zeilen ohne
+# transactionID (SUMMARY, ältere Exporte) und die alte/neue conid eines
+# Splits teilen oft Zeitstempel und ID; erst Ebene, conid, Menge, actionID
+# und Typ trennen sie (Issue #98: sonst geht ein Glied der Split-Kette
+# verloren). Auf allen echten Exporten ohne Kollision innerhalb einer Datei.
+CORPORATE_ACTION_KEY_FIELDS = ('transactionID', 'actionID', 'dateTime',
+                               'levelOfDetail', 'conid', 'quantity', 'type')
+
+
+def corporate_action_key(row):
+    return tuple((row.get(field) or '').strip()
+                 for field in CORPORATE_ACTION_KEY_FIELDS)
+
+
+def extract_corporate_actions_from_root(root):
+    """Extract CorporateActions rows (all levels) from a parsed XML root."""
+    ca_node = root.find('.//CorporateActions')
+    if ca_node is None:
+        return [], set()
+    headers = set()
+    rows = []
+    for row in ca_node:
+        attrib = normalize_ibkr_row(row.attrib)
+        headers.update(attrib.keys())
+        rows.append(attrib.copy())
+    return rows, headers
+
+
 def extract_fx_multi_xml(xml_files, output_dir):
     """Extract and merge FX transactions and trades from multiple XML files (multi-year).
 
     Single tax-year XML: the latest XML is used for standard sections.
     Split tax-year XMLs: all XMLs touching the latest year are fully merged.
-    Prior-year XMLs only contribute trades, FX transactions and ConversionRates for
-    FIFO lot history and Stillhalter matching across years.
+    Prior-year XMLs only contribute trades, FX transactions, ConversionRates and
+    CorporateActions for FIFO lot history and Stillhalter matching across years.
     """
     if not xml_files:
         return
@@ -314,6 +374,63 @@ def extract_fx_multi_xml(xml_files, output_dir):
                 writer.writeheader()
                 writer.writerows(existing_trades)
             print(f"  Trades: {added_history_trades} historische Trades aus Vorjahren hinzugefügt (für Stillhalter-Matching)")
+
+    # 3b. Merge CorporateActions from history XMLs. Ein Split nach einer
+    # Vorjahres-Andienung steht nur im Vorjahres-Export; ohne ihn passen die
+    # Lot-Stückzahlen des Steuerjahres nicht zur Andienung (Issue #98).
+    # Duplikate bei überlappenden Exporten über corporate_action_key.
+    if history_xmls:
+        ca_path = os.path.join(output_dir, 'corporate_actions.csv')
+        ca_rows = []
+        ca_headers = set()
+        if os.path.exists(ca_path):
+            with open(ca_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                ca_headers = set(reader.fieldnames or [])
+                ca_rows = list(reader)
+        ca_seen = {corporate_action_key(row) for row in ca_rows}
+        added_history_ca = 0
+        history_ca_missing = False
+        for xml_path in history_xmls:
+            try:
+                history_root = ET.parse(xml_path).getroot()
+                rows, hdrs = extract_corporate_actions_from_root(history_root)
+            except (OSError, ET.ParseError) as e:
+                print(f"  FEHLER bei CorporateActions aus {xml_path}: {e}")
+                history_ca_missing = True
+                continue
+            if corporate_actions_section(history_root) == 'missing':
+                history_ca_missing = True
+            for row in rows:
+                key = corporate_action_key(row)
+                if key in ca_seen:
+                    continue
+                ca_seen.add(key)
+                row['__source_section__'] = 'CorporateActions'
+                ca_rows.append(row)
+                ca_headers.update(hdrs)
+                added_history_ca += 1
+        if added_history_ca:
+            ca_headers.add('__source_section__')
+            with open(ca_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=sorted(ca_headers))
+                writer.writeheader()
+                writer.writerows(ca_rows)
+            print(f"  CorporateActions: {added_history_ca} Zeilen aus Vorjahren "
+                  f"hinzugefügt (Splits zwischen Andienung und Verkauf)")
+        # Ein Vorjahres-Export ohne die Sektion kann einen Split nach einer
+        # Vorjahres-Andienung verbergen: Hinweis wie beim Steuerjahr.
+        acct_path = os.path.join(output_dir, 'account_info.csv')
+        if history_ca_missing and os.path.exists(acct_path):
+            with open(acct_path, 'r', encoding='utf-8') as f:
+                acct_rows = list(csv.DictReader(f))
+            if acct_rows:
+                acct_rows[0]['corporate_actions_section'] = 'missing'
+                with open(acct_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(
+                        f, fieldnames=sorted(acct_rows[0].keys()))
+                    writer.writeheader()
+                    writer.writerow(acct_rows[0])
 
     # 4. Merge FX transactions from ALL XMLs
     all_fx = []
@@ -458,6 +575,7 @@ def extract_quarterly_xmls(xml_files, output_dir):
     base_curr = 'EUR'
     tax_year = None
     acct_data = None
+    ca_section_missing = False
     fx_trans_count = 0
     statement_periods = []
     documents_seen = set()
@@ -495,6 +613,8 @@ def extract_quarterly_xmls(xml_files, output_dir):
         # otherwise their base-currency amounts cannot be summed.
         info = account_info_from_root(root, os.path.basename(xml_path))
         validate_trade_fields(root, os.path.basename(xml_path))
+        if corporate_actions_section(root) == 'missing':
+            ca_section_missing = True
         if acct_data is not None and info['currency'] != base_curr:
             raise FlexExportError(
                 "Unterschiedliche Basiswährungen im selben Steuerjahr: "
@@ -513,12 +633,15 @@ def extract_quarterly_xmls(xml_files, output_dir):
         # ── Trades (EXECUTION + Lot/CLOSED_LOT) ──
         trades_node = root.find('.//Trades')
         if trades_node is not None:
+            last_execution = None
             for row in trades_node:
                 attrib = normalize_ibkr_row(row.attrib)
                 lod = attrib.get('levelOfDetail', '')
 
                 # Lot / CLOSED_LOT
                 if lod == 'CLOSED_LOT' or row.tag == 'Lot':
+                    attrib['closingTransactionID'] = closing_transaction_id(
+                        attrib, last_execution)
                     key = occurrence_key(attrib, lot_occurrences, period)
                     lots_headers.update(attrib.keys())
                     if key not in lots_seen:
@@ -531,6 +654,7 @@ def extract_quarterly_xmls(xml_files, output_dir):
                     continue
                 if lod and lod != 'EXECUTION':
                     continue
+                last_execution = attrib
 
                 tid = attrib.get('tradeID', '')
                 key = ('tradeID', tid) if tid else occurrence_key(
@@ -602,7 +726,7 @@ def extract_quarterly_xmls(xml_files, output_dir):
         if ca_node is not None:
             for row in ca_node:
                 attrib = normalize_ibkr_row(row.attrib)
-                key = (attrib.get('transactionID', ''), attrib.get('dateTime', ''))
+                key = corporate_action_key(attrib)
                 if key not in corp_seen:
                     corp_seen.add(key)
                     corp_headers.update(attrib.keys())
@@ -782,6 +906,8 @@ def extract_quarterly_xmls(xml_files, output_dir):
         # distribution is missing from the export proves no year.
         acct_data['statement_coverage_from'] = coverage_start(
             statement_periods)
+        acct_data['corporate_actions_section'] = (
+            'missing' if ca_section_missing else 'present')
         acct_data['fx_transactions_count'] = str(fx_trans_count)
         acct_path = os.path.join(output_dir, 'account_info.csv')
         with open(acct_path, 'w', newline='', encoding='utf-8') as f:
@@ -865,6 +991,7 @@ def parse_ibkr_xml(xml_file_path, output_dir):
         data_rows = []
         skipped = 0
 
+        last_execution = None
         for row in rows:
             attrib = normalize_ibkr_row(row.attrib)
 
@@ -873,7 +1000,10 @@ def parse_ibkr_xml(xml_file_path, output_dir):
             if section_tag == 'Trades':
                 lod = attrib.get('levelOfDetail', '')
                 if lod == 'CLOSED_LOT':
-                    closed_lot_rows.append(attrib.copy())
+                    lot = attrib.copy()
+                    lot['closingTransactionID'] = closing_transaction_id(
+                        lot, last_execution)
+                    closed_lot_rows.append(lot)
                     skipped += 1
                     continue
                 elif row.tag != 'Trade':
@@ -882,6 +1012,7 @@ def parse_ibkr_xml(xml_file_path, output_dir):
                 elif lod and lod != 'EXECUTION':
                     skipped += 1
                     continue
+                last_execution = attrib
 
             headers.update(attrib.keys())
             record = attrib.copy()
@@ -1038,6 +1169,7 @@ def parse_ibkr_xml(xml_file_path, output_dir):
     if tax_year_detected:
         acct_data['tax_year'] = tax_year_detected
     acct_data['statement_coverage_from'] = coverage_from
+    acct_data['corporate_actions_section'] = corporate_actions_section(root)
     acct_path = os.path.join(output_dir, 'account_info.csv')
     with open(acct_path, 'w', newline='', encoding='utf-8') as f:
         headers = sorted(acct_data.keys())

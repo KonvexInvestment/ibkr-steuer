@@ -30,7 +30,7 @@ import calculate_tax_report
 # Bump when the snapshot payload layout OR the computed values for the same
 # input change; stale session_state snapshots from an older code version are
 # then recomputed instead of rendered.
-SCHEMA_VERSION = 10  # Vorjahreszuordnung der Quellensteuer nur bei Abdeckung ab 1. Januar.
+SCHEMA_VERSION = 11  # Split bei Andienungen (#98), Buchungskurs im Tageskurs (#99).
 # Bump when the view-model/export layout changes (part of the view key).
 VIEW_SCHEMA_VERSION = 1
 
@@ -876,6 +876,46 @@ def collect_notices(report, context=None):
             [dict(lot_coverage)],
         ))
 
+    # Export ohne Transaction ID: Lots derselben Sekunde lassen sich keiner
+    # von mehreren schliessenden Ausfuehrungen zuordnen, und die Zuordnung
+    # aendert die Aufteilung der Tageskurs-Korrektur (Codex-Runde 6).
+    unlinked_lots = int(
+        lot_coverage.get('lots_without_closing_execution') or 0)
+    if unlinked_lots:
+        notices.append(_notice(
+            'closing_execution_unlinked', 'prueffall', 'normal',
+            'Tageskurs-Korrektur ohne Zuordnung zur Ausführung',
+            f"{unlinked_lots} Lot(s) lassen sich keiner schließenden "
+            "Ausführung zuordnen: Der Export enthält keine Transaction ID, "
+            "und mehrere Ausführungen derselben Sekunde schließen dasselbe "
+            "Wertpapier. Die Tageskurs-Korrektur stimmt im Saldo, ihre "
+            "Aufteilung auf Gewinne und Verluste (Zeilen 20, 22 und 23) "
+            "kann abweichen. Lösung: in der Flex Query unter Trades das Feld "
+            "Transaction ID auswählen und neu exportieren.",
+            'prueffaelle', unlinked_lots, [dict(lot_coverage)],
+        ))
+
+    # Flex Query ohne CorporateActions: Ein Aktiensplit zwischen Andienung
+    # und Verkauf ist dann nicht erkennbar (Issue #98). Kontoweise gezaehlt
+    # und im Multi-Account-Merge summiert.
+    ca_coverage = audit.get('corporate_actions_coverage', {}) or {}
+    ca_assignments = int(
+        ca_coverage.get('stock_assignments_without_section') or 0)
+    if ca_assignments:
+        notices.append(_notice(
+            'corporate_actions_missing', 'prueffall', 'normal',
+            'Keine Kapitalmaßnahmen im Export',
+            f"Der Export enthält {ca_assignments} Aktien-Andienung(en), aber "
+            "keine Sektion Corporate Actions. Ein Aktiensplit zwischen "
+            "Andienung und Verkauf ist dann nicht erkennbar: Die Stückzahlen "
+            "von Andienung und Verkauf passen nicht zusammen, und die Prämie "
+            "kann im Ergebnis der Aktie doppelt enthalten sein oder zu hoch "
+            "herausgerechnet werden. Lösung: in der Flex Query die Sektion "
+            "Corporate Actions aktivieren und neu exportieren, bei "
+            "Vorjahres-Exporten ebenso.",
+            'prueffaelle', ca_assignments, [dict(ca_coverage)],
+        ))
+
     # Quellensteuer-Korrekturen fuer fruehere Ausschuettungen (z.B.
     # Februar-Reklassifizierung von US-Fonds): nicht in Zeile 41 dieses
     # Jahres, sondern Anrechnung des Ausschuettungsjahres.
@@ -1295,6 +1335,20 @@ def collect_notices(report, context=None):
             'rechenwege', len(occ_renames), occ_renames,
         ))
 
+    split_adjustments = [
+        item for item in (audit.get('stock_split_adjustments', []) or [])
+        if item.get('status') == 'umgerechnet'
+    ]
+    if split_adjustments:
+        notices.append(_notice(
+            'stock_split_adjustments', 'transparenz', 'normal',
+            'Aktiensplit bei Andienungen berücksichtigt',
+            f"{len(split_adjustments)} Stillhalter-Korrektur(en) wurden auf "
+            "die Stückzahlen nach einem Aktiensplit umgerechnet, damit die "
+            "Prämie nur einmal versteuert wird.",
+            'rechenwege', len(split_adjustments), split_adjustments,
+        ))
+
     aliases = audit.get('underlying_symbol_aliases', {}) or {}
     if aliases:
         notices.append(_notice(
@@ -1311,8 +1365,9 @@ def collect_notices(report, context=None):
             'stillhalter_corrections_dropped', 'prueffall', 'kritisch',
             'Stillhalter-Korrektur nicht zuordenbar',
             f"{len(dropped_corr)} Prämien-Korrektur(en) konnten keinem "
-            "Basiswert-Trade zugeordnet werden; die Prämie bliebe sonst doppelt "
-            "versteuert. Trade-Details prüfen.",
+            "Basiswert-Trade zugeordnet werden. Es wurde nichts korrigiert; "
+            "die Prämie kann im Ergebnis des Basiswerts doppelt enthalten "
+            "sein. Trade-Details prüfen.",
             'prueffaelle', len(dropped_corr), dropped_corr,
         ))
 

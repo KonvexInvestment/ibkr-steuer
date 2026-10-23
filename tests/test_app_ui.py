@@ -749,6 +749,110 @@ def test_guidance_copy_and_rechenwege_grouping():
     assert "Kontrollnachweis und kein zweiter Satz Formularwerte" in captions
 
 
+def _split_history_bodies(split_text):
+    """Issue #98: Put-Andienung und Split 3:1 im Vorjahr, Verkauf im
+    Steuerjahr. Prämie 150 EUR steckt in der IBKR-Basis 5.850 statt 6.000."""
+    def trade(**fields):
+        base = {"accountId": "U123", "levelOfDetail": "EXECUTION",
+                "currency": "EUR", "fxRateToBase": "1", "ibCommission": "0"}
+        base.update(fields)
+        return "<Trade " + " ".join(
+            f'{key}="{value}"' for key, value in base.items()) + " />"
+
+    option = dict(assetCategory="OPT", putCall="P", strike="60",
+                  expiry="2024-06-21", underlyingSymbol="HXY",
+                  symbol="HXY 240621P60", conid="990", multiplier="100")
+    history = f"""<Trades>
+{trade(tradeID="h1", transactionID="h1", transactionType="ExchTrade",
+       buySell="SELL", quantity="-1", tradePrice="1.5",
+       dateTime="2024-05-01 10:00:00", tradeDate="2024-05-01",
+       reportDate="2024-05-01", fifoPnlRealized="0", **option)}
+{trade(tradeID="h2", transactionID="h2", transactionType="BookTrade",
+       buySell="BUY", quantity="1", tradePrice="0",
+       dateTime="2024-06-21 16:20:00", tradeDate="2024-06-21",
+       reportDate="2024-06-21", fifoPnlRealized="0", **option)}
+{trade(tradeID="h3", transactionID="h3", assetCategory="STK", symbol="HXY",
+       conid="901", transactionType="BookTrade", buySell="BUY",
+       openCloseIndicator="O", quantity="100", tradePrice="60", cost="5850",
+       proceeds="-6000", dateTime="2024-06-21 16:20:00",
+       tradeDate="2024-06-21", reportDate="2024-06-21", fifoPnlRealized="0")}
+</Trades>
+<CorporateActions>
+<CorporateAction accountId="U123" assetCategory="STK" levelOfDetail="DETAIL" type="FS"
+  actionID="A9" transactionID="T1" conid="901" symbol="HXY.OLD"
+  quantity="-100" dateTime="2024-09-03 20:25:00" reportDate="2024-09-04"
+  description="{split_text}" />
+<CorporateAction accountId="U123" assetCategory="STK" levelOfDetail="DETAIL" type="FS"
+  actionID="A9" transactionID="T2" conid="902" symbol="HXY"
+  quantity="300" dateTime="2024-09-03 20:25:00" reportDate="2024-09-04"
+  description="{split_text}" />
+</CorporateActions>"""
+    main = f"""<Trades>
+{trade(tradeID="m1", transactionID="m1", assetCategory="STK", symbol="HXY",
+       conid="902", transactionType="ExchTrade", buySell="SELL",
+       openCloseIndicator="C", quantity="-300", tradePrice="25",
+       cost="-5850", proceeds="7500", dateTime="2025-04-10 10:00:00",
+       tradeDate="2025-04-10", reportDate="2025-04-10",
+       fifoPnlRealized="1650")}
+<Lot accountId="U123" levelOfDetail="CLOSED_LOT" assetCategory="STK" symbol="HXY"
+  conid="902" currency="EUR" fxRateToBase="1" quantity="300" buySell="SELL"
+  cost="5850" fifoPnlRealized="1650" openDateTime="2024-06-21 16:20:00"
+  dateTime="2025-04-10 10:00:00" tradeDate="2025-04-10"
+  reportDate="2025-04-10" />
+</Trades>"""
+    return [
+        ("hxy_2024.xml", make_xml(body=history, from_date="2024-01-01",
+                                  to_date="2024-12-31")),
+        ("hxy_2025.xml", make_xml(body=main)),
+    ]
+
+
+def test_stock_split_assignment_is_transparent_in_ui():
+    """Issue #98 end-to-end über den Upload zweier Jahres-XMLs: Der Split steht
+    nur im Vorjahres-Export. Rechenwege und Textbericht nennen die
+    Umrechnung, auch ohne Andienung im Steuerjahr; ohne belegtes Verhältnis
+    erscheint der Fall als Prüffall in Rechenwege und Textbericht."""
+    text = ("HXY(US0000000901) SPLIT 3 FOR 1 "
+            "(HXY, HXY CORP, US0000000902)")
+    at = run_app(make_dataset(_split_history_bodies(text)), nav='rechenwege')
+    assert_no_exception(at, "Aktiensplit in Rechenwege")
+    report = at.session_state['snapshot']['payload']['merged']
+    adjustments = report['audit']['stock_split_adjustments']
+    assert len(adjustments) == 1, adjustments
+    assert adjustments[0]['status'] == 'umgerechnet'
+    assert not report['audit']['stillhalter_corrections_dropped']
+    final = ui_model.build_final_values(report, ui_model.default_toggles())
+    assert abs(final['zeile_20'] - 1500) < 1e-6, final['zeile_20']
+    labels = [expander.label for expander in at.expander]
+    assert any(label.startswith("Aktiensplits · 1 umgerechnete")
+               for label in labels), labels
+
+    at.session_state['nav'] = 'export'
+    at.run()
+    assert_no_exception(at, "Aktiensplit im Export")
+    txt = at.session_state['export_cache']['txt']
+    assert "STILLHALTERPRÄMIEN" in txt
+    assert "Aktiensplit: HXY Andienung 2024-06-21" in txt
+    assert "100 Stück der Andienung = 300 Stück im Lot" in txt
+
+    unknown = "HXY(US0000000901) SPLIT (HXY, HXY CORP, US0000000902)"
+    at = run_app(make_dataset(_split_history_bodies(unknown)), nav='rechenwege')
+    assert_no_exception(at, "Unbelegter Split in Rechenwege")
+    report = at.session_state['snapshot']['payload']['merged']
+    dropped = report['audit']['stillhalter_corrections_dropped']
+    assert [item['reason'] for item in dropped] == [
+        'stock_split_ratio_unknown'], dropped
+    assert dropped[0]['assignment_date'] == '2024-06-21'
+    labels = [expander.label for expander in at.expander]
+    assert any(label.startswith("Nicht zuordenbare Stillhalter-Korrekturen · 1")
+               for label in labels), labels
+    at.session_state['nav'] = 'export'
+    at.run()
+    txt = at.session_state['export_cache']['txt']
+    assert "PRÜFFALL: 1 Stillhalter-Korrektur(en) nicht zuordenbar" in txt
+    assert "HXY 2024-06-21" in txt
+
+
 if __name__ == '__main__':
     tests = [
         test_start_screen_without_dataset,
@@ -773,6 +877,7 @@ if __name__ == '__main__':
         test_partnership_trade_is_visible_in_export_summary,
         test_future_option_assignment_is_transparent_in_ui,
         test_transaction_tax_daily_aggregate_is_transparent_in_ui,
+        test_stock_split_assignment_is_transparent_in_ui,
         test_guidance_copy_and_rechenwege_grouping,
     ]
     failures = 0

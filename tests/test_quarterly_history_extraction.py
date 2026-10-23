@@ -618,6 +618,86 @@ def test_statement_coverage_start_is_written_for_every_path():
     assert not covers_year_start("", 2025)
 
 
+def test_corporate_actions_section_flag_is_written_for_every_path():
+    """Issue #98: Ohne Sektion CorporateActions bleibt ein Split zwischen
+    Andienung und Verkauf unsichtbar. Einzel-, Quartals- und Vorjahrespfad
+    melden die fehlende Sektion; eine leere, aber ausgewählte Sektion zählt
+    als vorhanden."""
+    with tempfile.TemporaryDirectory() as tmp:
+        with_ca = write_xml(tmp, "with.xml", "2025-01-01", "2025-06-30",
+                            "<CorporateActions />")
+        q2_with = write_xml(tmp, "q2.xml", "2025-07-01", "2025-12-31",
+                            "<CorporateActions />")
+        q2_without = write_xml(tmp, "q2_ohne.xml", "2025-07-01",
+                               "2025-12-31", "")
+        history_with = write_xml(tmp, "h.xml", "2024-01-01", "2024-12-31",
+                                 "<CorporateActions />")
+        history_without = write_xml(tmp, "h_ohne.xml", "2024-01-01",
+                                    "2024-12-31", "")
+        full_with = write_xml(tmp, "full.xml", "2025-01-01", "2025-12-31",
+                              "<CorporateActions />")
+
+        def flag(run, *paths):
+            out_dir = tempfile.mkdtemp(dir=tmp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                run(list(paths) if run is not parse_ibkr_xml else paths[0],
+                    out_dir)
+            info = read_csv(os.path.join(out_dir, "account_info.csv"))[0]
+            return info["corporate_actions_section"]
+
+        assert flag(parse_ibkr_xml, with_ca) == "present"
+        assert flag(parse_ibkr_xml, q2_without) == "missing"
+        assert flag(extract_quarterly_xmls, with_ca, q2_with) == "present"
+        assert flag(extract_quarterly_xmls, with_ca, q2_without) == "missing"
+        assert flag(extract_fx_multi_xml, history_with, full_with) == "present"
+        assert flag(extract_fx_multi_xml, history_without, full_with) \
+            == "missing", "Vorjahres-Export ohne Sektion"
+
+
+def test_closed_lots_carry_their_closing_execution():
+    """Die Lots stehen im XML direkt hinter ihrer schließenden Ausführung;
+    die transactionID des Lots zeigt auf die Eröffnung. Zwei Verkäufe
+    derselben Sekunde: Jedes Lot erhält die transactionID seiner
+    Ausführung (Tageskurs-Bruttozuordnung je Ausführung). Folgt ein Lot
+    einer Ausführung eines anderen Instruments, bleibt das Feld leer."""
+    def trade(tx, qty, conid="2"):
+        return (f'<Trade levelOfDetail="EXECUTION" assetCategory="STK" '
+                f'symbol="TEST" conid="{conid}" currency="USD" '
+                f'buySell="SELL" dateTime="2025-02-03 10:00:00" '
+                f'quantity="{qty}" transactionID="{tx}" tradeID="{tx}" '
+                f'fifoPnlRealized="0" />')
+
+    def lot(open_tx, qty):
+        return (f'<Lot levelOfDetail="CLOSED_LOT" assetCategory="STK" '
+                f'symbol="TEST" conid="2" currency="USD" '
+                f'openDateTime="2025-01-02 10:00:00" '
+                f'dateTime="2025-02-03 10:00:00" quantity="{qty}" '
+                f'transactionID="{open_tx}" />')
+
+    order = ('<Order levelOfDetail="ORDER" assetCategory="STK" '
+             'symbol="TEST" conid="2" dateTime="2025-02-03 10:00:00" />')
+    body = ('<Trades>' + order + trade("E1", -15) + lot("O1", 10)
+            + lot("O2", 5) + order + trade("E2", -5) + lot("O3", 5)
+            + trade("E3", -1, conid="9") + lot("O4", 1) + '</Trades>')
+    expected = {"O1": "E1", "O2": "E1", "O3": "E2", "O4": ""}
+    with tempfile.TemporaryDirectory() as tmp:
+        main = write_xml(tmp, "main.xml", "2025-01-01", "2025-12-31", body)
+        history = write_xml(tmp, "h.xml", "2024-01-01", "2024-12-31", "")
+        runs = {
+            "einzeln": lambda out: parse_ibkr_xml(main, out),
+            "quartal": lambda out: extract_quarterly_xmls([main], out),
+            "vorjahr": lambda out: extract_fx_multi_xml([history, main], out),
+        }
+        for label, run in runs.items():
+            out_dir = tempfile.mkdtemp(dir=tmp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                run(out_dir)
+            lots = read_csv(os.path.join(out_dir, "closed_lots.csv"))
+            got = {row["transactionID"]: row["closingTransactionID"]
+                   for row in lots}
+            assert got == expected, (label, got)
+
+
 if __name__ == "__main__":
     test_mixed_period_formats_sort_and_normalize_quarterly_xmls()
     print("OK: gemischte Quartals-Datumsformate werden normalisiert")
@@ -645,3 +725,7 @@ if __name__ == "__main__":
     print("OK: Nicht-Flex-XML wird sichtbar abgewiesen")
     test_statement_coverage_start_is_written_for_every_path()
     print("OK: Exportbeginn wird fuer Einzel- und Quartalsimport geschrieben")
+    test_corporate_actions_section_flag_is_written_for_every_path()
+    print("OK: fehlende CorporateActions-Sektion wird in jedem Pfad vermerkt")
+    test_closed_lots_carry_their_closing_execution()
+    print("OK: Lots tragen die transactionID ihrer schließenden Ausführung")
