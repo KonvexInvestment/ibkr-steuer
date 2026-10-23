@@ -522,12 +522,22 @@ def full_trigger_report():
                 'details': [],
             },
             'closed_lot_coverage': {'lot_rows': 0, 'closing_trades': 3,
-                                    'closing_trades_without_lots': 3},
+                                    'closing_trades_without_lots': 3,
+                                    'lots_without_closing_execution': 2},
+            'corporate_actions_coverage': {
+                'section_missing': 1, 'stock_assignments_without_section': 2},
             'fx_rate_parse_failures': {'funds': 1, 'trades': 0},
             'occ_rename_matches': [{'sell_symbol': 'MMM', 'sell_date': 'x',
                                     'close_symbol': 'MMM1', 'close_date': 'y',
                                     'quantity': 1}],
             'underlying_symbol_aliases': {'CON': ['CONd']},
+            'stock_split_adjustments': [
+                {'underlying': 'TLRY', 'symbol': 'TLRY', 'putCall': 'P',
+                 'assignment_date': '2025-01-10', 'split_factor': 0.1,
+                 'splits': 'TLRY 1:10 am 2025-12-01',
+                 'assignment_shares': 500.0, 'lot_shares': 50.0,
+                 'correction_raw': 60.0, 'currency': 'USD',
+                 'source': 'same_year', 'status': 'umgerechnet'}],
             'stillhalter_corrections_dropped': [{'symbol': 'DDD'}],
             'stillhalter_open_short': [{'symbol': 'EEE'}],
             'prior_year_withholding': [{'isin': 'US0000000001', 'amount_eur': 5.0, 'fund': True}],
@@ -574,8 +584,10 @@ NOTICE_REGISTRY = {
     'multi_statement_file', 'accounts_skipped', 'duplicate_uploads_dropped',
     'csv_disabled_multi_account', 'plausibility_mismatch',
     'occ_rename_matches', 'underlying_symbol_aliases',
+    'stock_split_adjustments',
     'stillhalter_corrections_dropped', 'stillhalter_open_short',
     'future_assignment_corrections', 'closed_lots_missing',
+    'closing_execution_unlinked', 'corporate_actions_missing',
     'prior_year_withholding', 'withholding_refund_surplus',
     'withholding_year_unresolved',
 }
@@ -742,6 +754,43 @@ def test_closed_lots_missing_notice_survives_multi_account_merge():
         'lot_rows': 0, 'closing_trades': 4}})
     assert 'closed_lots_missing' in {
         n['id'] for n in ui_model.collect_notices(legacy)}
+
+
+def test_corporate_actions_missing_notice_counts_per_account():
+    """Issue #98: Hinweis nur, wenn ein Konto ohne CorporateActions-Sektion
+    Aktien-Andienungen hat; nach dem Merge zählt die kontoweise Kennzahl."""
+    merged = make_report(audit={'corporate_actions_coverage': {
+        'section_missing': 1, 'stock_assignments_without_section': 4}})
+    notices = {n['id']: n for n in ui_model.collect_notices(merged)}
+    notice = notices['corporate_actions_missing']
+    assert notice['count'] == 4 and notice['class'] == 'prueffall'
+    assert 'Corporate Actions' in notice['body']
+    without_assignments = make_report(audit={'corporate_actions_coverage': {
+        'section_missing': 1, 'stock_assignments_without_section': 0}})
+    assert 'corporate_actions_missing' not in {
+        n['id'] for n in ui_model.collect_notices(without_assignments)}
+    assert 'corporate_actions_missing' not in {
+        n['id'] for n in ui_model.collect_notices(make_report())}
+
+
+def test_closing_execution_unlinked_notice_follows_lot_count():
+    """Codex-Runde 6: Lots ohne schließende Ausführung, deren Zuordnung die
+    Aufteilung der Tageskurs-Korrektur ändert, sind ein Prüffall; die
+    kontoweise Zahl überlebt den Multi-Account-Merge als Summe."""
+    report = make_report(audit={'closed_lot_coverage': {
+        'lot_rows': 10, 'closing_trades': 4, 'closing_trades_without_lots': 0,
+        'lots_without_closing_execution': 3}})
+    notice = {n['id']: n for n in
+              ui_model.collect_notices(report)}['closing_execution_unlinked']
+    assert notice['count'] == 3 and notice['class'] == 'prueffall'
+    assert 'Transaction ID' in notice['body']
+    assert 'closed_lots_missing' not in {
+        n['id'] for n in ui_model.collect_notices(report)}
+    clean = make_report(audit={'closed_lot_coverage': {
+        'lot_rows': 10, 'closing_trades': 4, 'closing_trades_without_lots': 0,
+        'lots_without_closing_execution': 0}})
+    assert 'closing_execution_unlinked' not in {
+        n['id'] for n in ui_model.collect_notices(clean)}
 
 
 def test_closed_lots_missing_is_critical_with_put_assignments():

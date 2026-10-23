@@ -217,5 +217,142 @@ class NonUsdTageskurs(unittest.TestCase):
         self.assertAlmostEqual(report['fx_correction_kap_inv_taxable'], -70)
 
 
+# Issue #99: IBKR rechnet ein Ergebnis zum Kurs des Buchungstags um. Bei
+# Verfall und Andienung am Freitag mit Buchung am Montag (reportDate) ist das
+# der Montagskurs (Lot-fxRateToBase), maßgeblich ist aber der Handelstag.
+BOOKING_RATES = {'2025-01-02': 0.95, '2025-01-10': 0.955,
+                 '2025-01-31': 0.96, '2025-02-03': 0.97}
+
+
+def _booked_case(trades, lot):
+    rates = [dict(reportDate=day, fromCurrency='USD', toCurrency='EUR',
+                  rate=str(rate)) for day, rate in BOOKING_RATES.items()]
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, rows in [('trades', trades), ('closed_lots', [lot]),
+                           ('account_info', [dict(currency='EUR', tax_year='2025',
+                                                  fx_transactions_count='0')]),
+                           ('conversion_rates', rates)]:
+            _write_csv(str(Path(tmp) / (name + '.csv')), rows)
+        with contextlib.redirect_stdout(io.StringIO()):
+            report = calculate_tax(tmp)
+    toggles = effective_toggles(default_toggles(), toggle_availability(report))
+    return report, build_final_values(report, toggles)
+
+
+def _usd_row(**fields):
+    row = dict(currency='USD', ibCommission='0', multiplier='1',
+               subCategory='COMMON', isin='US0000000099', conid='99',
+               symbol='BOOK', underlyingSymbol='BOOK', putCall='', strike='',
+               expiry='')
+    row.update(fields)
+    return row
+
+
+def _expiring_option_case(short):
+    """Option eröffnet am 02.01., verfällt Freitag 31.01., gebucht Montag 03.02."""
+    side_open, side_close = ('SELL', 'BUY') if short else ('BUY', 'SELL')
+    option = dict(assetCategory='OPT', multiplier='100', putCall='C',
+                  strike='60', expiry='2025-01-31', conid='991',
+                  symbol='BOOK 250131C60')
+    cost = -100 if short else 100
+    pnl = -cost
+    opening = _usd_row(**option, tradeID='open', transactionID='open',
+                       transactionType='ExchTrade', buySell=side_open,
+                       openCloseIndicator='O',
+                       quantity='-1' if short else '1',
+                       dateTime='2025-01-02 10:00:00', tradeDate='2025-01-02',
+                       reportDate='2025-01-02', tradePrice='1', cost=str(cost),
+                       proceeds=str(-cost), fifoPnlRealized='0',
+                       fxRateToBase='0.95')
+    expiry = _usd_row(**option, tradeID='expiry', transactionID='expiry',
+                      transactionType='BookTrade', buySell=side_close,
+                      openCloseIndicator='C', quantity='1' if short else '-1',
+                      dateTime='2025-01-31 16:20:00', tradeDate='2025-01-31',
+                      reportDate='2025-02-03', tradePrice='0', cost=str(-cost),
+                      proceeds='0', fifoPnlRealized=str(pnl),
+                      fxRateToBase='0.97', notes='Ep')
+    lot = _usd_row(**option, openDateTime='2025-01-02 10:00:00',
+                   dateTime='2025-01-31 16:20:00', tradeDate='2025-01-31',
+                   reportDate='2025-02-03', transactionID='open',
+                   buySell=side_close, quantity='-1' if short else '1',
+                   cost=str(cost), fifoPnlRealized=str(pnl), fxRateToBase='0.97')
+    return _booked_case([opening, expiry], lot)
+
+
+class BookingRateOnLaterBooking(unittest.TestCase):
+    def test_worthless_long_option_is_valued_at_purchase_rate(self):
+        # Verlust = gezahlte Prämie zum Kurs des Kauftags: -100 x 0,95.
+        # IBKR: -100 x 0,97 (Montag); Korrektur +1 (Basis) +1 (Buchungskurs).
+        report, final = _expiring_option_case(short=False)
+        detail = report['fx_correction_details'][0]
+        self.assertAlmostEqual(detail['fx_close'], 0.96)
+        self.assertAlmostEqual(detail['fx_booked'], 0.97)
+        self.assertAlmostEqual(detail['booking_rate_delta_eur'], 1.0)
+        self.assertAlmostEqual(report['fx_correction_total'], 2.0)
+        self.assertAlmostEqual(final['options_loss'], -95.0)
+        self.assertAlmostEqual(final['options_gain'], 0.0)
+
+    def test_worthless_short_option_is_valued_at_sale_rate(self):
+        # Zufluss der Prämie zum Kurs des Verkaufstags: 100 x 0,95.
+        report, final = _expiring_option_case(short=True)
+        self.assertAlmostEqual(report['fx_correction_total'], -2.0)
+        self.assertAlmostEqual(final['options_gain'], 95.0)
+        self.assertAlmostEqual(final['options_loss'], 0.0)
+
+    def test_same_day_booking_needs_no_booking_rate_correction(self):
+        report, _ = calculate()
+        detail = report['fx_correction_details'][0]
+        self.assertAlmostEqual(detail['booking_rate_delta_eur'], 0.0)
+
+    def test_call_assigned_stock_uses_trade_day_after_premium_split(self):
+        # 100 Aktien zu 50 (0,95) gekauft, Call 55 für 200 USD am 10.01.
+        # (0,955) verkauft, Andienung Freitag, Buchung Montag (0,97).
+        # IBKR legt die Prämie in den Aktienerlös (PnL 700). Steuerlich:
+        # Aktie 5500 x 0,96 - 5000 x 0,95 = 530, Prämie 200 x 0,955 = 191.
+        stock = dict(assetCategory='STK', conid='99', symbol='BOOK')
+        call = dict(assetCategory='OPT', multiplier='100', putCall='C',
+                    strike='55', expiry='2025-01-31', conid='992',
+                    symbol='BOOK 250131C55')
+        trades = [
+            _usd_row(**stock, tradeID='buy', transactionID='buy',
+                     transactionType='ExchTrade', buySell='BUY',
+                     openCloseIndicator='O', quantity='100',
+                     dateTime='2025-01-02 10:00:00', tradeDate='2025-01-02',
+                     reportDate='2025-01-02', tradePrice='50', cost='5000',
+                     proceeds='-5000', fifoPnlRealized='0', fxRateToBase='0.95'),
+            _usd_row(**call, tradeID='call_sell', transactionID='call_sell',
+                     transactionType='ExchTrade', buySell='SELL',
+                     openCloseIndicator='O', quantity='-1',
+                     dateTime='2025-01-10 10:00:00', tradeDate='2025-01-10',
+                     reportDate='2025-01-10', tradePrice='2', cost='-200',
+                     proceeds='200', fifoPnlRealized='0', fxRateToBase='0.955'),
+            _usd_row(**call, tradeID='call_assign', transactionID='call_assign',
+                     transactionType='BookTrade', buySell='BUY',
+                     openCloseIndicator='C', quantity='1',
+                     dateTime='2025-01-31 16:20:00', tradeDate='2025-01-31',
+                     reportDate='2025-02-03', tradePrice='0', cost='200',
+                     proceeds='0', fifoPnlRealized='0', fxRateToBase='0.97',
+                     notes='A'),
+            _usd_row(**stock, tradeID='stock_sell', transactionID='stock_sell',
+                     transactionType='BookTrade', buySell='SELL',
+                     openCloseIndicator='C', quantity='-100',
+                     dateTime='2025-01-31 16:20:00', tradeDate='2025-01-31',
+                     reportDate='2025-02-03', tradePrice='55', cost='-5000',
+                     proceeds='5700', fifoPnlRealized='700', fxRateToBase='0.97',
+                     notes='A'),
+        ]
+        lot = _usd_row(**stock, openDateTime='2025-01-02 10:00:00',
+                       dateTime='2025-01-31 16:20:00', tradeDate='2025-01-31',
+                       reportDate='2025-02-03', transactionID='buy',
+                       buySell='SELL', quantity='100', cost='5000',
+                       fifoPnlRealized='700', fxRateToBase='0.97')
+        report, final = _booked_case(trades, lot)
+        detail = report['fx_correction_details'][0]
+        self.assertAlmostEqual(detail['stillhalter_adjustment_raw'], 200)
+        self.assertAlmostEqual(detail['booking_rate_delta_eur'], -5.0)
+        self.assertAlmostEqual(final['stocks_gain'], 530.0)
+        self.assertAlmostEqual(final['options_gain'], 191.0)
+
+
 if __name__ == '__main__':
     unittest.main()

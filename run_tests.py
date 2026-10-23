@@ -53,6 +53,7 @@ SYNTHETIC_TESTS = [
     ("Pflichtfelder-Trades", "tests/test_required_trade_fields.py"),
     ("Tageskurs-Bruttozuordnung", "tests/test_tageskurs_gross_bucket.py"),
     ("Cross-Year-Series-Tests", "tests/test_cross_year_series.py"),
+    ("Aktiensplit-bei-Andienungen", "tests/test_stock_split_assignments.py"),
     ("Quarterly-History-Extraction", "tests/test_quarterly_history_extraction.py"),
     ("KAP-INV-WHT", "tests/test_kap_inv_wht.py"),
     ("KAP-INV-Tageskurs-TFS", "tests/test_kap_inv_tageskurs.py"),
@@ -112,7 +113,9 @@ def tageskurs_rate_mismatches(rd, out_dir):
     schliessender Fill im Export steht, prueft die Gegenprobe deshalb:
     Kurstag == tradeDate des Fills; Kurs == fxRateToBase des Fills
     (ExchTrade) bzw. == ConversionRate des tradeDate (BookTrade, dessen
-    fxRateToBase der 16:20-Settlement-Kurs ist). So prueft der Test gegen
+    fxRateToBase die ConversionRate des Buchungstags reportDate ist und bei
+    spaeterer Buchung vom Handelstag abweicht, Issue #99). So prueft der
+    Test gegen
     IBKR statt gegen den eigenen Code. CASH, TradeCancel und Fills
     ausserhalb des Exports werden uebersprungen.
 

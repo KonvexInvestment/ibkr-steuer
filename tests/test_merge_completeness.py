@@ -176,6 +176,44 @@ def test_merge_sums_transaction_tax_audit():
     assert len(audit['details']) == 2
 
 
+def test_merge_keeps_closed_lot_coverage_fields():
+    """Jede Kennzahl der Lot-Abdeckung ist kontoweise gezählt und wird
+    summiert; eine fehlende Merge-Regel ließe den Prüffall bei mehreren
+    Konten still verschwinden (Codex-Runde 6: lots_without_closing_execution)."""
+    merge_report_data = load_merge_report_data()
+    report = build_sample_report()
+    coverage = report['audit']['closed_lot_coverage']
+    assert 'lots_without_closing_execution' in coverage, coverage
+    for index, key in enumerate(sorted(coverage), start=1):
+        coverage[key] = index
+    merged = merge_report_data([copy.deepcopy(report), copy.deepcopy(report)])
+    merged_coverage = merged['audit']['closed_lot_coverage']
+    assert set(merged_coverage) == set(coverage), merged_coverage
+    for key, value in coverage.items():
+        assert merged_coverage[key] == 2 * value, (key, merged_coverage)
+
+
+def test_merge_keeps_stock_split_fields():
+    """Split-Korrekturen werden aneinandergehängt, die Abdeckung der
+    Kapitalmaßnahmen kontoweise summiert: ein Konto mit Sektion darf die
+    fehlende Sektion eines anderen nicht verdecken (Issue #98)."""
+    merge_report_data = load_merge_report_data()
+    report = build_sample_report()
+    audit = report['audit']
+    coverage = audit['corporate_actions_coverage']
+    for index, key in enumerate(sorted(coverage), start=1):
+        coverage[key] = index
+    audit['stock_split_adjustments'] = [
+        {'symbol': 'TEST', 'status': 'umgerechnet', 'correction_raw': 10.0}]
+    merged = merge_report_data([copy.deepcopy(report), copy.deepcopy(report)])
+    merged_coverage = merged['audit']['corporate_actions_coverage']
+    assert set(merged_coverage) == set(coverage), merged_coverage
+    for key, value in coverage.items():
+        assert merged_coverage[key] == 2 * value, (key, merged_coverage)
+    assert merged['audit']['stock_split_adjustments'] == (
+        audit['stock_split_adjustments'] * 2)
+
+
 if __name__ == '__main__':
     test_merge_keeps_every_report_data_field()
     print('OK: Merge verliert keine report_data-Felder')
@@ -185,3 +223,7 @@ if __name__ == '__main__':
     print('OK: Partnership-Blocker wird gemergt')
     test_merge_sums_transaction_tax_audit()
     print('OK: TTAX-Audit wird gemergt')
+    test_merge_keeps_closed_lot_coverage_fields()
+    print('OK: Lot-Abdeckung wird kontoweise summiert')
+    test_merge_keeps_stock_split_fields()
+    print('OK: Split-Korrekturen und Kapitalmaßnahmen-Abdeckung werden gemergt')

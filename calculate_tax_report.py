@@ -2,6 +2,7 @@
 import csv
 import io
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 from collections import Counter, defaultdict, deque
@@ -1773,7 +1774,8 @@ def _symbol_root(value):
     return parts[0] if parts else ''
 
 
-def _build_underlying_alias_map(trades, closed_lots=None, instruments=None):
+def _build_underlying_alias_map(trades, closed_lots=None, instruments=None,
+                                linked_symbols=None):
     """Symbol-Aequivalenzklassen fuer das Option↔Aktien-Matching (Issue #83).
 
     IBKR fuehrt dieselbe Aktie unter verschiedenen Symbolen: Handelsplatz-
@@ -1790,6 +1792,15 @@ def _build_underlying_alias_map(trades, closed_lots=None, instruments=None):
     Symbole werden EXAKT wie im Feld registriert (kein _symbol_root):
     Klassen-Aktien ('BRK A' vs. 'BRK B') haben verschiedene conids/ISINs und
     duerfen nicht ueber ein manufakturiertes Wurzel-Symbol verschmelzen.
+
+    ``linked_symbols``: weitere belegte Gruppen gleicher Aktie als
+    (Symbol, conid)-Paare, z.B. altes und neues Symbol eines Splits mit
+    Identitaetswechsel (Issue #98, _split_symbol_links), fuer die keine
+    gemeinsame conid/ISIN existiert. Die conids zaehlen fuer die
+    Mehrdeutigkeitspruefung: Traegt das alte Symbol spaeter eine andere
+    conid, verbindet die Gruppe nichts. conids derselben Gruppe gelten
+    dabei als eine Aktie (Kette OLD/401 → NEW/402 → NEW/403: NEW mit
+    402 und 403 ist kein wiederverwendetes Symbol).
 
     Reine Funktion: liefert {symbol: kanonisches_symbol} nur fuer Gruppen mit
     mindestens zwei Symbolen und mindestens einem STK-seitigen Mitglied;
@@ -1834,6 +1845,30 @@ def _build_underlying_alias_map(trades, closed_lots=None, instruments=None):
         if fi.get('assetCategory') == 'STK':
             register(fi.get('symbol'), fi.get('conid'), (fi.get('isin'),),
                      stk_side=True)
+    conid_parent = {}  # durch Kapitalmassnahmen belegte conid-Ketten
+
+    def find_conid(conid):
+        conid_parent.setdefault(conid, conid)
+        while conid_parent[conid] != conid:
+            conid_parent[conid] = conid_parent[conid_parent[conid]]
+            conid = conid_parent[conid]
+        return conid
+
+    for idx, pairs in enumerate(linked_symbols or ()):
+        members = set()
+        conids = []
+        for symbol, conid in pairs:
+            symbol = (symbol or '').strip()
+            conid = (conid or '').strip()
+            if symbol:
+                register(symbol, conid, ())
+                members.add(symbol)
+            if conid:
+                conids.append(conid)
+        for conid in conids[1:]:
+            conid_parent[find_conid(conid)] = find_conid(conids[0])
+        if len(members) > 1:
+            id_groups.setdefault(('L', idx), set()).update(members)
 
     # Ein wiederverwendetes Broker-Symbol darf nicht als transitive Bruecke
     # zwischen verschiedenen Wertpapieren dienen. conid ist primaer; nur wenn
@@ -1841,7 +1876,7 @@ def _build_underlying_alias_map(trades, closed_lots=None, instruments=None):
     ambiguous_symbols = {
         symbol
         for symbol in set(symbol_conids) | set(symbol_isins)
-        if (len(symbol_conids.get(symbol, set())) > 1
+        if (len({find_conid(c) for c in symbol_conids.get(symbol, set())}) > 1
             or (not symbol_conids.get(symbol)
                 and len(symbol_isins.get(symbol, set())) > 1))
     }
@@ -2165,8 +2200,332 @@ def _propagate_alias_isins(symbol_to_isin, alias_map):
                 symbol_to_isin.setdefault(m, isin)
 
 
+_STOCK_SPLIT_RATIO = re.compile(
+    r'\bSPLIT\s+(\d+(?:\.\d+)?)\s+FOR\s+(\d+(?:\.\d+)?)', re.IGNORECASE)
+# IBKR-Typen der CorporateActions: FS Forward Split, RS Reverse Split,
+# FI Forward Split mit neuer ISIN (ANET 4:1 im Dezember 2024).
+_STOCK_SPLIT_TYPES = ('FS', 'RS', 'FI')
+
+
+def _split_ratio_from_text(text):
+    """Neue Aktien je alte Aktie aus 'SPLIT x FOR y', sonst None."""
+    match = _STOCK_SPLIT_RATIO.search(text or '')
+    if not match:
+        return None
+    new_shares, old_shares = float(match.group(1)), float(match.group(2))
+    if new_shares <= 0 or old_shares <= 0:
+        return None
+    return new_shares / old_shares
+
+
+def _split_quantities_consistent(rows, ratio):
+    """Plausibilität eines Split-Paars (alte conid raus, neue conid rein).
+
+    Das Verhältnis kommt aus dem Text, nicht aus den Mengen: bei einem
+    Reverse Split werden Bruchstücke bar abgefunden (805 alte → 80 neue bei
+    1:10). Die Mengen müssen deshalb nur bis auf eine Aktie zum Text passen.
+    Eine einzelne Zeile (Split ohne conid-Wechsel) trägt nur die Zusatzmenge
+    und ist so nicht prüfbar.
+    """
+    if len(rows) != 2:
+        return len(rows) == 1
+    qty_a, qty_b = (abs(safe_float(row.get('quantity'), 0)) for row in rows)
+    if qty_a <= 0 or qty_b <= 0:
+        return False
+    return (abs(qty_b - qty_a * ratio) < 1.0 + 1e-9
+            or abs(qty_a - qty_b * ratio) < 1.0 + 1e-9)
+
+
+# Kennung des alten Wertpapiers am Anfang der IBKR-Beschreibung, z.B.
+# "TLRY(US88688T1007) SPLIT 1 FOR 10 (...)": steht auf beiden Zeilen eines
+# Splits mit conid-Wechsel und verbindet sie, wenn die actionID fehlt.
+_SPLIT_EVENT_IDENTITY = re.compile(r'^\s*([^()]+?\([A-Z0-9]{9,12}\))')
+
+
+def _build_stock_split_index(corporate_actions):
+    """Aktien-Splits je conid aus der CorporateActions-Sektion (Issue #98).
+
+    Nach einem Split führt IBKR offene Lots unter der neuen conid mit dem
+    ursprünglichen openDateTime, aber in Stückzahlen nach dem Split weiter
+    (belegt: ANET 4:1 und BTC 1:5 im Dezember/November 2024). Andienungen
+    stehen dagegen in Stückzahlen vor dem Split. Der Index liefert pro conid
+    die Split-Ereignisse mit Zeitstempel, Faktor (neue je alte Aktie) und
+    allen conids des Ereignisses, damit Ketten (A→B→C) rückwärts verfolgt
+    werden können. ``factor`` ist None, wenn das Verhältnis nicht belegt ist
+    oder die Mengen ihm widersprechen; Aufrufer machen daraus einen Prüffall.
+    """
+    groups = defaultdict(list)
+    for row in corporate_actions or []:
+        if (row.get('assetCategory') or '').upper() != 'STK':
+            continue
+        level = (row.get('levelOfDetail') or '').upper()
+        if level and level != 'DETAIL':
+            continue
+        text = ' '.join(filter(None, (row.get('actionDescription'),
+                                      row.get('description'))))
+        ratio = _split_ratio_from_text(text)
+        if ratio is None and (row.get('type') or '').upper() not in _STOCK_SPLIT_TYPES:
+            continue
+        conid = (row.get('conid') or '').strip()
+        timestamp = normalize_ibkr_datetime(
+            row.get('dateTime') or row.get('reportDate') or '')[:19]
+        if not conid or not timestamp:
+            continue
+        if len(timestamp) <= 10:
+            timestamp = timestamp[:10] + ' 23:59:59'
+        action_id = (row.get('actionID') or '').strip()
+        if action_id:
+            key = action_id
+        else:
+            identity = next((m.group(1) for m in (
+                _SPLIT_EVENT_IDENTITY.match(row.get(field) or '')
+                for field in ('actionDescription', 'description')) if m), '')
+            # Ohne actionID und ohne Kennung bleibt offen, ob die Zeile zu
+            # einem Paar alter/neuer conid gehört: Eine Kette ließe sich
+            # dann nicht vollständig verfolgen (Prüffall statt Teilfaktor).
+            key = ('identity', timestamp, identity) if identity \
+                else ('unlinked', timestamp, conid)
+        groups[key].append((row, conid, timestamp, ratio, text))
+
+    index = defaultdict(list)
+    for key, members in groups.items():
+        rows = [m[0] for m in members]
+        ratios = {m[3] for m in members if m[3] is not None}
+        factor = ratios.pop() if len(ratios) == 1 else None
+        issue = ''
+        if isinstance(key, tuple) and key[0] == 'unlinked':
+            factor = None
+            issue = 'event_unlinked'
+        elif factor is None:
+            issue = 'ratio_missing'
+        elif not _split_quantities_consistent(rows, factor):
+            factor = None
+            issue = 'quantity_mismatch'
+        event = {
+            'timestamp': max(m[2] for m in members),
+            'factor': factor,
+            'conids': tuple(sorted({m[1] for m in members})),
+            'symbols': tuple(sorted({(m[0].get('symbol') or '').strip()
+                                     for m in members} - {''})),
+            'members': tuple(sorted({((m[0].get('symbol') or '').strip(), m[1])
+                                     for m in members
+                                     if (m[0].get('symbol') or '').strip()})),
+            'description': next((m[4] for m in members if m[4]), ''),
+            'action_id': key if isinstance(key, str) else '',
+            'issue': issue,
+        }
+        for conid in event['conids']:
+            index[conid].append(event)
+    return dict(index)
+
+
+def _split_symbol_links(split_index):
+    """Symbole je Split-Ereignis mit Identitätswechsel (Issue #98).
+
+    Wechselt mit dem Split auch das Symbol (alte und neue conid, neue ISIN,
+    dieselbe actionID oder Wertpapier-Kennung), gibt es keine gemeinsame
+    conid/ISIN, über die die Alias-Map die Andienung (altes Symbol) mit dem
+    Lot (neues Symbol) verbindet. Das Ereignis belegt die Verbindung; der
+    Faktor bleibt Sache von _split_factor_between (fehlt er, folgt der
+    Prüffall statt einer stillen Doppelzählung der Prämie).
+
+    Jede Verbindung besteht aus (Symbol, conid)-Paaren: Die Alias-Map prüft
+    sie wie jede andere Sichtung auf Ticker-Wiederverwendung, damit ein
+    später an eine andere Aktie vergebenes altes Symbol keine fremden
+    Positionen verbindet. Auch Ereignisse ohne Symbolwechsel (nur neue
+    conid) gehören dazu: Sie belegen, dass beide conids dieselbe Aktie
+    sind, sonst hielte die Prüfung das Symbol einer Kette für
+    wiederverwendet (Codex-Runde 6).
+    """
+    links = []
+    seen = set()
+    for events in (split_index or {}).values():
+        for event in events:
+            if id(event) in seen or event.get('issue') == 'event_unlinked':
+                continue
+            seen.add(id(event))
+            if len(event.get('members') or ()) > 1:
+                links.append(tuple(event.get('members') or ()))
+    return links
+
+
+def _split_factor_between(conid, open_ts, close_ts, split_index):
+    """Kumulierter Split-Faktor einer Position zwischen Eröffnung und Schluss.
+
+    Returns ``(factor, events)``: factor = Aktien zum Schluss je Aktie zur
+    Eröffnung (1.0 ohne Split, None bei nicht belegtem Verhältnis), events =
+    die angewandten Ereignisse, jüngstes zuerst.
+    """
+    conid = (conid or '').strip()
+    open_ts = normalize_ibkr_datetime(open_ts or '')[:19]
+    close_ts = normalize_ibkr_datetime(close_ts or '')[:19]
+    if not conid or not open_ts or not split_index:
+        return 1.0, []
+    if close_ts and len(close_ts) <= 10:
+        close_ts = close_ts[:10] + ' 23:59:59'
+    factor = 1.0
+    applied = []
+    conids = {conid}
+    upper = close_ts or '9999-12-31 23:59:59'
+    upper_inclusive = True
+    while True:
+        candidates = []
+        for current in conids:
+            for event in split_index.get(current, ()):
+                if any(event is seen for seen in applied):
+                    continue
+                ts = event['timestamp']
+                if ts <= open_ts:
+                    continue
+                if ts > upper or (not upper_inclusive and ts == upper):
+                    continue
+                candidates.append(event)
+        if not candidates:
+            break
+        event = max(candidates, key=lambda e: e['timestamp'])
+        applied.append(event)
+        if event['factor'] is None:
+            return None, applied
+        factor *= event['factor']
+        conids = set(event['conids'])
+        upper = event['timestamp']
+        upper_inclusive = False
+    return factor, applied
+
+
+def _annotate_lot_split_factors(lots, split_index):
+    """Hängt an STK-Lots den Split-Faktor seit ihrer Eröffnung an.
+
+    ``_split_factor`` fehlt bei Lots ohne Split (Faktor 1). Mutiert die Lots
+    in place; Unterstrich-Felder werden nie exportiert.
+    """
+    if not split_index:
+        return
+    for lot in lots or []:
+        if lot.get('assetCategory') != 'STK':
+            continue
+        factor, events = _split_factor_between(
+            lot.get('conid'), lot.get('openDateTime'),
+            lot.get('dateTime') or lot.get('reportDate'), split_index)
+        if events:
+            lot['_split_factor'] = factor
+            lot['_split_events'] = events
+
+
+def _split_event_summary(events):
+    """Kurztext der Split-Ereignisse für Audit und Prüffälle."""
+    parts = []
+    for event in events or []:
+        symbol = ', '.join(event.get('symbols') or ()) or '?'
+        if event.get('factor') is None:
+            ratio = {
+                'quantity_mismatch': 'Mengen widersprechen dem Verhältnis',
+                'event_unlinked': 'alte und neue conid nicht verbunden',
+            }.get(event.get('issue'), 'Verhältnis unbelegt')
+        elif event['factor'] >= 1:
+            ratio = f"{event['factor']:g}:1"
+        else:
+            ratio = f"1:{1 / event['factor']:g}"
+        parts.append(f"{symbol} {ratio} am {event['timestamp'][:10]}")
+    return '; '.join(parts)
+
+
+def _record_split_review(review, det, underlying, assignment_shares, dropped,
+                         adjustments):
+    """Lots mit unbelegtem Split-Verhältnis: Prüffall statt stiller Doppelzählung.
+
+    Ohne Verhältnis lassen sich Andienungs- und Lot-Stücke nicht vergleichen.
+    Die Prämie bleibt dann in Topf 2 und zusätzlich im Aktienergebnis; der
+    Prüffall nennt die höchstens betroffene Prämie der Andienung.
+    """
+    if not review:
+        return
+    dropped.append({
+        'underlying': underlying,
+        'assignment_date': (det.get('assignment_date') or '')[:10],
+        'leftover_shares': assignment_shares,
+        'leftover_raw': safe_float(det.get('premium_raw'), 0.0),
+        'reason': 'stock_split_ratio_unknown',
+    })
+    for item in review:
+        adjustments.append({
+            'underlying': underlying,
+            'symbol': item.get('symbol') or underlying,
+            'putCall': det.get('putCall', ''),
+            'assignment_date': (det.get('assignment_date') or '')[:10],
+            'split_factor': None,
+            'splits': item.get('splits', ''),
+            'assignment_shares': None,
+            'lot_shares': item.get('lot_quantity'),
+            'correction_raw': 0.0,
+            'currency': det.get('currency', ''),
+            'status': 'unbelegt',
+        })
+    print(f"  (!) WARNUNG: {underlying}: Split zwischen Andienung und Verkauf "
+          f"ohne belegtes Verhältnis ({review[0].get('splits', '')}). "
+          f"Stillhalter-Korrektur nicht angewendet, Prämie bleibt ggf. im "
+          f"Aktienergebnis; bitte Kapitalmaßnahme prüfen.")
+
+
+def _record_split_adjustment(adjustments, det, underlying, match,
+                             correction_per_share_raw, source):
+    """Transparenz: Andienungskorrektur über einen Split umgerechnet (Issue #98)."""
+    factor = match.get('split_factor', 1.0)
+    if factor is None or abs(factor - 1.0) < 1e-12:
+        return
+    shares = safe_float(match.get('shares'), 0.0)
+    adjustments.append({
+        'underlying': underlying,
+        'symbol': match.get('symbol') or underlying,
+        'putCall': det.get('putCall', ''),
+        'assignment_date': (det.get('assignment_date') or '')[:10],
+        'split_factor': factor,
+        'splits': _split_event_summary(match.get('split_events')),
+        'assignment_shares': shares,
+        'lot_shares': shares * factor,
+        'correction_raw': correction_per_share_raw * shares,
+        'currency': det.get('currency', ''),
+        'source': source,
+        'status': 'umgerechnet',
+    })
+
+
+def _put_lot_above_strike_review(det, underlying, match, premium_per_share_raw):
+    """Prüffall, wenn ein zeitlich passendes Long-Lot deutlich ÜBER dem Strike liegt.
+
+    Basis zum Strike ist ein bekanntes IBKR-Muster (Prämie nicht eingebettet)
+    und bleibt still. Liegt die Basis je Andienungsstück darüber, erklärt die
+    Andienung das Lot nicht: am selben Tag zugekauft oder Reverse Split ohne
+    Kapitalmaßnahmen-Daten (Issue #98). Short-Lots tragen in 'cost' den
+    Verkaufserlös und sind ausgenommen. Returns den Eintrag oder None.
+    """
+    strike = safe_float(det.get('strike'), 0)
+    shares = match.get('shares') or 0
+    if strike <= 0 or shares <= 0 or match.get('is_short_lot'):
+        return None
+    cost_per_share = safe_float(match.get('cost'), 0) / shares
+    if cost_per_share <= strike * 1.01 + 0.05:
+        return None
+    return {
+        'underlying': underlying,
+        'assignment_date': (det.get('assignment_date') or '')[:10],
+        'leftover_shares': shares,
+        'leftover_raw': premium_per_share_raw * shares,
+        'reason': 'put_lot_basis_above_strike',
+        'open_date': match.get('open_date', ''),
+        'close_date': match.get('close_date', ''),
+    }
+
+
+def _warn_put_lot_above_strike(item):
+    print(f"  (!) WARNUNG: {item['underlying']}: Aktien-Lot vom "
+          f"{item['open_date']} passt zur Put-Andienung, seine "
+          f"Kostenbasis liegt aber über dem Strike. Keine "
+          f"Korrektur angewendet; bitte prüfen.")
+
+
 def _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares, consumed=None,
-                                       alias_map=None):
+                                       alias_map=None, review=None):
     """Return STK closed-lot slices that originate from this put assignment.
 
     `consumed` (optional dict, key: id(lot)) trackt bereits geclaimte Lot-Shares
@@ -2175,6 +2534,13 @@ def _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares, con
     Korrektur verfällt und der spätere Verkauf behält die eingebettete Prämie
     (Audit-Finding F3 / Codex-Review P2).
     `alias_map`: Symbol-Aequivalenzklassen (Issue #83, 'CON' ↔ 'CONd').
+
+    Split zwischen Andienung und Verkauf (Issue #98): `shares` und das Feld
+    'shares' der Treffer stehen in Stückzahlen der Andienung, 'lot_shares' in
+    Stückzahlen des Lots (nach dem Split). 'cost' und 'pnl_per_share' beziehen
+    sich auf Andienungs-Stücke, damit der Vergleich mit dem Strike stimmt.
+    `consumed` zählt in Lot-Stücken. Lots mit unbelegtem Split-Verhältnis
+    werden übersprungen und, falls `review` übergeben ist, dort gemeldet.
     """
     if det.get('putCall') != 'P':
         return []
@@ -2205,13 +2571,24 @@ def _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares, con
         if relevant_dates and open_date not in relevant_dates:
             continue
         signed_qty = safe_float(lot.get('quantity'), 0)
-        qty = abs(signed_qty)
-        if qty <= 0:
+        lot_qty = abs(signed_qty)
+        if lot_qty <= 0:
             continue
-        avail = qty if consumed is None else qty - consumed.get(id(lot), 0.0)
-        if avail <= 0:
+        split_factor = lot.get('_split_factor', 1.0)
+        if split_factor is None or split_factor <= 0:
+            if review is not None:
+                review.append({
+                    'symbol': sym,
+                    'open_date': open_date,
+                    'lot_quantity': lot_qty,
+                    'splits': _split_event_summary(lot.get('_split_events')),
+                })
             continue
-        take = min(avail, remaining)
+        avail_lot = lot_qty if consumed is None else lot_qty - consumed.get(id(lot), 0.0)
+        if avail_lot <= 0:
+            continue
+        qty = lot_qty / split_factor
+        take = min(avail_lot / split_factor, remaining)
         close_date = (lot.get('reportDate') or lot.get('dateTime') or '')[:10]
         close_buysell = (lot.get('buySell') or '').upper()
         is_short_lot = signed_qty < 0
@@ -2219,6 +2596,10 @@ def _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares, con
             close_buysell = 'BUY' if is_short_lot else 'SELL'
         matches.append({
             'shares': take,
+            'lot_shares': take * split_factor,
+            'split_factor': split_factor,
+            'split_events': lot.get('_split_events') or [],
+            'symbol': sym,
             'cost': abs(safe_float(lot.get('cost'), 0)) * take / qty,
             'pnl_per_share': safe_float(lot.get('fifoPnlRealized'), 0) / qty,
             'open_date': open_date,
@@ -2232,13 +2613,13 @@ def _put_assignment_closed_lot_matches(closed_lots, det, underlying, shares, con
             'target_buysell': close_buysell,
         })
         if consumed is not None:
-            consumed[id(lot)] = consumed.get(id(lot), 0.0) + take
+            consumed[id(lot)] = consumed.get(id(lot), 0.0) + take * split_factor
         remaining -= take
     return matches
 
 
 def _call_assignment_short_lot_matches(closed_lots, det, underlying, shares, consumed=None,
-                                       alias_map=None):
+                                       alias_map=None, review=None):
     """Return STK short closed-lot slices opened by this call assignment.
 
     Call-Andienung ohne Long-Bestand eröffnet einen Aktien-Short (SELL mit PnL=0,
@@ -2248,7 +2629,8 @@ def _call_assignment_short_lot_matches(closed_lots, det, underlying, shares, con
     die BUY-Row des Cover-Tags, nicht auf den Andienungstag (Audit-Finding F1,
     SPY/BITO/MPW-Fälle). `consumed` wie bei _put_assignment_closed_lot_matches:
     geteilter Lot-Konsum-State gegen Doppel-Claims durch Same-Day-Details
-    (Codex-Review P2).
+    (Codex-Review P2). Stückzahlen wie beim Put-Matcher: 'shares' in
+    Andienungs-Stücken, 'lot_shares' in Lot-Stücken nach einem Split.
     """
     if det.get('putCall') != 'C':
         return []
@@ -2280,28 +2662,43 @@ def _call_assignment_short_lot_matches(closed_lots, det, underlying, shares, con
         open_date = (lot.get('openDateTime') or '')[:10]
         if relevant_dates and open_date not in relevant_dates:
             continue
-        qty = abs(safe_float(lot.get('quantity'), 0))
-        if qty <= 0:
+        lot_qty = abs(safe_float(lot.get('quantity'), 0))
+        if lot_qty <= 0:
             continue
-        avail = qty if consumed is None else qty - consumed.get(id(lot), 0.0)
-        if avail <= 0:
+        split_factor = lot.get('_split_factor', 1.0)
+        if split_factor is None or split_factor <= 0:
+            if review is not None:
+                review.append({
+                    'symbol': sym,
+                    'open_date': open_date,
+                    'lot_quantity': lot_qty,
+                    'splits': _split_event_summary(lot.get('_split_events')),
+                })
             continue
-        take = min(avail, remaining)
+        avail_lot = lot_qty if consumed is None else lot_qty - consumed.get(id(lot), 0.0)
+        if avail_lot <= 0:
+            continue
+        take = min(avail_lot / split_factor, remaining)
         close_date = (lot.get('reportDate') or lot.get('dateTime') or '')[:10]
         matches.append({
             'shares': take,
+            'lot_shares': take * split_factor,
+            'split_factor': split_factor,
+            'split_events': lot.get('_split_events') or [],
+            'symbol': sym,
             'open_date': open_date,
             'close_date': close_date,
         })
         if consumed is not None:
-            consumed[id(lot)] = consumed.get(id(lot), 0.0) + take
+            consumed[id(lot)] = consumed.get(id(lot), 0.0) + take * split_factor
         remaining -= take
     return matches
 
 
 def _call_short_cover_candidates_from_trades(trades, underlying, after_dates, shares, consumed=None,
                                              alias_map=None, option_currency=None,
-                                             raw_underlying=None):
+                                             raw_underlying=None, split_index=None,
+                                             review=None):
     """Fallback ohne CLOSED_LOT-Daten: Short-Cover-Kandidaten direkt aus trades.
 
     Wenn closed_lots.csv fehlt oder das Short-Lot nicht enthält, ist der
@@ -2310,6 +2707,11 @@ def _call_short_cover_candidates_from_trades(trades, underlying, after_dates, sh
     NICHT chronologisch sortiert). Ohne diesen Fallback bliebe die Prämie im
     Cover-PnL eingebettet und würde doppelt versteuert (Codex-Review Finding 2).
     `consumed` wie bei den Lot-Matchern (Doppel-Claim-Schutz, key id(trade)).
+    Liegt zwischen Andienung und Cover ein Split (Issue #98), steht der Cover
+    in Stückzahlen nach dem Split: 'shares' bleibt in Andienungs-Stücken,
+    'lot_shares' in Stücken der Cover-Zeile. Covers mit unbelegtem
+    Split-Verhältnis werden übersprungen und, falls `review` übergeben ist,
+    dort gemeldet (der Aufrufer macht daraus einen Prüffall).
     """
     remaining = abs(safe_float(shares, 0))
     after = min([d for d in after_dates if d]) if after_dates else ''
@@ -2344,14 +2746,30 @@ def _call_short_cover_candidates_from_trades(trades, underlying, after_dates, sh
         qty = abs(safe_float(t.get('quantity'), 0))
         if qty <= 0:
             continue
+        split_factor, split_events = _split_factor_between(
+            t.get('conid'), after, t.get('dateTime') or t.get('reportDate'),
+            split_index)
+        if split_factor is None or split_factor <= 0:
+            if review is not None:
+                review.append({
+                    'symbol': _stock_symbol_for_matching(t, alias_map),
+                    'open_date': after,
+                    'lot_quantity': qty,
+                    'splits': _split_event_summary(split_events),
+                })
+            continue
         ckey = (id(t), 'C')
         avail = qty if consumed is None else qty - consumed.get(ckey, 0.0)
         if avail <= 0:
             continue
-        take = min(avail, remaining)
-        matches.append({'shares': take, 'close_date': t_date, 'oid': id(t)})
+        take = min(avail / split_factor, remaining)
+        matches.append({'shares': take, 'lot_shares': take * split_factor,
+                        'split_factor': split_factor,
+                        'split_events': split_events,
+                        'symbol': _stock_symbol_for_matching(t, alias_map),
+                        'close_date': t_date, 'oid': id(t)})
         if consumed is not None:
-            consumed[ckey] = consumed.get(ckey, 0.0) + take
+            consumed[ckey] = consumed.get(ckey, 0.0) + take * split_factor
         remaining -= take
     return matches
 
@@ -2483,7 +2901,7 @@ def _claim_stock_rows_for_date(trades, underlying, close_date, shares, consumed,
 
 
 def _resolve_call_assignment_targets(trades, closed_lots, det, underlying, total_shares, consumed,
-                                     alias_map=None):
+                                     alias_map=None, split_index=None, review=None):
     """Löst eine Call-Andienung ANTEILIG in Korrektur-Ziele auf (kein binäres Gate).
 
     IBKR realisiert den Aktien-PnL einer Call-Andienung (inkl. eingebetteter
@@ -2500,7 +2918,9 @@ def _resolve_call_assignment_targets(trades, closed_lots, det, underlying, total
          Position offen, PnL unrealisiert → bewusst KEINE Korrektur, kein Fehler.
 
     Returns (targets, open_short_shares, unresolved_shares):
-      targets: [{'shares', 'close_dates', 'target_buysell'}]
+      targets: [{'shares', 'close_dates', 'target_buysell', 'split_factor'}]
+        'shares' in Andienungs-Stücken; 'split_factor' rechnet sie in Stücke
+        der Zielzeile um, falls bis zum Cover ein Split lag (Issue #98).
       open_short_shares: Anteil mit offenem Short (→ stillhalter_open_short)
       unresolved_shares: Rest ohne jede Evidenz (→ Anomalie, dropped+Warnung)
     """
@@ -2522,17 +2942,21 @@ def _resolve_call_assignment_targets(trades, closed_lots, det, underlying, total
         or _symbol_root(det.get('symbol'))
     for match in _call_assignment_short_lot_matches(closed_lots, det, underlying,
                                                     rest, consumed=consumed,
-                                                    alias_map=alias_map):
+                                                    alias_map=alias_map,
+                                                    review=review):
         row_oids = _claim_stock_rows_for_date(trades, underlying,
                                               match['close_date'],
-                                              match['shares'], consumed,
+                                              match['lot_shares'], consumed,
                                               buysell='BUY', alias_map=alias_map,
                                               option_currency=option_currency,
                                               raw_underlying=det_raw_underlying)
         targets.append({'shares': match['shares'],
                         'close_dates': [match['close_date']],
                         'target_buysell': 'BUY',
-                        'row_oids': row_oids or None})
+                        'row_oids': row_oids or None,
+                        'split_factor': match['split_factor'],
+                        'split_events': match['split_events'],
+                        'symbol': match['symbol']})
         rest -= match['shares']
 
     # Stufe 2: Long-Close-Anteil am Andienungstag (BookTrade-Rows bevorzugt —
@@ -2550,16 +2974,29 @@ def _resolve_call_assignment_targets(trades, closed_lots, det, underlying, total
             rest -= long_qty
 
     # Stufe 3: restliche Covers aus trades (closed_lots fehlt oder ist lückenhaft).
+    stage3_review = []
     if rest > 0:
         for match in _call_short_cover_candidates_from_trades(
                 trades, underlying, call_dates, rest, consumed=consumed,
                 alias_map=alias_map, option_currency=option_currency,
-                raw_underlying=det_raw_underlying):
+                raw_underlying=det_raw_underlying, split_index=split_index,
+                review=stage3_review):
             targets.append({'shares': match['shares'],
                             'close_dates': [match['close_date']],
                             'target_buysell': 'BUY',
-                            'row_oids': {match['oid']}})
+                            'row_oids': {match['oid']},
+                            'split_factor': match['split_factor'],
+                            'split_events': match['split_events'],
+                            'symbol': match['symbol']})
             rest -= match['shares']
+
+    # Ein Cover mit unbelegtem Split-Verhältnis schließt den Short zwar,
+    # lässt sich aber nicht umrechnen: der Rest ist Prüffall (über `review`),
+    # weder offener Short (Stufe 4) noch SELL-Fallback.
+    if stage3_review:
+        if review is not None:
+            review.extend(stage3_review)
+        return targets, 0.0, 0.0
 
     # Stufe 4: offener Short (Short-Open-Evidenz, kein Cover im Steuerjahr).
     open_short = 0.0
@@ -2970,9 +3407,11 @@ def _build_tageskurs_put_adjustments(same_year_lots, xy_tageskurs_lots,
     callers now pass the quantity-capped correction derived from the matched
     CLOSED_LOT.  This keeps trade PnL and the Tageskurs cost on one basis.
 
-    Input shape per symbol: ``{date_str, shares,
+    Input shape per symbol: ``{date_str, close_date, shares,
     correction_per_share_raw, premium_per_share_raw,
-    invstg_basis_extra_per_share_raw, currency}``.
+    invstg_basis_extra_per_share_raw, currency}``. ``close_date`` (optional)
+    bindet den Snapshot an das Schlussdatum seines Lots: nach einem Split
+    tragen Lots derselben Andienung verschiedene Stückwerte (Issue #98).
     """
     put_adj = {}
     for source in (same_year_lots or {}, xy_tageskurs_lots or {}):
@@ -2988,6 +3427,7 @@ def _build_tageskurs_put_adjustments(same_year_lots, xy_tageskurs_lots,
                     continue
                 put_adj.setdefault(canonical_sym, deque()).append({
                     'date': (snap.get('date_str') or '')[:10],
+                    'close_date': (snap.get('close_date') or '')[:10],
                     'shares_remaining': shares,
                     'correction_per_share_raw': correction_per_share,
                     'premium_per_share_raw': safe_float(
@@ -3009,7 +3449,24 @@ def _tageskurs_close_timestamp(row):
     return value[:19]
 
 
-def _build_tageskurs_pnl_adjustment_maps(debug_rows, alias_map=None):
+def _closing_quantity_by_execution(closed_lots):
+    """Geschlossene Stücke je schließender Ausführung (closingTransactionID).
+
+    Eine Ausführung kann schließen und zugleich eröffnen (IBKR-Code C;O,
+    z.B. Andienung über einen Short hinaus). Ihr realisiertes Ergebnis und
+    alle Korrekturen darauf gehören dann allein zu den geschlossenen Lots.
+    """
+    totals = defaultdict(float)
+    for lot in closed_lots or []:
+        execution = (lot.get('closingTransactionID') or '').strip()
+        if execution:
+            totals[execution] += abs(safe_float(lot.get('quantity'), 0.0))
+    return dict(totals)
+
+
+def _build_tageskurs_pnl_adjustment_maps(debug_rows, alias_map=None,
+                                        field='stillhalter_adjustment_raw',
+                                        closing_quantities=None):
     """Baut die Per-Share-Korrektur-Maps fuer die Tageskurs-Bruttozuordnung.
 
     Gross gain/loss buckets muessen die tatsaechlich auf die Trade-Row
@@ -3020,18 +3477,38 @@ def _build_tageskurs_pnl_adjustment_maps(debug_rows, alias_map=None):
     teilen DIESELBEN Entry-Objekte — ein exakter Slice kann darum nicht
     doppelt konsumiert werden.
 
+    ``field='transaction_tax_eur'`` liefert stattdessen die bereits im
+    Trade-Ergebnis enthaltene Transaktionssteuer (EUR, vorzeichenbehaftet,
+    alle Kategorien), damit die Bruttozuordnung vom selben Ergebnis ausgeht
+    wie die Pools.
+
+    ``closing_quantities`` (_closing_quantity_by_execution): Schließt eine
+    Ausführung weniger Stücke, als sie handelt, verteilt sich die Korrektur
+    nur auf die geschlossenen Stücke; sonst bliebe ein Teil in keinem Lot
+    und die Bruttozuordnung ginge nicht vom Ergebnis der Pool-Zeile aus.
+
     Returns (adj_exact, adj_date).
     """
+    stillhalter = field == 'stillhalter_adjustment_raw'
     adj_exact = {}
     adj_date = {}
     for row in debug_rows:
-        adjustment_raw = safe_float(row.get('stillhalter_adjustment_raw'), 0.0)
-        if row.get('source') != 'trades' or row.get('assetCategory') != 'STK' \
-                or adjustment_raw <= 0:
+        adjustment_raw = safe_float(row.get(field), 0.0)
+        if row.get('source') != 'trades':
+            continue
+        if stillhalter and (row.get('assetCategory') != 'STK'
+                            or adjustment_raw <= 0):
+            continue
+        if not stillhalter and abs(adjustment_raw) < 1e-12:
             continue
         quantity = abs(safe_float(row.get('quantity'), 0.0))
-        symbol = _canon_symbol(
-            _stock_symbol_for_matching(row, alias_map), alias_map)
+        execution = (row.get('_transaction_id') or '').strip()
+        closing_quantity = (closing_quantities or {}).get(execution, 0.0)
+        if 0 < closing_quantity < quantity:
+            quantity = closing_quantity
+        symbol = (_tageskurs_instrument_key(row) if not stillhalter else
+                  _canon_symbol(_stock_symbol_for_matching(row, alias_map),
+                                alias_map))
         close_timestamp = _tageskurs_close_timestamp(row)
         side = (row.get('buySell') or '').upper()
         if quantity <= 0 or not symbol or not close_timestamp:
@@ -3039,6 +3516,10 @@ def _build_tageskurs_pnl_adjustment_maps(debug_rows, alias_map=None):
         entry = {
             'remaining_shares': quantity,
             'adjustment_per_share_raw': adjustment_raw / quantity,
+            'category': row.get('assetCategory') or '',
+            'currency': (row.get('currency') or '').strip(),
+            'fx': safe_float(row.get('fxRateToBase'), 0.0),
+            'execution': execution,
         }
         exact_key = (symbol, close_timestamp, side)
         date_key = (symbol, close_timestamp[:10], side)
@@ -3047,45 +3528,228 @@ def _build_tageskurs_pnl_adjustment_maps(debug_rows, alias_map=None):
     return adj_exact, adj_date
 
 
-def _consume_tageskurs_pnl_adjustment(lot, adj_exact, adj_date,
-                                      alias_map=None):
-    """Konsumiert die Stillhalter-Korrektur eines CLOSED_LOTs quantity-proportional.
+def _tageskurs_instrument_key(row):
+    """Instrument-Identität für die TTAX-Map: conid und Währung.
 
-    Exakter Timestamp zuerst; Same-Day-Fallback nur fuer den Rest (IBKR
-    konsolidiert mehrere Executions in groessere Lots). Mutiert die
-    remaining_shares der geteilten Entry-Objekte in beiden Maps.
-    Returns den Roh-Korrekturbetrag fuer diesen Lot.
+    Das Aktien-Matching-Symbol liefert für Optionen das Underlying; zwei
+    Kontrakte auf denselben Basiswert teilten sonst den Tages-Schlüssel.
     """
+    conid = (row.get('conid') or row.get('_conid') or '').strip()
+    currency = (row.get('currency') or '').strip()
+    if conid:
+        return ('conid', conid, currency)
+    symbol = (row.get('symbol') or '').strip()
+    return ('symbol', symbol, currency) if symbol else None
+
+
+def _tageskurs_adjustment_match(lot, alias_map=None, by_instrument=False):
+    """Schlüssel und Gates eines CLOSED_LOTs für die Anpassungs-Maps."""
     quantity_signed = safe_float(lot.get('quantity'), 0.0)
-    remaining = abs(quantity_signed)
-    if remaining <= 0:
-        return 0.0
-    symbol = _canon_symbol(
-        _stock_symbol_for_matching(lot, alias_map), alias_map)
+    symbol = (_tageskurs_instrument_key(lot) if by_instrument else
+              _canon_symbol(_stock_symbol_for_matching(lot, alias_map),
+                            alias_map))
     close_timestamp = _tageskurs_close_timestamp(lot)
     side = (lot.get('buySell') or '').upper()
     if not side:
         side = 'SELL' if quantity_signed >= 0 else 'BUY'
-    exact_key = (symbol, close_timestamp, side)
-    date_key = (symbol, close_timestamp[:10], side)
+    return {
+        'exact_key': (symbol, close_timestamp, side),
+        'date_key': (symbol, close_timestamp[:10], side),
+        'quantity': abs(quantity_signed),
+        'category': lot.get('assetCategory') or '',
+        'currency': (lot.get('currency') or '').strip(),
+        'fx': safe_float(lot.get('fxRateToBase'), 0.0),
+        'execution': (lot.get('closingTransactionID') or '').strip(),
+    }
+
+
+def _tageskurs_execution_counts(trades):
+    """Schließende Ausführungen je Instrument, Zeitstempel und Richtung.
+
+    Grundlage des Rückfalls in _tageskurs_closing_trade_key, wenn ein Lot
+    keine schließende transactionID trägt (Export ohne Transaction ID).
+    Reine Eröffnungen (openCloseIndicator 'O') schließen kein Lot und
+    zählen nicht (Codex-Runde 6: ein Short-Verkauf derselben Sekunde ließ
+    den eindeutigen Verkauf mehrdeutig erscheinen); ohne Indikator zählt
+    die Ausführung vorsichtshalber mit.
+    """
+    counts = Counter()
+    for trade in trades or []:
+        indicators = {part.strip().upper() for part in
+                      (trade.get('openCloseIndicator') or '').split(';')}
+        if indicators == {'O'}:
+            continue
+        instrument = _tageskurs_instrument_key(trade)
+        close_timestamp = _tageskurs_close_timestamp(trade)
+        side = (trade.get('buySell') or '').upper()
+        if instrument and close_timestamp and side in ('BUY', 'SELL'):
+            counts[(instrument, close_timestamp, side)] += 1
+    return counts
+
+
+def _tageskurs_closing_trade_key(lot, topf, execution_counts=None):
+    """Schließende Ausführung eines CLOSED_LOTs für die Bruttozuordnung.
+
+    Die Pools führen jede schließende Trade-Zeile als einen Gewinn oder
+    Verlust; ein Verkauf schließt aber oft mehrere Lots mit
+    unterschiedlichem Vorzeichen (Codex-Befund: Kaufsteuer macht ein Lot
+    negativ, der Verkauf bleibt Gewinn). Die Zuordnung läuft deshalb je
+    Ausführung über ``closingTransactionID``, das die Extraktion aus der
+    XML-Reihenfolge setzt (extract_ibkr_data.closing_transaction_id).
+    Instrument, Zeitstempel und Richtung allein reichen nicht: Mehrere
+    Ausführungen derselben Sekunde sind in echten Exporten häufig, und
+    ihre Summe verwischt die Vorzeichen der einzelnen Pool-Zeilen.
+    Ohne das Feld gilt dieser Schlüssel nur, wenn genau eine schließende
+    Ausführung dazu passt. Passen mehrere, bleibt jedes Lot für sich unter
+    ``(topf, 'unlinked', instrument, zeitstempel, seite, id)``; ob die
+    Zuordnung das Ergebnis ändern kann, prüft
+    _tageskurs_unlinked_lots_at_risk (Prüffall statt stiller Annahme).
+    """
+    instrument = _tageskurs_instrument_key(lot)
+    closing_transaction = (lot.get('closingTransactionID') or '').strip()
+    if instrument and closing_transaction:
+        return (topf, instrument, 'execution', closing_transaction)
+    close_timestamp = _tageskurs_close_timestamp(lot)
+    side = (lot.get('buySell') or '').upper()
+    if not side:
+        side = 'SELL' if safe_float(lot.get('quantity'), 0.0) >= 0 else 'BUY'
+    key = (instrument, close_timestamp, side)
+    if not instrument or not close_timestamp:
+        return (topf, 'lot', id(lot))
+    if execution_counts is not None and execution_counts.get(key, 0) > 1:
+        return (topf, 'unlinked') + key + (id(lot),)
+    return (topf,) + key
+
+
+def _tageskurs_unlinked_lots_at_risk(gross_groups, adjusted_keys=(),
+                                     tolerance=1e-9):
+    """Lots ohne schließende Ausführung, deren Bruttozuordnung offen ist.
+
+    ``gross_groups``: Schlüssel aus _tageskurs_closing_trade_key ->
+    [Topf, Ergebnis vor Tageskurs, Tageskurs-Delta]. Lots derselben
+    Sekunde, die mehreren Ausführungen zugeordnet sein können, liefern in
+    jeder Aufteilung dieselben Gewinn- und Verlustkorrekturen, solange
+    alle vor und nach der Korrektur auf derselben Seite liegen (alle
+    Gewinn oder alle Verlust). Sonst hängen Zeile 20/22/23 davon ab,
+    welches Lot zu welcher Ausführung gehört.
+    ``adjusted_keys``: Schlüssel der Lots, die eine Stillhalter- oder
+    TTAX-Korrektur einer Trade-Zeile übernommen haben. Ohne Ausführungs-ID
+    ist auch diese Verteilung nur angenommen, die Vorzeichen der Lots
+    belegen dann nichts (Codex-Runde 7: das erste Lot zog die Steuer des
+    zweiten Verkaufs, beide blieben Gewinn, Zeile 20/23 = 20/3 statt
+    17/0); solche Gruppen zählen immer. Returns die Anzahl dieser Lots
+    (0 = Zuordnung ohne Einfluss).
+    """
+    adjusted_keys = set(adjusted_keys)
+    sets = defaultdict(list)
+    for key, (_topf, base, delta) in gross_groups.items():
+        if len(key) > 1 and key[1] == 'unlinked':
+            sets[key[:5]].append((base, base + delta, key in adjusted_keys))
+    at_risk = 0
+    for members in sets.values():
+        if any(adjusted for _before, _after, adjusted in members):
+            at_risk += len(members)
+            continue
+        gains = all(before >= -tolerance and after >= -tolerance
+                    for before, after, _adjusted in members)
+        losses = all(before <= tolerance and after <= tolerance
+                     for before, after, _adjusted in members)
+        if not (gains or losses):
+            at_risk += len(members)
+    return at_risk
+
+
+def _consume_tageskurs_entries(entries, remaining, match):
+    """Verbraucht Entries quantity-proportional; Returns (Betrag, Rest)."""
     adjustment = 0.0
+    category = match['category']
+    currency = match.get('currency', '')
+    execution = match.get('execution', '')
+    lot_fx = match['fx']
+    for entry in entries:
+        if remaining <= 0:
+            break
+        available = entry['remaining_shares']
+        if available <= 0:
+            continue
+        if category and entry.get('category') and \
+                entry['category'] != category:
+            continue
+        if currency and entry.get('currency') and \
+                entry['currency'] != currency:
+            continue
+        if execution and entry.get('execution') and \
+                entry['execution'] != execution:
+            continue
+        if lot_fx > 0 and entry.get('fx', 0) > 0 \
+                and abs(entry['fx'] - lot_fx) > 1e-9:
+            continue
+        consumed = min(remaining, available)
+        adjustment += consumed * entry['adjustment_per_share_raw']
+        entry['remaining_shares'] -= consumed
+        remaining -= consumed
+    return adjustment, remaining
 
-    def consume(entries):
-        nonlocal adjustment, remaining
-        for entry in entries:
-            if remaining <= 0:
-                break
-            available = entry['remaining_shares']
-            if available <= 0:
-                continue
-            consumed = min(remaining, available)
-            adjustment += consumed * entry['adjustment_per_share_raw']
-            entry['remaining_shares'] -= consumed
-            remaining -= consumed
 
-    consume(adj_exact.get(exact_key, []))
+def _claim_exact_tageskurs_adjustments(lots, adj_exact, alias_map=None,
+                                       by_instrument=False):
+    """Erster Durchgang: exakte Zeitstempel-Treffer aller Lots.
+
+    Läuft vor jedem Tagesfallback, damit ein Lot ohne eigenen Treffer keine
+    Zeile verbraucht, die exakt zu einem später verarbeiteten Lot gehört
+    (Codex-Befund: Kaufsteuer des 11-Uhr-Verkaufs landete beim 10-Uhr-Lot,
+    Zeile 20/23 hingen von der Lot-Reihenfolge ab). Ein exakter Treffer
+    identifiziert die Zeile; deshalb zählen hier auch Lots, die die
+    Tageskurs-Schleife später überspringt.
+    Returns {id(lot): (Betrag, Reststücke)} für
+    _consume_tageskurs_pnl_adjustment(exact_claims=...).
+    """
+    claims = {}
+    for lot in lots:
+        match = _tageskurs_adjustment_match(lot, alias_map, by_instrument)
+        if match['quantity'] <= 0:
+            continue
+        claims[id(lot)] = _consume_tageskurs_entries(
+            adj_exact.get(match['exact_key'], []), match['quantity'], match)
+    return claims
+
+
+def _consume_tageskurs_pnl_adjustment(lot, adj_exact, adj_date,
+                                      alias_map=None, by_instrument=False,
+                                      exact_claims=None):
+    """Konsumiert die Stillhalter-Korrektur eines CLOSED_LOTs quantity-proportional.
+
+    Exakter Timestamp zuerst; Same-Day-Fallback nur fuer den Rest (IBKR
+    konsolidiert mehrere Executions in groessere Lots). Mutiert die
+    remaining_shares der geteilten Entry-Objekte in beiden Maps. Mit
+    ``exact_claims`` (_claim_exact_tageskurs_adjustments) ist der exakte
+    Durchgang für alle Lots schon gelaufen; hier folgt nur der Fallback.
+    Entries anderer Asset-Kategorie oder Waehrung zaehlen nie (Options- und
+    Aktienzeilen teilen das Underlying-Symbol, ein EUR- und ein USD-Listing
+    derselben Aktie den Alias), ebenso Entries einer anderen Ausfuehrung,
+    wenn Lot (closingTransactionID) und Zeile sie kennen: Mehrere
+    Ausfuehrungen derselben Sekunde teilen den Zeitstempel, die
+    Bruttozuordnung laeuft aber je Ausfuehrung. Beide Durchgaenge nehmen nur Zeilen mit
+    dem Kurs des Lots (Lot-fxRateToBase = Kurs der schliessenden Zeile):
+    Seit der Buchungskurs-Korrektur (#99) wirkt der Betrag auf das
+    Nettoergebnis, und eine BookTrade-Zeile (Buchung am Folgetag) darf ihre
+    Stillhalter-Korrektur nicht an ein ExchTrade-Lot desselben Tages oder
+    derselben Sekunde verlieren. ``by_instrument`` schluesselt wie die
+    TTAX-Map nach conid und Waehrung.
+    Returns den Roh-Korrekturbetrag fuer diesen Lot.
+    """
+    match = _tageskurs_adjustment_match(lot, alias_map, by_instrument)
+    if match['quantity'] <= 0:
+        return 0.0
+    if exact_claims is not None and id(lot) in exact_claims:
+        adjustment, remaining = exact_claims.pop(id(lot))
+    else:
+        adjustment, remaining = _consume_tageskurs_entries(
+            adj_exact.get(match['exact_key'], []), match['quantity'], match)
     if remaining > 0:
-        consume(adj_date.get(date_key, []))
+        fallback, remaining = _consume_tageskurs_entries(
+            adj_date.get(match['date_key'], []), remaining, match)
+        adjustment += fallback
     return adjustment
 
 
@@ -3425,6 +4089,14 @@ STILLHALTER_REVIEW_REASON_LABELS = {
     'future_assignment_close_unproven': (
         'Future im Steuerjahr geschlossen, aber ohne CLOSED_LOT-Beleg für '
         'die Andienungsposition'),
+    'stock_split_ratio_unknown': (
+        'Split zwischen Andienung und Verkauf ohne belegtes Verhältnis: '
+        'Stückzahlen nicht vergleichbar, Korrektur nicht angewendet; Betrag '
+        '= Prämie der gesamten Andienung als Obergrenze'),
+    'put_lot_basis_above_strike': (
+        'Aktien-Lot passt zeitlich zur Put-Andienung, seine Kostenbasis liegt '
+        'aber über dem Strike (z.B. Split ohne Kapitalmaßnahmen-Daten oder am '
+        'selben Tag zugekauft); Korrektur nicht angewendet'),
 }
 
 
@@ -4808,6 +5480,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     base_currency = 'EUR'  # default — most IBKR accounts for German tax filers are EUR-based
     account_id = ''
     statement_coverage_from = ''  # unbekannt: Exportbeginn nicht belegt
+    corporate_actions_section = ''  # unbekannt (direkte Aufrufer, Tests)
     xml_has_fx_data = False
     acct_path = os.path.join(ib_tax_dir, 'account_info.csv')
     if os.path.exists(acct_path):
@@ -4817,6 +5490,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             account_id = acct_rows[0].get('accountId', '')
             statement_coverage_from = acct_rows[0].get(
                 'statement_coverage_from', '')
+            corporate_actions_section = acct_rows[0].get(
+                'corporate_actions_section', '')
             fx_count = int(acct_rows[0].get('fx_transactions_count', '-1'))
             xml_has_fx_data = fx_count > 0
             if tax_year is None:
@@ -4938,6 +5613,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     _alias_cl_path = os.path.join(ib_tax_dir, 'closed_lots.csv')
     if os.path.exists(_alias_cl_path):
         _alias_closed_lots = load_csv(_alias_cl_path)
+    # Split zwischen Andienung und Verkauf (Issue #98): Lots stehen danach in
+    # Stückzahlen nach dem Split, Andienungen in Stückzahlen davor.
+    stock_split_index = _build_stock_split_index(
+        load_csv(os.path.join(ib_tax_dir, 'corporate_actions.csv')))
+    _annotate_lot_split_factors(_alias_closed_lots, stock_split_index)
+    # Transparenz: jede Andienungskorrektur, die über einen Split umgerechnet
+    # wurde, und jede, die mangels belegtem Verhältnis zum Prüffall wurde.
+    stock_split_adjustments = []
     # Sichtbarkeit fehlender CLOSED_LOT-Daten: Ohne Lots entfallen
     # Tageskurs-Korrektur, Kaufsteuer-Zuordnung (TTAX) und die
     # Haltefrist-Pruefung fuer Anlage SO. Notice in ui_model
@@ -4950,11 +5633,17 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     # ein Konto mit Lots darf die fehlende Sektion eines anderen nicht verdecken.
     closed_lot_coverage['closing_trades_without_lots'] = (
         closed_lot_coverage['closing_trades'] if not _alias_closed_lots else 0)
+    # Lots, deren Tageskurs-Bruttozuordnung ohne schließende Ausführung offen
+    # bleibt (Notice 'closing_execution_unlinked'); gesetzt nach der
+    # CLOSED_LOT-Schleife.
+    closed_lot_coverage['lots_without_closing_execution'] = 0
     if closed_lot_coverage['closing_trades'] and not _alias_closed_lots:
         print(f"  WARNUNG: {closed_lot_coverage['closing_trades']} schliessende "
               f"Trades im Steuerjahr, aber keine CLOSED_LOT-Zeilen im Export "
               f"(Flex Query: Trades → Levels of Detail → Closed Lots).")
-    underlying_alias_map = _build_underlying_alias_map(trades, _alias_closed_lots, fi_rows)
+    underlying_alias_map = _build_underlying_alias_map(
+        trades, _alias_closed_lots, fi_rows,
+        linked_symbols=_split_symbol_links(stock_split_index))
     underlying_symbol_aliases = {}
     for _member, _canon in underlying_alias_map.items():
         if _member != _canon:
@@ -5321,6 +6010,12 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             # treffen statt der ersten Same-Day-Row in Dateireihenfolge.
             # Unterstrich-Felder werden nicht exportiert und nach dem Apply entfernt.
             '_trade_oid': id(t),
+            # Interne Instrument-Identität für die TTAX-Bruttozuordnung
+            # (zwei Optionskontrakte teilen das Underlying-Symbol).
+            '_conid': t.get('conid', ''),
+            # Interne Ausführungs-Identität: Lots tragen sie als
+            # closingTransactionID (Tageskurs-Maps, Bruttozuordnung).
+            '_transaction_id': t.get('transactionID', ''),
         })
 
     # TTAX wird erst nach dem normalen Trade-Routing angewandt. Dadurch kann
@@ -5646,6 +6341,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         _cl_basis_path = os.path.join(ib_tax_dir, 'closed_lots.csv')
         if os.path.exists(_cl_basis_path):
             closed_lots_for_put_basis = load_csv(_cl_basis_path)
+            _annotate_lot_split_factors(
+                closed_lots_for_put_basis, stock_split_index)
 
         # Split: check if underlying is an InvStG ETF
         stk_premium = 0.0
@@ -5716,6 +6413,9 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         # Lot-Sortierung wie oben → identische Zuordnung wie das Routing).
         _correction_lot_claims = {}
         _long_put_short_claims = {}
+        # Lots, die zeitlich zur Put-Andienung passen, deren Basis die Prämie
+        # aber nicht erkennbar enthält (vorher stilles `continue`).
+        _put_lots_above_strike = []
         for det in stillhalter_details:
             is_future_option = det.get('assetCategory') in ('FOP', 'FSFOP')
             underlying_raw = (
@@ -5729,11 +6429,16 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             total_shares_for_put = det['quantity'] * det.get('multiplier', 100)
             put_lot_matches = []
             if det['putCall'] == 'P' and not is_future_option:
+                _split_review = []
                 put_lot_matches = _put_assignment_closed_lot_matches(
                     closed_lots_for_put_basis, det, underlying, total_shares_for_put,
                     consumed=_correction_lot_claims,
-                    alias_map=underlying_alias_map
+                    alias_map=underlying_alias_map,
+                    review=_split_review,
                 )
+                _record_split_review(
+                    _split_review, det, underlying, total_shares_for_put,
+                    stillhalter_corrections_dropped, stock_split_adjustments)
             long_put_short_openings = []
             if det['putCall'] == 'P' and not is_future_option:
                 long_put_short_openings = \
@@ -5810,6 +6515,13 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                             # darf dann die normale Kostenheuristik übersteuern.
                             correction_shares = exercise_backed_shares
                             if correction_shares <= 0:
+                                # Basis zum Strike bleibt still, eine Basis
+                                # deutlich darüber wird Prüffall.
+                                review_item = _put_lot_above_strike_review(
+                                    det, underlying, match,
+                                    premium_per_share_raw)
+                                if review_item:
+                                    _put_lots_above_strike.append(review_item)
                                 continue
                             if not _short_cover_pnl_carries_premium(
                                     match, det, premium_per_share_raw):
@@ -5838,12 +6550,25 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                         match_cost = match.get('cost')
                         if match_cost is not None and match['shares'] > 0:
                             match_cost *= correction_shares / match['shares']
+                        _record_split_adjustment(
+                            stock_split_adjustments, det, underlying,
+                            dict(match, shares=correction_shares),
+                            match_premium_per_share_raw, 'same_year')
+                        # Ab hier Stücke der Verkaufszeile: nach einem Split
+                        # (Issue #98) verteilt sich dieselbe Korrektur auf
+                        # mehr bzw. weniger Aktien.
+                        split_factor = match.get('split_factor', 1.0)
+                        row_correction_shares = correction_shares * split_factor
+                        row_premium_per_share_raw = (
+                            match_premium_per_share_raw / split_factor)
+                        row_invstg_extra_per_share_raw = (
+                            invstg_basis_extra_per_share_raw / split_factor)
                         # Row-Identität der Zielzeile: Long-Lots werden per SELL,
                         # gedeckte Short-Lots per BUY realisiert. cost-präferiert
                         # bleiben fremde Same-Day-Trades unangetastet.
                         put_row_oids = _claim_stock_rows_for_date(
                             trades, underlying, match['close_date'],
-                            correction_shares, _correction_lot_claims,
+                            row_correction_shares, _correction_lot_claims,
                             buysell=match.get('target_buysell', 'SELL'),
                             prefer_cost=match_cost,
                             claim_side='P', alias_map=underlying_alias_map,
@@ -5851,12 +6576,12 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                             raw_underlying=underlying_raw
                         )
                         pending_stk_corrections.setdefault(underlying, []).append({
-                            'premium_per_share_raw': match_premium_per_share_raw,
-                            'remaining_shares': correction_shares,
+                            'premium_per_share_raw': row_premium_per_share_raw,
+                            'remaining_shares': row_correction_shares,
                             'close_date': match['close_date'],
                             'side': 'P',
                             'invstg_basis_extra_per_share_raw':
-                                invstg_basis_extra_per_share_raw,
+                                row_invstg_extra_per_share_raw,
                             'row_oids': put_row_oids or None,
                             'target_buysell': match.get('target_buysell', 'SELL'),
                             'raw_underlying': underlying_raw,
@@ -5865,28 +6590,43 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                         _cy_tageskurs_put_lots.setdefault(
                             underlying, []).append({
                                 'date_str': match.get('open_date', ''),
-                                'shares': correction_shares,
+                                'close_date': match.get('close_date', ''),
+                                'shares': row_correction_shares,
                                 'correction_per_share_raw':
-                                    match_premium_per_share_raw,
-                                'premium_per_share_raw': premium_per_share_raw,
+                                    row_premium_per_share_raw,
+                                'premium_per_share_raw':
+                                    premium_per_share_raw / split_factor,
                                 'invstg_basis_extra_per_share_raw':
-                                    invstg_basis_extra_per_share_raw,
+                                    row_invstg_extra_per_share_raw,
                                 'currency': det.get('currency', ''),
                             })
                 else:
                     # Anteilige Quellen-Kaskade statt binärer Gates (Audit F1 +
                     # Codex-Findings 1–3): Jede Call-Andienung wird quantity-genau
                     # in Ziele aufgelöst; offene Shorts sind kein Fehler.
+                    _split_review = []
                     call_targets, open_short_shares, unresolved_shares = \
                         _resolve_call_assignment_targets(
                             trades, closed_lots_for_put_basis, det, underlying,
                             total_shares, consumed=_correction_lot_claims,
-                            alias_map=underlying_alias_map
+                            alias_map=underlying_alias_map,
+                            split_index=stock_split_index,
+                            review=_split_review,
                         )
+                    _record_split_review(
+                        _split_review, det, underlying, total_shares,
+                        stillhalter_corrections_dropped, stock_split_adjustments)
                     for tgt in call_targets:
+                        _record_split_adjustment(
+                            stock_split_adjustments, det, underlying, tgt,
+                            premium_per_share_raw, 'same_year')
+                        # Stücke der Zielzeile (Split zwischen Andienung und
+                        # Cover, Issue #98).
+                        split_factor = tgt.get('split_factor', 1.0)
                         pending_stk_corrections.setdefault(underlying, []).append({
-                            'premium_per_share_raw': premium_per_share_raw,
-                            'remaining_shares': tgt['shares'],
+                            'premium_per_share_raw':
+                                premium_per_share_raw / split_factor,
+                            'remaining_shares': tgt['shares'] * split_factor,
                             'close_dates': tgt['close_dates'],
                             'side': 'C',
                             'target_buysell': tgt['target_buysell'],
@@ -5922,6 +6662,15 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                             'raw_underlying': underlying_raw,
                             'currency': det.get('currency', ''),
                         })
+
+        if _put_lots_above_strike:
+            # Kein Abzug, aber auch kein stilles Übergehen: ein am selben Tag
+            # zugekauftes Lot kann das Andienungs-Lot verdrängen, ein Reverse
+            # Split ohne Kapitalmaßnahmen-Daten die Stückzahlen verfälschen
+            # (Issue #98). Beides gehört in den Prüffall.
+            stillhalter_corrections_dropped.extend(_put_lots_above_strike)
+            for item in _put_lots_above_strike:
+                _warn_put_lot_above_strike(item)
 
         # Apply pending corrections to stock trade debug_rows
         # IBKR embeds the premium in the stock's cost basis → cost too low, G/V too high.
@@ -6324,6 +7073,25 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                              and (d := parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))) is not None
                              and d.year < tax_year]
 
+    # Ohne CorporateActions-Sektion bleibt ein Split zwischen Andienung und
+    # Verkauf unsichtbar (Issue #98): die Stückzahlen passen dann nicht, und
+    # ohne Lot-Basis über dem Strike fällt das nicht auf. Alle echten Exporte
+    # haben die Sektion; fehlt sie, gibt es einen Hinweis (Notice in ui_model
+    # 'corporate_actions_missing'). Kontoweise gezählt wie closed_lot_coverage.
+    _stock_assignment_count = sum(
+        1 for a in opt_assignments if a.get('assetCategory') == 'OPT'
+    ) + len(prior_put_assignments)
+    _ca_missing = corporate_actions_section == 'missing'
+    corporate_actions_coverage = {
+        'section_missing': 1 if _ca_missing else 0,
+        'stock_assignments_without_section':
+            _stock_assignment_count if _ca_missing else 0,
+    }
+    if corporate_actions_coverage['stock_assignments_without_section']:
+        print(f"  WARNUNG: {_stock_assignment_count} Aktien-Andienung(en), "
+              f"aber keine CorporateActions-Sektion im Export: Aktiensplits "
+              f"zwischen Andienung und Verkauf sind nicht erkennbar.")
+
     # Build FIFO lots per underlying symbol from prior-year put assignments
     from collections import deque
     put_assignment_lots = {}  # {symbol: deque of quantity-capped basis corrections}
@@ -6486,14 +7254,19 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         match_det['assignment_trade_date'] = (
             a.get('tradeDate') or a.get('reportDate')
             or a.get('dateTime') or '')[:10]
+        _split_review = []
         put_lot_matches = [
             match for match in _put_assignment_closed_lot_matches(
                 _xy_closed_lots, match_det, underlying_stk,
                 assignment_shares, consumed=_xy_closed_lot_claims,
-                alias_map=underlying_alias_map,
+                alias_map=underlying_alias_map, review=_split_review,
             )
             if not match.get('is_short_lot')
         ]
+        _record_split_review(
+            _split_review, dict(match_det, premium_raw=net_premium_raw),
+            underlying_stk, assignment_shares,
+            stillhalter_corrections_dropped, stock_split_adjustments)
         if not put_lot_matches:
             continue
 
@@ -6524,43 +7297,71 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 'correction_per_share_raw', 0.0
             )
             if correction_per_share_raw <= 0:
+                review_item = _put_lot_above_strike_review(
+                    match_det, underlying_stk, match, premium_per_share_raw)
+                if review_item:
+                    stillhalter_corrections_dropped.append(review_item)
+                    _warn_put_lot_above_strike(review_item)
                 continue
             invstg_basis_extra_per_share_raw = safe_float(
                 basis_correction.get(
                     'invstg_basis_extra_per_share_raw'), 0.0
             )
+            _record_split_adjustment(
+                stock_split_adjustments, match_det, underlying_stk, match,
+                correction_per_share_raw, 'cross_year')
+            # Verkaufszeilen stehen in Stücken nach einem Split (Issue #98).
+            split_factor = match.get('split_factor', 1.0)
             entry = {
                 'date': a_date,
-                'shares_remaining': match['shares'],
-                'premium_per_share_eur': premium_per_share_eur,
-                'premium_per_share_raw': premium_per_share_raw,
-                'correction_per_share_raw': correction_per_share_raw,
+                'shares_remaining': match['shares'] * split_factor,
+                'premium_per_share_eur': premium_per_share_eur / split_factor,
+                'premium_per_share_raw': premium_per_share_raw / split_factor,
+                'correction_per_share_raw':
+                    correction_per_share_raw / split_factor,
                 'invstg_basis_extra_per_share_raw':
-                    invstg_basis_extra_per_share_raw,
+                    invstg_basis_extra_per_share_raw / split_factor,
                 'strike': strike,
                 'year': a_date.year if a_date else 0,
                 # Review F1: fuer den Waehrungs-Guard bei Alias-vermittelten
                 # Matches (Praemie ist in Options-Waehrung).
                 'currency': a.get('currency', ''),
                 'raw_underlying': underlying,
+                # Schlussdatum des gematchten Lots: bindet die Korrektur an
+                # den Verkauf, zu dem das Lot gehört. Nach einem Split tragen
+                # Lots desselben Assignments verschiedene Stückwerte (#98).
+                'close_date': match.get('close_date', ''),
             }
             put_assignment_lots[underlying_stk].append(entry)
             # Immutable snapshot for the later Tageskurs pass.
             _xy_tageskurs_lots.setdefault(underlying_stk, []).append({
                 'date_str': match.get('open_date', ''),
-                'shares': match['shares'],
-                'correction_per_share_raw': correction_per_share_raw,
-                'premium_per_share_raw': premium_per_share_raw,
+                'close_date': match.get('close_date', ''),
+                'shares': entry['shares_remaining'],
+                'correction_per_share_raw': entry['correction_per_share_raw'],
+                'premium_per_share_raw': entry['premium_per_share_raw'],
                 'invstg_basis_extra_per_share_raw':
-                    invstg_basis_extra_per_share_raw,
+                    entry['invstg_basis_extra_per_share_raw'],
                 'currency': a.get('currency', ''),
             })
         # Anlage-SO-Lookup für cross-year (Issue #51)
-        if u_isin_xy and _effective_classification(u_isin_xy) == 'anlage_so' and a_date:
-            so_key = (underlying_stk, a_date.strftime('%Y-%m-%d'))
-            _so_premium_lookup.setdefault(so_key, {'shares': 0, 'premium_eur': 0.0})
-            _so_premium_lookup[so_key]['shares'] += shares
-            _so_premium_lookup[so_key]['premium_eur'] += premium_eur
+        # Schlüssel sind die Eröffnungstage der gematchten Lots, denn der
+        # Anlage-SO-Teil sucht über das openDateTime des Lots. Der Matcher
+        # akzeptiert Andienungs- und Handelstag; der Buchungstag (reportDate)
+        # liegt bei Verfall am Freitag oft erst am Montag.
+        if u_isin_xy and _effective_classification(u_isin_xy) == 'anlage_so':
+            for so_open_date in sorted({
+                    match.get('open_date', '') for match in put_lot_matches
+                    } - {''}):
+                so_key = (underlying_stk, so_open_date)
+                _so_premium_lookup.setdefault(
+                    so_key, {'shares': 0, 'premium_eur': 0.0})
+                # Prämie und Stückzahl auf denselben Umfang beziehen: alle
+                # Stücke der Andienung, deren Prämie per FIFO belegt ist. Mit
+                # nur den im Steuerjahr verkauften Stücken als Nenner zöge
+                # ein Teilverkauf die ganze Prämie ab.
+                _so_premium_lookup[so_key]['shares'] += assignment_shares
+                _so_premium_lookup[so_key]['premium_eur'] += premium_eur
 
     # Apply corrections to STK sells in tax_year
     if put_assignment_lots:
@@ -6570,6 +7371,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
 
         cross_year_put_total = 0.0
 
+        # Zwei Durchgänge: zuerst nur Einträge, deren Lot an genau diesem
+        # Tag geschlossen wurde (Lot-Identität, unabhängig von der Reihenfolge
+        # in trades.csv); danach FIFO für Reste ohne passendes Schlussdatum.
+        _xy_sell_rows = []
         for t in trades:
             report_date = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
             if not report_date or report_date.year != tax_year:
@@ -6587,43 +7392,57 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             sym = _canon_symbol(sym_raw, underlying_alias_map)
             if sym not in put_assignment_lots:
                 continue
+            _xy_sell_rows.append({
+                'trade': t, 'sym': sym, 'sym_raw': sym_raw,
+                'close_date': (t.get('reportDate') or t.get('dateTime')
+                               or '')[:10],
+                'remaining': abs(int(safe_float(t.get('quantity')))),
+            })
 
-            sell_qty = abs(int(safe_float(t.get('quantity'))))
-            remaining = sell_qty
+        for date_bound in (True, False):
+            for sell in _xy_sell_rows:
+                t = sell['trade']
+                sym = sell['sym']
+                sym_raw = sell['sym_raw']
+                remaining = sell['remaining']
 
-            while remaining > 0 and put_assignment_lots[sym]:
-                lot = put_assignment_lots[sym][0]
-                # Review F1: Alias-vermitteltes Match nur bei kompatibler
-                # Waehrung (Praemie in Options-Waehrung vs. Row-Rohfelder).
-                # Lots eines Underlyings teilen praktisch dieselbe Options-
-                # Waehrung, daher genuegt der Head-Lot-Vergleich.
-                if (sym_raw != lot.get('raw_underlying', sym_raw)
-                        and not _alias_currency_ok(t.get('currency'),
-                                                   lot.get('currency'))):
-                    break
-                consumed = min(remaining, lot['shares_remaining'])
-                # correction_eur wird erst in der debug_rows-Schleife unten gesetzt:
-                # der tatsaechliche EUR-Betrag haengt vom FX-Kurs des Aktienverkaufs
-                # ab, nicht vom Options-Verkaufskurs (premium_per_share_eur).
-                cross_year_put_corrections.append({
-                    'symbol': sym,
-                    'shares': consumed,
-                    'premium_per_share': lot['premium_per_share_eur'],
-                    'premium_per_share_raw': lot['premium_per_share_raw'],
-                    'correction_per_share_raw':
-                        lot['correction_per_share_raw'],
-                    'invstg_basis_extra_per_share_raw':
-                        lot['invstg_basis_extra_per_share_raw'],
-                    'correction_eur': 0.0,
-                    'currency': lot.get('currency', ''),
-                    'raw_underlying': lot.get('raw_underlying', ''),
-                    'assignment_year': lot['year'],
-                    'strike': lot['strike'],
-                })
-                lot['shares_remaining'] -= consumed
-                remaining -= consumed
-                if lot['shares_remaining'] <= 0:
-                    put_assignment_lots[sym].popleft()
+                for lot in put_assignment_lots[sym]:
+                    if remaining <= 0:
+                        break
+                    if lot['shares_remaining'] <= 0:
+                        continue
+                    if date_bound and lot.get('close_date') != sell['close_date']:
+                        continue
+                    # Review F1: Alias-vermitteltes Match nur bei kompatibler
+                    # Waehrung (Praemie in Options-Waehrung vs. Row-Rohfelder).
+                    if (sym_raw != lot.get('raw_underlying', sym_raw)
+                            and not _alias_currency_ok(t.get('currency'),
+                                                       lot.get('currency'))):
+                        continue
+                    consumed = min(remaining, lot['shares_remaining'])
+                    # correction_eur wird erst in der debug_rows-Schleife unten gesetzt:
+                    # der tatsaechliche EUR-Betrag haengt vom FX-Kurs des Aktienverkaufs
+                    # ab, nicht vom Options-Verkaufskurs (premium_per_share_eur).
+                    cross_year_put_corrections.append({
+                        'symbol': sym,
+                        'shares': consumed,
+                        'premium_per_share': lot['premium_per_share_eur'],
+                        'premium_per_share_raw': lot['premium_per_share_raw'],
+                        'correction_per_share_raw':
+                            lot['correction_per_share_raw'],
+                        'invstg_basis_extra_per_share_raw':
+                            lot['invstg_basis_extra_per_share_raw'],
+                        'correction_eur': 0.0,
+                        'currency': lot.get('currency', ''),
+                        'raw_underlying': lot.get('raw_underlying', ''),
+                        'assignment_year': lot['year'],
+                        'strike': lot['strike'],
+                        # Zielzeile: nur dieser Verkauf erhält die Korrektur.
+                        'row_oid': id(t),
+                    })
+                    lot['shares_remaining'] -= consumed
+                    remaining -= consumed
+                sell['remaining'] = remaining
 
         if cross_year_put_corrections:
             # Correct stock debug_rows in-place AND derive the pool adjustment from the
@@ -6651,6 +7470,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     'invstg_basis_extra_per_share_raw':
                         c['invstg_basis_extra_per_share_raw'],
                     'remaining_shares': c['shares'],
+                    # Interne Zielidentität, nicht im Audit ausgeben.
+                    'row_oid': c.pop('row_oid', None),
                     'corr_ref': c,
                 })
             for row in debug_rows:
@@ -6679,6 +7500,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 _row_corr_refs = []  # [(cross_year_put_corrections-Eintrag, chunk_raw)]
                 for corr in _xy_pending[row_symbol]:
                     if corr['remaining_shares'] <= 0:
+                        continue
+                    if (corr.get('row_oid') is not None
+                            and row.get('_trade_oid') is not None
+                            and corr['row_oid'] != row['_trade_oid']):
                         continue
                     # Review F1: keine Alias-Bruecke in fremde Waehrung
                     # (analog zum Sell-Loop oben).
@@ -7896,9 +8721,16 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
 
     # Per-Share-Korrektur-Maps fuer die Bruttozuordnung (Mechanik + Doku:
     # _build_tageskurs_pnl_adjustment_maps / _consume_tageskurs_pnl_adjustment).
+    _closing_quantities = _closing_quantity_by_execution(_alias_closed_lots)
     _tageskurs_pnl_adj_exact, _tageskurs_pnl_adj_date = \
         _build_tageskurs_pnl_adjustment_maps(
-            debug_rows, alias_map=underlying_alias_map)
+            debug_rows, alias_map=underlying_alias_map,
+            closing_quantities=_closing_quantities)
+    _tageskurs_ttax_exact, _tageskurs_ttax_date = \
+        _build_tageskurs_pnl_adjustment_maps(
+            debug_rows, alias_map=underlying_alias_map,
+            field='transaction_tax_eur',
+            closing_quantities=_closing_quantities)
 
     fx_correction_total = 0.0
     fx_correction_details = []
@@ -8040,6 +8872,21 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             return fx_map[fx_dates[idx - 1]]
 
         lots_processed = 0
+        # Bruttozuordnung je schließender Ausführung (_tageskurs_closing_trade_key):
+        # Schlüssel -> [Topf, Ergebnis vor Tageskurs, Tageskurs-Delta].
+        _tageskurs_gross_groups = {}
+        # Gruppen mit übernommener Stillhalter-/TTAX-Korrektur
+        # (_tageskurs_unlinked_lots_at_risk).
+        _tageskurs_adjusted_groups = set()
+        _tageskurs_executions = _tageskurs_execution_counts(trades)
+        # Exakte Treffer aller Lots vor jedem Tagesfallback (Doku:
+        # _claim_exact_tageskurs_adjustments).
+        _tageskurs_pnl_adj_claims = _claim_exact_tageskurs_adjustments(
+            [lot for lot in closed_lots
+             if lot.get('assetCategory') == 'STK'],
+            _tageskurs_pnl_adj_exact, alias_map=underlying_alias_map)
+        _tageskurs_ttax_claims = _claim_exact_tageskurs_adjustments(
+            closed_lots, _tageskurs_ttax_exact, by_instrument=True)
 
         for lot in closed_lots:
             currency = lot.get('currency', '')
@@ -8108,12 +8955,17 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                     underlying_alias_map)
                 if lot_sym in _tageskurs_put_adj:
                     lot_open_date = open_dt[:10]
+                    lot_close_date = (lot.get('reportDate')
+                                      or lot.get('dateTime') or '')[:10]
                     lot_qty = abs(safe_float(lot.get('quantity'), 0))
                     remaining = lot_qty
                     for adj_lot in _tageskurs_put_adj[lot_sym]:
                         if adj_lot['shares_remaining'] <= 0:
                             continue
                         if adj_lot['date'] and lot_open_date and adj_lot['date'] != lot_open_date:
+                            continue
+                        if (adj_lot.get('close_date') and lot_close_date
+                                and adj_lot['close_date'] != lot_close_date):
                             continue
                         # Review F1: Praemien-Restore nur in kompatibler
                         # Waehrung (cost_raw ist in Lot-Waehrung; bei einem
@@ -8139,7 +8991,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                         if remaining <= 0:
                             break
 
-            delta = cost_raw * (fx_close - fx_open)
+            delta_basis = cost_raw * (fx_close - fx_open)
             lots_processed += 1
 
             # Determine topf
@@ -8170,6 +9022,41 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 topf = 'Topf1'
             else:
                 topf = 'Topf2'
+
+            # Lot-Ergebnis so, wie es nach der Stillhalter-Korrektur in den
+            # Pools steht (die Andienungsprämie ist dort bereits entfernt).
+            pnl_raw = safe_float(lot.get('fifoPnlRealized'), 0)
+            pnl_stillhalter_adjustment_raw = (
+                _consume_tageskurs_pnl_adjustment(
+                    lot, _tageskurs_pnl_adj_exact,
+                    _tageskurs_pnl_adj_date,
+                    alias_map=underlying_alias_map,
+                    exact_claims=_tageskurs_pnl_adj_claims)
+                if category == 'STK' else 0.0
+            )
+            pnl_before_tageskurs_raw = pnl_raw - pnl_stillhalter_adjustment_raw
+            # TTAX steckt in EUR schon im Pool-Ergebnis der Trade-Zeile
+            # (§20 Abs. 4 EStG), aber nicht im Lot-PnL. Nur für die
+            # Bruttozuordnung, nicht für die Kursdifferenz.
+            transaction_tax_eur = _consume_tageskurs_pnl_adjustment(
+                lot, _tageskurs_ttax_exact, _tageskurs_ttax_date,
+                by_instrument=True, exact_claims=_tageskurs_ttax_claims)
+
+            # delta_basis unterstellt, dass IBKR das Ergebnis zum Kurs des
+            # Handelstags umgerechnet hat. Bei BookTrades mit späterem
+            # Buchungstag (Verfall Freitag, Buchung Montag) ist fxRateToBase
+            # aber die ConversionRate des Buchungstags (Issue #99, belegt an
+            # allen echten Exporten). Den Unterschied zum tatsächlich
+            # gebuchten Kurs mitkorrigieren; der Steuerkurs bleibt der
+            # Handelstag (BMF Rn. 85). USD-Basis rechnet die Pools mit eigener
+            # Tageskursreihe und bleibt hier unverändert.
+            fx_booked = (safe_float(lot.get('fxRateToBase'), 0)
+                         if base_currency == 'EUR' else 0.0)
+            booking_rate_delta = (
+                pnl_before_tageskurs_raw * (fx_close - fx_booked)
+                if fx_booked > 0 else 0.0
+            )
+            delta = delta_basis + booking_rate_delta
             # Nur steuerlich geroutete Buckets zaehlen zum globalen
             # Tageskurs-Korrekturwert. Die LP-Jahresallokation fehlt; ihr
             # Broker-Delta bleibt deshalb ausschliesslich als beobachteter
@@ -8218,6 +9105,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 'fx_close': fx_close,
                 'fx_open_date': open_fx_day,
                 'fx_close_date': close_dt,
+                'fx_booked': fx_booked if fx_booked > 0 else None,
+                'booking_rate_delta_eur': round(booking_rate_delta, 5),
                 'delta_eur': round(delta, 5),
                 'topf': topf,
                 'underlyingSymbol': lot.get('underlyingSymbol', ''),
@@ -8238,36 +9127,47 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 )
             fx_correction_details.append(detail)
 
-            # Track gain/loss shift per lot for consistent Zeilen 20/22/23
-            pnl_raw = safe_float(lot.get('fifoPnlRealized'), 0)
-            pnl_stillhalter_adjustment_raw = (
-                _consume_tageskurs_pnl_adjustment(
-                    lot, _tageskurs_pnl_adj_exact,
-                    _tageskurs_pnl_adj_date,
-                    alias_map=underlying_alias_map)
-                if category == 'STK' else 0.0
-            )
+            # Gain/loss shift per closing trade for consistent Zeilen 20/22/23
             detail['stillhalter_adjustment_raw'] = round(
                 pnl_stillhalter_adjustment_raw, 5
             )
             # The base pools already exclude an assigned-put premium when that
             # premium was actually removed from the tax trade. Classify the FX
             # delta from that same corrected basis, not from IBKR's uncorrected
-            # fifoPnlRealized value.
-            pnl_before_tageskurs_raw = pnl_raw - pnl_stillhalter_adjustment_raw
+            # fifoPnlRealized value, converted at the rate actually booked.
             if base_currency == 'EUR':
-                original_pnl = pnl_before_tageskurs_raw * fx_close
+                original_pnl = pnl_before_tageskurs_raw * (
+                    fx_booked if fx_booked > 0 else fx_close)
             else:
                 original_pnl = (
                     pnl_before_tageskurs_raw
                     * safe_float(lot.get('fxRateToBase'), 1.0)
                     * get_rate_for_date(report_date, usd_to_eur_rates)
                 )
+            original_pnl += transaction_tax_eur
+            group_key = _tageskurs_closing_trade_key(
+                lot, topf, _tageskurs_executions)
+            group = _tageskurs_gross_groups.setdefault(
+                group_key, [topf, 0.0, 0.0])
+            group[1] += original_pnl
+            group[2] += delta
+            if (abs(pnl_stillhalter_adjustment_raw) > 1e-9
+                    or abs(transaction_tax_eur) > 1e-9):
+                _tageskurs_adjusted_groups.add(group_key)
+
+        for topf, group_pnl, group_delta in _tageskurs_gross_groups.values():
             gross_adjustment = calculate_tageskurs_gross_adjustment(
-                original_pnl, delta
+                group_pnl, group_delta
             )
             fx_corr_gain_adj[topf] += gross_adjustment['gain_adjustment']
             fx_corr_loss_adj[topf] += gross_adjustment['loss_adjustment']
+        closed_lot_coverage['lots_without_closing_execution'] = (
+            _tageskurs_unlinked_lots_at_risk(
+                _tageskurs_gross_groups, _tageskurs_adjusted_groups))
+        if closed_lot_coverage['lots_without_closing_execution']:
+            print(f"  WARNUNG: {closed_lot_coverage['lots_without_closing_execution']} "
+                  "Lot(s) ohne schliessende Ausfuehrung (Export ohne Transaction ID): "
+                  "Aufteilung der Tageskurs-Korrektur auf Zeile 20/22/23 offen.")
 
         validate_tageskurs_gross_adjustments(
             fx_corr_by_topf, fx_corr_gain_adj, fx_corr_loss_adj
@@ -8305,6 +9205,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                 if lot.get('isin', '').strip() in so_isins
                 and lot.get('assetCategory') == 'STK'
             ]
+            _annotate_lot_split_factors(closed_lots_for_so, stock_split_index)
 
         if closed_lots_for_so:
             # Use CLOSED_LOT data for exact per-lot holding period
@@ -8341,8 +9242,14 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
                         underlying_alias_map)
                     open_date_str = str(open_dt)[:10]
                     so_entry = _so_premium_lookup.get((lot_sym, open_date_str))
-                    if so_entry and so_entry['shares'] > 0:
-                        premium_for_lot = so_entry['premium_eur'] * abs(qty) / so_entry['shares']
+                    # Lot-Stücke nach einem Split in Andienungs-Stücke
+                    # zurückrechnen (Issue #98); ohne belegtes Verhältnis
+                    # keine Korrektur (Prüffall im Stillhalter-Pfad).
+                    split_factor = lot.get('_split_factor', 1.0)
+                    if so_entry and so_entry['shares'] > 0 and split_factor:
+                        premium_for_lot = (so_entry['premium_eur']
+                                           * abs(qty) / split_factor
+                                           / so_entry['shares'])
                         pnl_eur -= premium_for_lot
                         _so_lot_corr_total += premium_for_lot
 
@@ -8535,6 +9442,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     # Jahren ohne Stillhalter-Fall nicht in Report/Export gelangen.
     for row in debug_rows:
         row.pop('_trade_oid', None)
+        row.pop('_conid', None)
+        row.pop('_transaction_id', None)
     debug_rows.sort(key=lambda r: r.get('dateTime', '') or r.get('reportDate', '') or 'zzzz')
 
     # Alle je in diesem Report vorkommenden ETF-ISINs (unabhängig von Bucket) —
@@ -8689,6 +9598,10 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             # CLOSED_LOT-Abdeckung: lot_rows=0 bei closing_trades>0 heisst
             # Flex Query ohne "Closed Lots" (Notice closed_lots_missing).
             "closed_lot_coverage": closed_lot_coverage,
+            # Fehlt die Sektion CorporateActions, sind Splits zwischen
+            # Andienung und Verkauf nicht erkennbar (Notice
+            # corporate_actions_missing).
+            "corporate_actions_coverage": corporate_actions_coverage,
             "unhandled_activity_codes": sorted(
                 unhandled_activity_codes.values(), key=lambda e: e['code']
             ),
@@ -8702,6 +9615,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             "etf_correction_cy": etf_gain_corr_cy + etf_loss_corr_cy,
             "stillhalter_unmatched": stillhalter_unmatched,
             "stillhalter_corrections_dropped": stillhalter_corrections_dropped,
+            "stock_split_adjustments": stock_split_adjustments,
             "future_assignment_corrections": future_assignment_corrections,
             "stillhalter_open_short": stillhalter_open_short,
             "stillhalter_details": stillhalter_details,

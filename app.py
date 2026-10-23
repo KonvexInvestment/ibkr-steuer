@@ -1215,6 +1215,7 @@ def merge_report_data(reports):
         'prior_zufluss_details': [],
         'zufluss_unmatched': [],
         'occ_rename_matches': [],
+        'stock_split_adjustments': [],
         'stillhalter_corrections_dropped': [],
         'future_assignment_corrections': [],
         'stillhalter_open_short': [],
@@ -1253,6 +1254,13 @@ def merge_report_data(reports):
             'lot_rows': sum(r.get('audit', {}).get('closed_lot_coverage', {}).get('lot_rows', 0) for r in reports),
             'closing_trades': sum(r.get('audit', {}).get('closed_lot_coverage', {}).get('closing_trades', 0) for r in reports),
             'closing_trades_without_lots': sum(r.get('audit', {}).get('closed_lot_coverage', {}).get('closing_trades_without_lots', 0) for r in reports),
+            'lots_without_closing_execution': sum(r.get('audit', {}).get('closed_lot_coverage', {}).get('lots_without_closing_execution', 0) for r in reports),
+        },
+        # Kontoweise gezählt: ein Konto mit Kapitalmaßnahmen-Sektion darf die
+        # fehlende Sektion eines anderen nicht verdecken (Issue #98).
+        'corporate_actions_coverage': {
+            'section_missing': sum((r.get('audit', {}).get('corporate_actions_coverage') or {}).get('section_missing', 0) for r in reports),
+            'stock_assignments_without_section': sum((r.get('audit', {}).get('corporate_actions_coverage') or {}).get('stock_assignments_without_section', 0) for r in reports),
         },
     }
     _fees_by_code = {}
@@ -1309,6 +1317,8 @@ def merge_report_data(reports):
         merged_audit['prior_zufluss_details'].extend(a.get('prior_zufluss_details', []))
         merged_audit['zufluss_unmatched'].extend(a.get('zufluss_unmatched', []))
         merged_audit['occ_rename_matches'].extend(a.get('occ_rename_matches', []))
+        merged_audit['stock_split_adjustments'].extend(
+            a.get('stock_split_adjustments', []) or [])
         merged_audit['stillhalter_corrections_dropped'].extend(a.get('stillhalter_corrections_dropped', []))
         merged_audit['future_assignment_corrections'].extend(
             a.get('future_assignment_corrections', []))
@@ -2297,7 +2307,8 @@ with _toggle_slot:
             f"({'+' if _fx_corr_total >= 0 else ''}{fmt_de(_fx_corr_total)} EUR)",
             "Rechnet Erlöse und Anschaffungskosten jeweils zum FX-Kurs ihres "
             "eigenen Handelstags um (§20 Abs. 4 S. 1 EStG) statt den Netto-PnL "
-            "zum Schlusskurs. Benötigt CLOSED_LOT-Daten der Flex Query.",
+            "zum Kurs der IBKR-Schlussbuchung. Benötigt CLOSED_LOT-Daten der "
+            "Flex Query.",
             "ersetzt für betroffene Geschäfte die IBKR-Schlusskursumrechnung; "
             f"erkannte Gesamtdifferenz in diesem Bericht: "
             f"{'+' if _fx_corr_total >= 0 else ''}"
@@ -2379,6 +2390,13 @@ future_option_premium_eur = sum(
 future_assignment_corrections = audit.get('future_assignment_corrections', []) or []
 future_correction_eur = sum(
     float(c.get('amount_eur') or 0) for c in future_assignment_corrections)
+# Andienungskorrekturen, die über einen Aktiensplit umgerechnet wurden
+# (Issue #98); unbelegte Verhältnisse laufen als Prüffall über
+# stillhalter_corrections_dropped.
+split_adjustments = [
+    item for item in audit.get('stock_split_adjustments', []) or []
+    if item.get('status') == 'umgerechnet'
+]
 
 fx_corr_total = d.get('fx_correction_total', 0)
 tk_gain_adj = d.get('fx_corr_gain_adj', {}) or {}
@@ -3653,6 +3671,32 @@ def _render_transparency_details():
                     f"{esc(qty_text)} |\n")
             st.markdown(occ_table)
 
+    if split_adjustments:
+        with st.expander(
+                f"Aktiensplits · {len(split_adjustments)} umgerechnete "
+                f"Andienungskorrektur(en)", expanded=False):
+            st.caption(
+                "Zwischen Andienung und Verkauf lag ein Aktiensplit. IBKR "
+                "führt das Lot danach in Stückzahlen nach dem Split, die "
+                "Andienung steht in Stückzahlen davor. Die Prämie wird mit "
+                "dem Split-Verhältnis aus der Kapitalmaßnahme umgerechnet "
+                "und genau einmal aus dem Aktienergebnis entfernt."
+            )
+            split_table = ("| Basiswert | Andienung | Split | Stück Andienung "
+                           "| Stück Lot | Korrektur |\n"
+                           "|---|---|---|---|---|---|\n")
+            for item in split_adjustments:
+                split_table += (
+                    f"| {esc(item.get('symbol') or item.get('underlying'))} "
+                    f"({esc(item.get('putCall'))}) | "
+                    f"{esc(item.get('assignment_date'))} | "
+                    f"{esc(item.get('splits'))} | "
+                    f"{float(item.get('assignment_shares') or 0):g} | "
+                    f"{float(item.get('lot_shares') or 0):g} | "
+                    f"{fmt_de(float(item.get('correction_raw') or 0))} "
+                    f"{esc(item.get('currency'))} |\n")
+            st.markdown(split_table)
+
     underlying_symbol_aliases = audit.get('underlying_symbol_aliases', {})
     if underlying_symbol_aliases:
         with st.expander("Symbol-Aliasse und Ticker-Umbenennungen",
@@ -3934,7 +3978,9 @@ def _render_toggle_explainers():
             "Tageskurs-Methode",
             "**§20 Abs. 4 S. 1 EStG:** Einnahmen werden zum Verkaufskurs und "
             "Anschaffungskosten zum Kaufkurs in Euro umgerechnet. IBKR rechnet "
-            "den gesamten Netto-PnL zum Schlusskurs um. Abweichung für "
+            "den gesamten Netto-PnL zum Kurs der Schlussbuchung um, bei "
+            "Verfall und Andienung teils erst zum Kurs des folgenden "
+            "Buchungstags. Abweichung für "
             f"{steuerjahr}: **{'+' if fx_corr_total >= 0 else ''}"
             f"{fmt_de(fx_corr_total)} EUR** (CLOSED_LOT-Analyse, ohne Futures "
             "und CFDs).",
@@ -4249,7 +4295,7 @@ Wird eine verkaufte Option (Stillhalterposition) ausgeübt (Assignment), muss di
 - **Aktientransaktion** = Veräußerung (Call, Rn. 26) bzw. Anschaffung (Put, Rn. 33) nach §20 Abs. 2 → gehört in **Topf 1**
 - **Future-Optionen (FOP/FSFOP)** = der gelieferte Future ist ein Termingeschäft nach §20 Abs. 2 S. 1 Nr. 3 EStG → bleibt in **Topf 2**. IBKR bettet die Prämie in die Kostenbasis des Futures ein; das Tool rechnet sie beim Close des Futures (auch jahresübergreifend) wieder heraus, damit sie nur einmal in Topf 2 steht. Andienungsgebühren bleiben Anschaffungsnebenkosten des Futures. Ohne lückenlose Belegkette (Optionsverkauf, Lieferung, CLOSED_LOT, Close) erfolgt keine Korrektur, sondern ein Prüffall.
 
-Bei **beiden** Assignment-Typen gilt laut BMF: „Die vereinnahmte Optionsprämie wird bei der Ermittlung des Veräußerungsgewinns **nicht berücksichtigt**." IBKR bündelt die Prämie jedoch im Trade des Basiswerts (Call: im Verkaufserlös, Put: in den reduzierten Anschaffungskosten). Dieses Tool erkennt Assignments automatisch und trennt die Prämie heraus.
+Bei **beiden** Assignment-Typen gilt laut BMF: „Die vereinnahmte Optionsprämie wird bei der Ermittlung des Veräußerungsgewinns **nicht berücksichtigt**." IBKR bündelt die Prämie jedoch im Trade des Basiswerts (Call: im Verkaufserlös, Put: in den reduzierten Anschaffungskosten). Dieses Tool erkennt Assignments automatisch und trennt die Prämie heraus. Liegt zwischen Andienung und Verkauf ein Aktiensplit, wird die Prämie mit dem Split-Verhältnis aus den Kapitalmaßnahmen des Exports auf die neue Stückzahl umgerechnet; ohne belegtes Verhältnis entsteht ein Prüffall statt einer Korrektur.
 
 {"**In diesem Report:** " + str(sh_count) + " Assignments erkannt (Call + Put), " + fmt_de(sh_eur) + " EUR Stillhalterprämien separat in Topf 2 erfasst" + (" (davon " + str(len(future_option_details)) + " Future-Option(en) mit " + fmt_de(future_option_premium_eur) + " EUR; Future-Ergebnis um " + fmt_de(future_correction_eur) + " EUR bereinigt)" if future_option_details else "") + "." if sh_count > 0 else "**In diesem Report:** Keine Assignments erkannt."}
 
@@ -4328,10 +4374,11 @@ Die IBKR Flex Query XML wird in einzelne CSV-Dateien zerlegt. Jede XML-Sektion e
 | `<StmtFunds>` | Dividenden, Zinsen, Steuern, Gebühren. Felder: `activityCode`, `amount`, `fxRateToBase`, `reportDate`, `transactionID` | Bei einer einzelnen XML-Datei vollständig übernommen; Split-/Quartals-XMLs werden bereits beim Merge dedupliziert. Die Berechnung dedupliziert anschließend nochmals defensiv (Schritt 2) |
 | `<FIFOPerformanceSummaryInBase>` | Aggregierter PnL pro Instrument. Felder: `assetCategory`, `isin`, `totalRealizedPnl` | Fallback für fehlende Trades (z.B. T-Bill Maturity) |
 | `<FxTransactions>` | FX-Gewinne/-Verluste. Felder: `fxCurrency`, `realizedPL`, `reportDate` | Nur `levelOfDetail=TRANSACTION` |
+| `<CorporateActions>` | Kapitalmaßnahmen. Felder: `type`, `actionDescription`, `conid`, `quantity`, `dateTime`, `actionID` | Alle Zeilen → corporate_actions.csv. Aktiensplits (Typ FS/RS/FI bzw. Text „SPLIT x FOR y“) dienen der Umrechnung von Andienungen auf Stückzahlen nach dem Split; fehlt die Sektion, erscheint bei Aktien-Andienungen ein Prüffall-Hinweis |
 | `<AccountInformation>` | Basiswährung (`currency`), Kontotyp | Einzelner Eintrag; fehlt die Sektion, wird die Basiswährung aus den Kontostandszeilen der Buchungen abgeleitet, sonst bricht die Verarbeitung mit einer Fehlermeldung ab |
 | `<FlexStatement>` | Berichtszeitraum → Steuerjahr aus `toDate` | Automatisch erkannt, auch ohne `<AccountInformation>` |
 
-**Multi-XML (Vorjahre):** Trades aus allen XMLs werden in eine gemeinsame `trades.csv` zusammengeführt (für Stillhalter-Matching über Jahresgrenzen). FX-Kontobewegungen werden chronologisch gemergt; als Duplikat gilt dabei eine Zeile, bei der alle sechs Schlüsselfelder übereinstimmen: Währung, Datum, `transactionID`, Buchungstext, Betrag und Saldo. Ein Schlüssel allein aus `transactionID` wäre falsch: IBKR vergibt dieselbe ID für jede Folgebuchung derselben Position, etwa für alle täglichen Abrechnungen eines Futures.
+**Multi-XML (Vorjahre):** Trades aus allen XMLs werden in eine gemeinsame `trades.csv` zusammengeführt (für Stillhalter-Matching über Jahresgrenzen). Kapitalmaßnahmen aus Vorjahres-XMLs werden ebenfalls übernommen, damit ein Split nach einer Vorjahres-Andienung erkannt wird; fehlt die Sektion in einem Vorjahres-XML, gilt sie für den Hinweis als fehlend. FX-Kontobewegungen werden chronologisch gemergt; als Duplikat gilt dabei eine Zeile, bei der alle sechs Schlüsselfelder übereinstimmen: Währung, Datum, `transactionID`, Buchungstext, Betrag und Saldo. Ein Schlüssel allein aus `transactionID` wäre falsch: IBKR vergibt dieselbe ID für jede Folgebuchung derselben Position, etwa für alle täglichen Abrechnungen eines Futures.
 
 ---
 
@@ -4355,14 +4402,14 @@ IBKR-Methode:     PnL (EUR) = fifoPnlRealized × fxRateToBase
 Tageskurs-Methode: PnL (EUR) = Erlös × FX_Verkaufstag − AK × FX_Kauftag
 ```
 
-**IBKR-Methode (Standard):** Rechnet den Netto-PnL komplett zum Schlusskurs um.
+**IBKR-Methode (Ausgangswert):** Rechnet den Netto-PnL komplett zum Kurs der Schlussbuchung um (`fxRateToBase`, IBKRs Tageskurs des Buchungstags `reportDate`).
 
-**Tageskurs-Methode (§20 Abs. 4 S. 1 EStG, optional):** *"Bei nicht in Euro getätigten Geschäften sind die Einnahmen im Zeitpunkt der Veräußerung und die Anschaffungskosten im Zeitpunkt der Anschaffung in Euro umzurechnen."* Verwendet die CLOSED_LOT-Zeilen der Flex Query (Trades, Levels of Detail: Closed Lots). Korrigiert werden alle Lots in einer Fremdwährung (USD, CHF, GBP, JPY, HKD usw.), jede Währung mit ihrer eigenen Kursreihe. Futures und CFDs werden ausgeschlossen (Kostenbasis = Nominalwert, bei der Eröffnung fließt kein Nominal), ebenso angediente oder ausgeübte Optionen (die Prämie ist bereits zum Kurs des Verkaufstags erfasst). Korrektur: `AK × (FX_Schlusskurs - FX_Kaufkurs)` pro Lot; AK ist vorzeichenbehaftet (Long positiv, Short negativ), dadurch kehrt sich die Richtung bei Short-Positionen automatisch um. Kursquelle bei EUR-Basiskonten: IBKRs Tageskurs der jeweiligen Währung (`ConversionRate`). Fehlt er für einen Tag, dient das Tagesmittel der `fxRateToBase`-Kurse der Trades dieses Tages als Ersatz (ohne stornierte Trades und Devisentausch): der Intraday-Kurs der ExchTrades, an reinen Verfall-/Andienungstagen der Settlement-Kurs der BookTrades (16:20). Bei USD-Basiskonten: Kurs der Währung zu USD × USD/EUR-Tageskurs. Stichtag ist jeweils der Handelstag von Kauf und Verkauf (IBKR `tradeDate`), nicht das Kalenderdatum des IBKR-Zeitstempels in US-Ostküstenzeit: Käufe an asiatischen Börsen und im US-Nachthandel fallen dort auf den Vorabend. Liegt der Kauf vor dem Zeitraum des Exports, wird der früheste verfügbare Kurs verwendet; für exakte Werte das XML des Vorjahres mit hochladen.
+**Tageskurs-Methode (§20 Abs. 4 S. 1 EStG, standardmäßig aktiv, in der Sidebar abschaltbar):** *"Bei nicht in Euro getätigten Geschäften sind die Einnahmen im Zeitpunkt der Veräußerung und die Anschaffungskosten im Zeitpunkt der Anschaffung in Euro umzurechnen."* Verwendet die CLOSED_LOT-Zeilen der Flex Query (Trades, Levels of Detail: Closed Lots). Korrigiert werden alle Lots in einer Fremdwährung (USD, CHF, GBP, JPY, HKD usw.), jede Währung mit ihrer eigenen Kursreihe. Futures und CFDs werden ausgeschlossen (Kostenbasis = Nominalwert, bei der Eröffnung fließt kein Nominal), ebenso angediente oder ausgeübte Optionen (die Prämie ist bereits zum Kurs des Verkaufstags erfasst). Korrektur: `AK × (FX_Schlusskurs − FX_Kaufkurs)` pro Lot; AK ist vorzeichenbehaftet (Long positiv, Short negativ), dadurch kehrt sich die Richtung bei Short-Positionen automatisch um. Bei EUR-Basiskonten kommt ein zweiter Teil hinzu: IBKR rechnet das Ergebnis zum Kurs seines Buchungstags um, und bei Verfall und Andienung liegt der Buchungstag teils nach dem Handelstag (Verfall am Freitag, Buchung am Montag). Das Tool korrigiert deshalb zusätzlich `Ergebnis × (FX_Schlusskurs − FX_Buchungskurs)`, wobei Ergebnis das realisierte Ergebnis in Handelswährung ist (nach Herausrechnen einer Stillhalterprämie). Bei Börsen-Trades fallen Handels- und Buchungstag zusammen, der zweite Teil ist dann null. Bei USD-Basiskonten wird der zweite Teil derzeit nicht berechnet. Kursquelle bei EUR-Basiskonten: IBKRs Tageskurs der jeweiligen Währung (`ConversionRate`). Fehlt er für einen Tag, dient das Tagesmittel der `fxRateToBase`-Kurse der Trades dieses Tages als Ersatz (ohne stornierte Trades und Devisentausch). Börsen-Trades haben dabei Vorrang; Verfall- und Andienungsbuchungen zählen nur an Tagen ohne Börsen-Trade, weil IBKR sie zum Kurs ihres Buchungstags umrechnet. Bei USD-Basiskonten: Kurs der Währung zu USD × USD/EUR-Tageskurs. Stichtag ist jeweils der Handelstag von Kauf und Verkauf (IBKR `tradeDate`, als Näherung an den Zeitpunkt des Geschäftsabschlusses, den BMF 14.05.2025 Rn. 85 für die Währungsumrechnung vorgibt), nicht der Buchungstag und nicht das Kalenderdatum des IBKR-Zeitstempels in US-Ostküstenzeit: Käufe an asiatischen Börsen und im US-Nachthandel fallen dort auf den Vorabend. Liegt der Kauf vor dem Zeitraum des Exports, wird der früheste verfügbare Kurs verwendet; für exakte Werte das XML des Vorjahres mit hochladen.
 
 | Feld | Bedeutung |
 |---|---|
 | `fifoPnlRealized` | IBKR's FIFO-basierter realisierter Gewinn/Verlust in **Trade-Währung** |
-| `fxRateToBase` | Umrechnungskurs Trade-Währung → Basiswährung (EUR) am **Schlusstag** |
+| `fxRateToBase` | Umrechnungskurs Trade-Währung → Basiswährung am **Buchungstag** (`reportDate`); bei Börsen-Trades ist das der Handelstag, bei Verfall und Andienung teils der folgende Handelstag |
 | `reportDate` | Buchungsdatum (bestimmt das Steuerjahr, Zuflussprinzip) |
 | `assetCategory` | Ausgangspunkt der Routingtabelle unten: `STK` wird weiter nach Produktart unterschieden; bekannte Derivate und Kapitalforderungen gehen in Topf 2, `CASH` in die separate FX-Rechnung. Unbekannte Kategorien werden als Prüffall gemeldet |
 | `subCategory` | ETF-Erkennung: `ETF` → InvStG-Prüfung, `COMMON` → Einzelaktie |
@@ -4423,7 +4470,9 @@ Jede Teilfüllung wird einzeln umgerechnet. Ein gewichteter Durchschnittskurs w�
 
 **Cross-Year:** Wenn die Option in einem Vorjahr verkauft wurde und im Steuerjahr assigned wird, gehört die Prämie ins Vorjahr (Zuflussprinzip). Vorjahres-XMLs müssen mit hochgeladen werden (beim Start oder über "Daten ändern" in der Sidebar), damit der Original-SELL gefunden wird. Findet das Tool zu einer Andienung im Steuerjahr keinen Original-Verkauf (fehlendes oder lückenhaftes Vorjahres-XML), erscheint eine Stillhalter-Warnung mit den betroffenen Serien; die Prämie bleibt dann unkorrigiert im Aktien-Ergebnis. Fehlt der Original-Verkauf bei einer noch älteren Put-Andienung, wird nur dann ein separater Prüffall angezeigt, wenn das daraus entstandene Aktien-Lot tatsächlich im Steuerjahr veräußert wurde.
 
-**Cross-Year Put-Korrektur:** Wenn Aktien aus Put-Assignments früherer Jahre im Steuerjahr verkauft werden, wird IBKR's PnL korrigiert. Die Prämie war bereits im Assignment-Jahr versteuert und darf die Anschaffungskosten nicht mindern. Das Matching läuft über FIFO-Lots; Schreibweisen desselben Basiswerts (Handelsplatz-Suffix, Ticker-Wechsel im Jahresverlauf) werden dabei über die Kontraktnummer oder ISIN zusammengeführt.
+**Cross-Year Put-Korrektur:** Wenn Aktien aus Put-Assignments früherer Jahre im Steuerjahr verkauft werden, wird IBKR's PnL korrigiert. Die Prämie war bereits im Assignment-Jahr versteuert und darf die Anschaffungskosten nicht mindern. Das Matching läuft über FIFO-Lots; Schreibweisen desselben Basiswerts (Handelsplatz-Suffix, Ticker-Wechsel im Jahresverlauf) werden dabei über die Kontraktnummer oder ISIN zusammengeführt. Die Korrektur geht vorrangig an den Verkauf, an dessen Tag IBKR das Lot aus der Andienung geschlossen hat, und nur für Reste ohne passendes Schlussdatum nach FIFO an weitere Verkäufe.
+
+**Aktiensplit zwischen Andienung und Verkauf:** Nach einem Split führt IBKR das Aktien-Lot in Stückzahlen nach dem Split weiter, die Andienung steht in Stückzahlen davor. Das Tool liest das Verhältnis aus der Sektion `<CorporateActions>` (Text „SPLIT x FOR y“, auch aus Vorjahres-XMLs; aufeinanderfolgende Splits werden verkettet) und rechnet die Prämienkorrektur auf die Stückzahl der Verkaufszeile um, sodass die Prämie genau einmal aus dem Aktienergebnis herausgerechnet wird. Ist das Verhältnis nicht belegt, widersprechen die gemeldeten Mengen dem Verhältnis oder lassen sich alte und neue Wertpapiernummer nicht verbinden, wird nichts korrigiert, sondern ein Prüffall gemeldet. Ein Prüffall entsteht auch, wenn ein zeitlich passendes Aktien-Lot einer Put-Andienung eine Kostenbasis deutlich über dem Strike hat (etwa Reverse Split ohne Kapitalmaßnahmen-Daten oder Zukauf am selben Tag). Fehlt die Sektion `<CorporateActions>` im Export, erscheint bei Aktien-Andienungen ein Hinweis, die Flex Query um diese Sektion zu ergänzen.
 
 ---
 
@@ -4533,9 +4582,13 @@ Vorabpauschalen ausdrücklich noch nicht final.
 **Tageskurs-Korrektur (wenn aktiviert):**
 
 ```
-Korrektur = Σ Anschaffungskosten × (FX_Verkauf − FX_Kauf) pro CLOSED_LOT
+Korrektur = Σ pro CLOSED_LOT:
+              Anschaffungskosten × (FX_Verkauf − FX_Kauf)
+            + Ergebnis × (FX_Verkauf − FX_Buchung)    (nur EUR-Basiskonten)
 Anschaffungskosten vorzeichenbehaftet (Long positiv, Short negativ);
-jede Fremdwährung mit eigener Tageskursreihe, Stichtag = Handelstag.
+FX_Buchung = IBKR-Kurs des Buchungstags; weicht nur ab, wenn IBKR nach dem
+Handelstag bucht (Verfall/Andienung am Freitag, Buchung am Montag).
+Jede Fremdwährung mit eigener Tageskursreihe, Stichtag = Handelstag.
 Futures, CFDs und angediente Optionen ausgeschlossen.
 Wird auf Topf 1, Topf 2 und KAP-INV aufgeteilt. In die KAP-INV-Formularzeile
 fließt das rohe Delta; das teilfreigestellte Delta dient nur der Kontrollrechnung.
@@ -5005,6 +5058,32 @@ def _build_text_report():
                 f"  Future-Ergebnis bereinigt: {fmt_de(-future_correction_eur):>10} EUR "
                 f"({len(future_assignment_corrections)} Korrektur(en); die Prämie war in der "
                 "Future-Kostenbasis eingebettet, Andienungsgebühren bleiben Anschaffungsnebenkosten)\n")
+    # Splits und Prüffälle betreffen auch Vorjahres-Andienungen, die
+    # stillhalter_count nicht zählt; der Block erscheint deshalb auch ohne
+    # Andienung im Steuerjahr.
+    sh_dropped = audit.get('stillhalter_corrections_dropped', []) or []
+    if (split_adjustments or sh_dropped) and not sh_export:
+        sh_export = f"\nSTILLHALTERPRÄMIEN (BMF Rn. 25-35)\n"
+    for item in split_adjustments:
+        sh_export += (
+            f"  Aktiensplit: {item.get('symbol') or item.get('underlying')} "
+            f"Andienung {item.get('assignment_date')}, {item.get('splits')}: "
+            f"{float(item.get('assignment_shares') or 0):g} Stück der Andienung = "
+            f"{float(item.get('lot_shares') or 0):g} Stück im Lot, Korrektur "
+            f"{fmt_de(float(item.get('correction_raw') or 0))} "
+            f"{item.get('currency') or ''}\n")
+    if sh_dropped:
+        sh_export += (
+            f"  PRÜFFALL: {len(sh_dropped)} Stillhalter-Korrektur(en) nicht "
+            "zuordenbar; nichts korrigiert, die Prämie kann im Ergebnis des "
+            "Basiswerts doppelt enthalten sein:\n")
+        for item in sh_dropped:
+            sh_export += (
+                f"    {item.get('underlying', '')} "
+                f"{str(item.get('assignment_date', '') or '')[:10]} "
+                f"{float(item.get('leftover_shares') or 0):g} Stück, "
+                f"{fmt_de(float(item.get('leftover_raw') or 0))} roh: "
+                f"{calculate_tax_report.get_stillhalter_review_reason_label(item.get('reason'))}\n")
 
     ttax_export = ""
     ttax_details = (audit.get('transaction_tax', {}) or {}).get('details', []) or []
@@ -5279,6 +5358,11 @@ def _build_export_trade_details():
             note = (f'Tageskurs-Korrektur (Kauf {open_dt}, Verkauf '
                     f'{sale_dt}, Kurs {lot["fx_open"]:.6g} → '
                     f'{lot["fx_close"]:.6g})')
+            booking_delta = lot.get('booking_rate_delta_eur') or 0
+            if abs(booking_delta) >= 0.005 and lot.get('fx_booked'):
+                note += (f' · IBKR-Buchungskurs {lot["fx_booked"]:.6g}, '
+                         f'Anteil Ergebnis auf Handelstag-Kurs '
+                         f'{fmt_de(booking_delta)} EUR')
             if lot.get('invstg_basis_adjustment_raw', 0) > 0:
                 note += (' · KAP-INV-AK inkl. zusätzlicher ausländischer '
                          'Basisreduktion (z. B. ROC) auf Put-Strike '

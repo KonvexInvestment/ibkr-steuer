@@ -17,7 +17,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from calculate_tax_report import calculate_tax  # noqa: E402
-from ui_model import build_final_values, collect_notices  # noqa: E402
+from ui_model import build_final_values, collect_notices, default_toggles  # noqa: E402
 
 
 def _write_csv(path, rows):
@@ -105,12 +105,15 @@ def _closed_lot(conid, symbol, open_date, close_date, quantity, pnl,
     }
 
 
-def _run(trades, funds, lots=None, tax_year=2025):
+def _run(trades, funds, lots=None, tax_year=2025, conversion_rates=None):
     with tempfile.TemporaryDirectory() as tmp:
         _write_csv(os.path.join(tmp, "trades.csv"), trades)
         _write_csv(os.path.join(tmp, "statement_of_funds.csv"), funds)
         if lots:
             _write_csv(os.path.join(tmp, "closed_lots.csv"), lots)
+        if conversion_rates:
+            _write_csv(os.path.join(tmp, "conversion_rates.csv"),
+                       conversion_rates)
         _write_csv(os.path.join(tmp, "account_info.csv"), [{
             "currency": "EUR",
             "tax_year": str(tax_year),
@@ -718,6 +721,210 @@ def test_open_position_and_unrelated_closes_remain_deferred():
     print('  OK  Offene Position sowie fruehere/spaetere/fremde Schliessungen')
 
 
+def test_tageskurs_gross_split_starts_from_result_after_tax():
+    """Codex-Befund: Die Bruttozuordnung der Tageskurs-Korrektur muss vom
+    Ergebnis NACH Transaktionssteuer ausgehen. USD-Aktie: IBKR-Gewinn
+    100 USD x 0,96 = 96 EUR, Verkaufs-TTAX 100 EUR -> vor Tageskurs -4 EUR
+    Verlust. Tageskurs 1.000 USD x (0,96 - 0,95) = +10 EUR kippt den Verlust
+    in 6 EUR Gewinn: Zeile 20 = 6, Zeile 23 = 0. Ohne TTAX in der Ausgangs-
+    basis landeten die 10 EUR voll im Gewinn (Zeile 20 = 10, Zeile 23 = 4)."""
+    conid, symbol = 'U1', 'USDSTK'
+    buy = _trade('BUY', conid, symbol, '2025-01-02', 'BUY', 'O', 0, 10,
+                 category='STK')
+    sell = _trade('SELL', conid, symbol, '2025-03-03', 'SELL', 'C', 100, -10,
+                  category='STK')
+    for row, rate in ((buy, '0.95'), (sell, '0.96')):
+        row.update(currency='USD', fxRateToBase=rate)
+    buy.update(cost='1000', proceeds='-1000')
+    sell.update(cost='-1000', proceeds='1100')
+    lot = _closed_lot(conid, symbol, '2025-01-02', '2025-03-03', 10, 100,
+                      category='STK')
+    lot.update(currency='USD', cost='1000', fxRateToBase='0.96',
+               transactionID=buy['transactionID'])
+    rates = [dict(reportDate=day, fromCurrency='USD', toCurrency='EUR',
+                  rate=rate)
+             for day, rate in (('2025-01-02', '0.95'), ('2025-03-03', '0.96'))]
+    funds = [_ttax('SELL', conid, symbol, '2025-03-03', -100, category='STK')]
+
+    report = _run([buy, sell], funds, [lot], conversion_rates=rates)
+
+    audit = report['audit']['transaction_tax']
+    assert audit['applied_count'] == 1 and audit['unmatched_count'] == 0, audit
+    _assert_close(report['fx_correction_total'], 10, 'Tageskurs-Korrektur')
+    _assert_close(report['stocks_loss_eur'], -4, 'Topf 1 vor Tageskurs')
+    _assert_close(report['fx_corr_gain_adj']['Topf1'], 6, 'Gewinnkorrektur')
+    _assert_close(report['fx_corr_loss_adj']['Topf1'], 4, 'Verlustkorrektur')
+    final = build_final_values(report, default_toggles())
+    _assert_close(final['zeile_20'], 6, 'Zeile 20')
+    _assert_close(final['zeile_23'], 0, 'Zeile 23')
+    print('  OK  Tageskurs-Bruttozuordnung geht vom Ergebnis nach TTAX aus')
+
+
+def test_tageskurs_ttax_allocation_ignores_lot_order():
+    """Codex-Befund: Zwei USD-Lots derselben conid, je 1.000 USD Kosten zu
+    0,95, Schlusskurs 0,96. Verkauf 10 Uhr: 10 USD Gewinn; Verkauf 11 Uhr:
+    1 USD Gewinn und 4 EUR Kaufsteuer. Richtig: Lot 10 Uhr 9,60 + 10 =
+    19,60, Lot 11 Uhr 0,96 - 4 + 10 = 6,96 -> Zeile 20 = 26,56, Zeile 23 = 0.
+    Zog das 10-Uhr-Lot die Steuer des 11-Uhr-Lots über den Tagesfallback,
+    blieb der Verlust von 3,04 stehen (Zeile 20 = 29,60, Zeile 23 = 3,04)."""
+    conid, symbol = 'U2', 'USDTWO'
+    buy_a = _stk_fill('BA', conid, symbol, '2025-01-02', '10:00:00', 'BUY',
+                      'O', 0, 10, 100)
+    buy_b = _stk_fill('BB', conid, symbol, '2025-01-03', '10:00:00', 'BUY',
+                      'O', 0, 10, 100)
+    sell_a = _stk_fill('SA', conid, symbol, '2025-03-03', '10:00:00', 'SELL',
+                       'C', 10, -10, 101)
+    sell_b = _stk_fill('SB', conid, symbol, '2025-03-03', '11:00:00', 'SELL',
+                       'C', 1, -10, 100.1)
+    for row, rate in ((buy_a, '0.95'), (buy_b, '0.95'), (sell_a, '0.96'),
+                      (sell_b, '0.96')):
+        row.update(currency='USD', fxRateToBase=rate,
+                   cost='1000' if row['buySell'] == 'BUY' else '-1000')
+    lot_a = _stk_lot(conid, symbol, '2025-01-02', '10:00:00', '2025-03-03',
+                     '10:00:00', 10, 10, buy_a)
+    lot_b = _stk_lot(conid, symbol, '2025-01-03', '10:00:00', '2025-03-03',
+                     '11:00:00', 10, 1, buy_b)
+    for lot in (lot_a, lot_b):
+        lot.update(currency='USD', cost='1000', fxRateToBase='0.96')
+    rates = [dict(reportDate=day, fromCurrency='USD', toCurrency='EUR',
+                  rate=rate)
+             for day, rate in (('2025-01-02', '0.95'), ('2025-01-03', '0.95'),
+                               ('2025-03-03', '0.96'))]
+    funds = [_ttax('BB', conid, symbol, '2025-01-03', -4, category='STK')]
+
+    for order in ((lot_a, lot_b), (lot_b, lot_a)):
+        report = _run([buy_a, buy_b, sell_a, sell_b], funds,
+                      [dict(lot) for lot in order], conversion_rates=rates)
+        audit = report['audit']['transaction_tax']
+        assert audit['applied_count'] == 1 and \
+            audit['unmatched_count'] == 0, audit
+        _assert_close(report['fx_correction_total'], 20, 'Tageskurs')
+        _assert_close(report['fx_corr_gain_adj']['Topf1'], 16.96,
+                      'Gewinnkorrektur')
+        _assert_close(report['fx_corr_loss_adj']['Topf1'], 3.04,
+                      'Verlustkorrektur')
+        final = build_final_values(report, default_toggles())
+        _assert_close(final['zeile_20'], 26.56, 'Zeile 20')
+        _assert_close(final['zeile_23'], 0, 'Zeile 23')
+    print('  OK  Tageskurs-Bruttozuordnung der TTAX unabhängig von der '
+          'Lot-Reihenfolge')
+
+
+def test_tageskurs_gross_split_follows_the_closing_trade():
+    """Codex-Befund (Runde 4): Ein Verkauf schließt zwei USD-Lots mit je 10
+    Aktien, Kosten 1.000 / 991 USD, Ergebnis 1 / 10 USD, Kaufkurse 0,95 /
+    0,96, Verkaufskurs 0,96; nur der erste Kauf trägt 3 EUR Kaufsteuer. Im
+    Pool steht der Verkauf als ein Gewinn von 11 × 0,96 − 3 = 7,56 EUR; das
+    Tageskurs-Delta von 10 EUR gehört vollständig zum Gewinn (Zeile 20 =
+    17,56, Zeile 23 = 0). Die Zuordnung je Lot sah beim ersten Lot einen
+    Verlust von 2,04 EUR und schob ihn in einen leeren Verlustpool."""
+    conid, symbol = 'U3', 'USDTHREE'
+    buy_a = _stk_fill('CA', conid, symbol, '2025-01-02', '10:00:00', 'BUY',
+                      'O', 0, 10, 100)
+    buy_b = _stk_fill('CB', conid, symbol, '2025-01-03', '10:00:00', 'BUY',
+                      'O', 0, 10, 99.1)
+    sell = _stk_fill('CS', conid, symbol, '2025-03-03', '10:00:00', 'SELL',
+                     'C', 11, -20, 100.1)
+    buy_a.update(currency='USD', fxRateToBase='0.95', cost='1000')
+    buy_b.update(currency='USD', fxRateToBase='0.96', cost='991')
+    sell.update(currency='USD', fxRateToBase='0.96', cost='-1991')
+    lot_a = _stk_lot(conid, symbol, '2025-01-02', '10:00:00', '2025-03-03',
+                     '10:00:00', 10, 1, buy_a)
+    lot_b = _stk_lot(conid, symbol, '2025-01-03', '10:00:00', '2025-03-03',
+                     '10:00:00', 10, 10, buy_b)
+    lot_a.update(currency='USD', cost='1000', fxRateToBase='0.96')
+    lot_b.update(currency='USD', cost='991', fxRateToBase='0.96')
+    rates = [dict(reportDate=day, fromCurrency='USD', toCurrency='EUR',
+                  rate=rate)
+             for day, rate in (('2025-01-02', '0.95'), ('2025-01-03', '0.96'),
+                               ('2025-03-03', '0.96'))]
+    funds = [_ttax('CA', conid, symbol, '2025-01-02', -3, category='STK')]
+
+    for order in ((lot_a, lot_b), (lot_b, lot_a)):
+        report = _run([buy_a, buy_b, sell], funds,
+                      [dict(lot) for lot in order], conversion_rates=rates)
+        audit = report['audit']['transaction_tax']
+        assert audit['applied_count'] == 1 and \
+            audit['unmatched_count'] == 0, audit
+        _assert_close(report['fx_correction_total'], 10, 'Tageskurs')
+        _assert_close(report['fx_corr_gain_adj']['Topf1'], 10,
+                      'Gewinnkorrektur')
+        _assert_close(report['fx_corr_loss_adj']['Topf1'], 0,
+                      'Verlustkorrektur')
+        final = build_final_values(report, default_toggles())
+        _assert_close(final['zeile_19'], 17.56, 'Zeile 19')
+        _assert_close(final['zeile_20'], 17.56, 'Zeile 20')
+        _assert_close(final['zeile_23'], 0, 'Zeile 23')
+    print('  OK  Tageskurs-Bruttozuordnung folgt dem schließenden Trade, '
+          'nicht dem einzelnen Lot')
+
+
+def test_unlinked_lots_with_tax_are_a_review_case():
+    """Codex-Befund (Runde 7): Zwei Verkäufe derselben Aktie in derselben
+    Sekunde, je 10 Stück zu 100,10 USD, Schlusskurs 1. Lot A: Kosten 991
+    USD zu 1,00, Gewinn 10 EUR, Tageskurs 0. Lot B: Kosten 1.000 USD zu
+    0,99, Gewinn 1 EUR, Tageskurs +10 EUR; nur Verkauf B trägt 4 EUR TTAX
+    (relatedTradeID). Pools: +10 und -3 EUR. Mit Ausführungs-ID: Zeile
+    19/20/22/23 = 17/17/0/0. Ohne ID zog Lot A die Steuer, beide Lots
+    blieben Gewinn, der Prüfhinweis fehlte, Zeile 20/23 = 20/3. Ohne ID
+    lässt sich die Zuordnung nicht belegen: Prüffall in jeder Reihenfolge."""
+    conid, symbol = 'U4', 'USDFOUR'
+    buy_a = _stk_fill('DA', conid, symbol, '2025-01-02', '10:00:00', 'BUY',
+                      'O', 0, 10, 99.1)
+    buy_b = _stk_fill('DB', conid, symbol, '2025-01-03', '10:00:00', 'BUY',
+                      'O', 0, 10, 100)
+    sell_a = _stk_fill('SA4', conid, symbol, '2025-03-03', '10:00:00', 'SELL',
+                       'C', 10, -10, 100.1)
+    sell_b = _stk_fill('SB4', conid, symbol, '2025-03-03', '10:00:00', 'SELL',
+                       'C', 1, -10, 100.1)
+    for row, rate, cost in ((buy_a, '1', '991'), (buy_b, '0.99', '1000'),
+                            (sell_a, '1', '-991'), (sell_b, '1', '-1000')):
+        row.update(currency='USD', fxRateToBase=rate, cost=cost)
+    lot_a = _stk_lot(conid, symbol, '2025-01-02', '10:00:00', '2025-03-03',
+                     '10:00:00', 10, 10, buy_a)
+    lot_b = _stk_lot(conid, symbol, '2025-01-03', '10:00:00', '2025-03-03',
+                     '10:00:00', 10, 1, buy_b)
+    lot_a.update(currency='USD', cost='991', fxRateToBase='1')
+    lot_b.update(currency='USD', cost='1000', fxRateToBase='1')
+    rates = [dict(reportDate=day, fromCurrency='USD', toCurrency='EUR',
+                  rate=rate)
+             for day, rate in (('2025-01-02', '1'), ('2025-01-03', '0.99'),
+                               ('2025-03-03', '1'))]
+    tax = _ttax('SB4', conid, symbol, '2025-03-03', -4, category='STK')
+    tax['relatedTradeID'] = sell_b['tradeID']
+
+    for linked in (True, False):
+        for lots in ((lot_a, lot_b), (lot_b, lot_a)):
+            for sells in ((sell_a, sell_b), (sell_b, sell_a)):
+                rows = [dict(lot) for lot in lots]
+                for row in rows:
+                    closing = (sell_a if row['openDateTime'].startswith(
+                        '2025-01-02') else sell_b)
+                    if linked:
+                        row['closingTransactionID'] = closing['transactionID']
+                report = _run([buy_a, buy_b] + list(sells), [tax], rows,
+                              conversion_rates=rates)
+                audit = report['audit']['transaction_tax']
+                assert audit['applied_count'] == 1 and \
+                    audit['unmatched_count'] == 0, audit
+                _assert_close(report['fx_correction_total'], 10, 'Tageskurs')
+                final = build_final_values(report, default_toggles())
+                _assert_close(final['zeile_19'], 17, 'Zeile 19')
+                unlinked = report['audit']['closed_lot_coverage'][
+                    'lots_without_closing_execution']
+                notices = {notice['id'] for notice in collect_notices(report)}
+                if linked:
+                    _assert_close(final['zeile_20'], 17, 'Zeile 20')
+                    _assert_close(final['zeile_22'], 0, 'Zeile 22')
+                    _assert_close(final['zeile_23'], 0, 'Zeile 23')
+                    assert unlinked == 0, unlinked
+                    assert 'closing_execution_unlinked' not in notices
+                else:
+                    assert unlinked == 2, unlinked
+                    assert 'closing_execution_unlinked' in notices, notices
+    print('  OK  Lots ohne Ausführungs-ID mit TTAX bleiben Prüffall')
+
+
 if __name__ == "__main__":
     test_real_option_pattern_applies_open_and_close_tax()
     test_compact_dates_preserve_closed_lot_and_tax_matching()
@@ -739,4 +946,8 @@ if __name__ == "__main__":
     test_described_quantity_identifies_single_fill_among_same_day_trades()
     test_trade_quantity_field_is_primary_quantity_source()
     test_net_daily_aggregate_after_intraday_sales()
+    test_tageskurs_gross_split_starts_from_result_after_tax()
+    test_tageskurs_ttax_allocation_ignores_lot_order()
+    test_tageskurs_gross_split_follows_the_closing_trade()
+    test_unlinked_lots_with_tax_are_a_review_case()
     print("Alle TTAX-Tests bestanden.")
