@@ -170,11 +170,10 @@ def test_repeated_transaction_id_keeps_every_ledger_row():
     """IBKR vergibt dieselbe transactionID fuer Folgebuchungen derselben Position.
 
     Realfall: alle taeglichen MTM-Abrechnungen eines Futures teilen sich eine ID
-    (audit1_2024.xml, tid 654722380 = 40+ Zeilen "M6E 18MAR24 Position MTM"), und
-    auch am selben Tag kollidieren fachlich verschiedene Buchungen. Ein Dedupe ueber
-    die ID allein loeschte diese Zeilen: audit1 verlor netto -2.004,15 USD, audit2
-    -39.693,75 USD, wodurch der kumulierte Saldo und die FIFO-Naeherung (Option C)
-    verfaelscht wurden. Nur bitidentische Zeilen sind echte Duplikate.
+    (40+ Zeilen "... Position MTM"), und auch am selben Tag kollidieren fachlich
+    verschiedene Buchungen. Ein Dedupe ueber die ID allein loeschte diese Zeilen,
+    wodurch der kumulierte Saldo und die FIFO-Naeherung (Option C) verfaelscht
+    wurden. Nur bitidentische Zeilen sind echte Duplikate.
     """
     with tempfile.TemporaryDirectory() as tmp:
         history = write_xml(tmp, "history_2024.xml", "2024-01-01", "2024-12-31", """

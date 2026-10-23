@@ -4212,7 +4212,8 @@ def _transaction_tax_open_lots(open_trade, closed_lots, trade_tx_ids=None):
     Basis ist der Eroeffnungszeitstempel plus conid/Symbol. Liegen mehrere
     Eroeffnungen in derselben Sekunde (Teilausfuehrungen), entscheidet die
     ``transactionID`` des Lots, die bei IBKR auf die eroeffnende Transaktion
-    zeigt (Realbeleg U770: Lot 73 → BUY 73, Lots 27+70 → BUY 97): Ein Lot,
+    zeigt (Realbeleg: bei zwei Kauf-Fills derselben Sekunde verweist jedes
+    Lot auf seinen eigenen Fill): Ein Lot,
     dessen ID zu einem ANDEREN bekannten Trade gehoert, wird ausgeschlossen.
     Lots ohne bekannte ID bleiben beim Zeitstempel-Match (aeltere Exporte,
     synthetische Fixtures). ``trade_tx_ids`` ist die Menge aller
@@ -4272,8 +4273,8 @@ def _transaction_tax_lot_close_candidates(lot, trades):
 def _transaction_tax_split_close_targets(candidates):
     """Schluss-Trade(s) eines Lots als Liste ``(trade, anteil)``.
 
-    Mehrere Schluss-Fills zur selben Sekunde (Realbeleg U770: SELL 100 und
-    SELL 70 um 10:00:13) werden mengenproportional aufgeteilt. Das ist
+    Mehrere Schluss-Fills zur selben Sekunde (Realbeleg: zwei Verkaufs-Fills
+    derselben Sekunde) werden mengenproportional aufgeteilt. Das ist
     steuerneutral: gleiches Instrument, gleicher Tag, gleiche Richtung, also
     gleicher Topf und gleiches Jahr; nur die Zeilenzuordnung in den
     Trade-Details ist naeherungsweise. Returns None bei unsicherer
@@ -4309,10 +4310,11 @@ def _transaction_tax_described_quantity(row):
     """Stueckzahl einer TTAX-Tagesbuchung.
 
     Primaer das Feld ``tradeQuantity`` der StmtFunds-Zeile (Realbelege:
-    "French Daily Trade Charge Tax HO 170" traegt tradeQuantity="170",
-    "… EL 25" traegt 25, die italienische Derivatesteuer 0). Fallback ist
-    die Zahl am Ende des Buchungstexts. None, wenn beides fehlt oder 0 ist
-    ("Italian Derivative Transaction Tax ENI DEC25 14 C -").
+    "French Daily Trade Charge Tax <Symbol> <Stueckzahl>" traegt die
+    Stueckzahl auch im Feld, z.B. "… EL 25" tradeQuantity="25"; die
+    italienische Derivatesteuer traegt 0). Fallback ist die Zahl am Ende des
+    Buchungstexts. None, wenn beides fehlt oder 0 ist (italienische
+    Derivatesteuer auf Optionen, Text endet auf " -").
     """
     field_value = abs(safe_float(row.get('tradeQuantity'), 0.0))
     if field_value > 1e-9:
@@ -7415,7 +7417,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     #
     # Quelle ist IBKRs eigene `balance`-Spalte (Saldo NACH der Buchung), nicht mehr
     # eine Kumulation über `amount`: Bei gemergten Mehrjahres-Exporten driftet eine
-    # Eigenkumulation weg (audit2: 40.520 statt 826,73 USD am Jahresende), wodurch
+    # Eigenkumulation weg (in einem echten Export um ein Vielfaches des gemeldeten
+    # Endsaldos), wodurch
     # echte Margin-Phasen unsichtbar blieben. Zeilen ohne `balance` (synthetische
     # Fixtures) fallen auf die Kumulation zurück.
     fx_tx_path = os.path.join(ib_tax_dir, 'fx_transactions.csv')

@@ -32,13 +32,14 @@ SCENARIOS = {
             "--history", "test_data/audit2_2021.xml",
         ],
     },
-    # Issue #89: echte franzoesische Finanztransaktionssteuer als Tagesaggregat
-    # ueber zwei Kauf-Fills (HO 170 = 73 + 97), Verkauf am Folgetag in zwei
-    # Fills derselben Sekunde mit vollstaendigen CLOSED_LOTs.
-    "u770_2024": {
-        "source": "test_data/u770_2024.xml",
+    # Echte franzoesische Finanztransaktionssteuer als Tagesaggregat ueber
+    # zwei Kauf-Fills derselben Sekunde, Verkauf am Folgetag in zwei Fills
+    # derselben Sekunde mit vollstaendigen CLOSED_LOTs (Issue #89).
+    "ftt_tagesaggregat_2024": {
+        "source": "test_data/ftt_tagesaggregat_2024.xml",
         "extract": [
-            "extract_ibkr_data.py", "test_data/u770_2024.xml", "{out}",
+            "extract_ibkr_data.py", "test_data/ftt_tagesaggregat_2024.xml",
+            "{out}",
         ],
     },
 }
