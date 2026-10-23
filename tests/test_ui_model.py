@@ -739,6 +739,33 @@ def test_closed_lots_missing_notice_survives_multi_account_merge():
         n['id'] for n in ui_model.collect_notices(legacy)}
 
 
+def test_closed_lots_missing_is_critical_with_put_assignments():
+    """Ohne Lots bleibt die Put-Praemie im Veraeusserungsergebnis und zaehlt
+    zusaetzlich als Stillhalterpraemie (echter Export ohne Lots: KAP-INV
+    etwa dreimal so hoch). Mit Put-Andienungen ist der Hinweis
+    deshalb kritisch und nennt den betroffenen Praemienbetrag."""
+    coverage = {'lot_rows': 0, 'closing_trades': 5,
+                'closing_trades_without_lots': 5}
+    with_puts = make_report(audit={
+        'closed_lot_coverage': coverage,
+        'stillhalter_details': [{'putCall': 'P'}, {'putCall': 'C'}],
+        'put_nosell_premium_eur': 1234.5,
+    })
+    notice = {n['id']: n for n in
+              ui_model.collect_notices(with_puts)}['closed_lots_missing']
+    assert notice['severity'] == 'kritisch'
+    assert '1 Put-Andienung' in notice['body']
+    assert '1,234.50 EUR' in notice['body']
+    calls_only = make_report(audit={
+        'closed_lot_coverage': coverage,
+        'stillhalter_details': [{'putCall': 'C'}],
+    })
+    notice = {n['id']: n for n in
+              ui_model.collect_notices(calls_only)}['closed_lots_missing']
+    assert notice['severity'] == 'normal'
+    assert 'Put-Andienung' not in notice['body']
+
+
 if __name__ == '__main__':
     failures = 0
     for name, fn in sorted(globals().items()):

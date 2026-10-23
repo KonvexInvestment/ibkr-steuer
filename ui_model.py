@@ -837,15 +837,41 @@ def collect_notices(report, context=None):
             if not lot_coverage.get('lot_rows') else 0
         )
     if closing_without_lots:
-        notices.append(_notice(
-            'closed_lots_missing', 'prueffall', 'normal',
-            'Keine CLOSED_LOT-Daten im Export',
+        # Put-Andienungen werden ueber CLOSED_LOTs den Aktienverkaeufen
+        # zugeordnet. Ohne Lots bleibt die Praemie im Veraeusserungsergebnis
+        # stecken und zaehlt zusaetzlich als Stillhalterpraemie (in einem
+        # echten Export ohne Lots war KAP-INV dadurch rund dreimal so hoch).
+        put_assignments = [
+            d for d in audit.get('stillhalter_details', []) or []
+            if d.get('putCall') == 'P'
+        ]
+        body = (
             f"{closing_without_lots} schließende Trade(s) im Steuerjahr "
-            "stammen aus einem Export ohne CLOSED_LOT-Zeilen. Ohne sie entfallen "
-            "die Tageskurs-Korrektur, die Zuordnung von "
+            "stammen aus einem Export ohne CLOSED_LOT-Zeilen. Ohne sie "
+            "entfallen die Tageskurs-Korrektur, die Zuordnung von "
             "Kauf-Transaktionssteuern (TTAX) und die Haltefrist-Prüfung für "
-            "Anlage SO. Lösung: in der Flex Query unter Trades bei Levels of "
-            "Detail zusätzlich Closed Lots aktivieren und neu exportieren.",
+            "Anlage SO."
+        )
+        if put_assignments:
+            put_nosell = float(audit.get('put_nosell_premium_eur') or 0)
+            body += (
+                f" Außerdem lassen sich die {len(put_assignments)} "
+                "Put-Andienung(en) nicht den späteren Aktien- oder "
+                "Fondsverkäufen zuordnen: Die Prämie bleibt im "
+                "Veräußerungsergebnis enthalten und wird zusätzlich als "
+                "Stillhalterprämie versteuert. Betroffen sind bis zu "
+                f"{put_nosell:,.2f} EUR Prämie; Zeilen 19 bis 23 "
+                "und KAP-INV sind nicht belastbar."
+            )
+        body += (
+            " Lösung: in der Flex Query unter Trades bei Levels of Detail "
+            "zusätzlich Closed Lots aktivieren und neu exportieren."
+        )
+        notices.append(_notice(
+            'closed_lots_missing', 'prueffall',
+            'kritisch' if put_assignments else 'normal',
+            'Keine CLOSED_LOT-Daten im Export',
+            body,
             'prueffaelle', closing_without_lots,
             [dict(lot_coverage)],
         ))
