@@ -1505,26 +1505,27 @@ def _get_open_option_sells(trades, a_cat, strike, expiry, pc, assignment_qty_for
     2024-12-20). `alias_map` erlaubt dabei conid-/ISIN-belegte Tickerwechsel,
     ohne auf unsicheres String-Raten zurueckzufallen.
     """
+    # Nur eröffnende Verkäufe (openCloseIndicator): ein Long-Verkauf derselben
+    # Serie trägt keine Prämie; bei C;O zählt nur der eröffnende Anteil.
     all_sells = sorted(
         [t for t in trades
          if t.get('assetCategory') == a_cat
-         and t.get('transactionType') == 'ExchTrade'
          and t.get('strike') == strike
          and t.get('expiry') == expiry
          and t.get('putCall') == pc
-         and t.get('buySell') == 'SELL'
+         and _option_is_sell_open(t)
          and (underlying is None
               or _symbols_equivalent(
                   t.get('underlyingSymbol', ''), underlying, alias_map))],
         key=lambda t: t.get('dateTime', '') or t.get('tradeDate', '')
     )
-    total_sell_qty = sum(abs(int(safe_float(t.get('quantity')))) for t in all_sells)
+    total_sell_qty = sum(int(round(_option_sell_open_quantity(t))) for t in all_sells)
     close_qty = max(0, total_sell_qty - assignment_qty_for_series)
 
     remaining_close = close_qty
     open_sells = []
     for s in all_sells:
-        s_qty = abs(int(safe_float(s.get('quantity'))))
+        s_qty = int(round(_option_sell_open_quantity(s)))
         if remaining_close >= s_qty:
             remaining_close -= s_qty
             continue  # Fully consumed by close (buyback or expiry)
@@ -3298,11 +3299,210 @@ def _option_sort_key(t):
     return t.get('dateTime') or t.get('tradeDate') or t.get('reportDate') or ''
 
 
+def _open_close_parts(t):
+    """IBKRs openCloseIndicator als Menge: {'O'}, {'C'}, {'C', 'O'} oder leer."""
+    return {p.strip().upper()
+            for p in (t.get('openCloseIndicator') or '').split(';')} - {''}
+
+
+def _annotate_close_open_lot_quantities(trades, closed_lots):
+    """Hängt an C;O-Options-Ausführungen die Stückzahl ihrer CLOSED_LOTs.
+
+    Die Extraktion verknüpft jedes Lot mit seiner schließenden Ausführung
+    (closingTransactionID); die Lot-Summe ist IBKRs eigene Angabe, wie viele
+    Kontrakte die Ausführung geschlossen hat. Internes Feld
+    `_lot_closed_quantity`, gelesen von _close_open_closing_quantity.
+    """
+    closed_by_execution = defaultdict(float)
+    for lot in closed_lots:
+        execution = lot.get('closingTransactionID')
+        if execution:
+            closed_by_execution[execution] += abs(safe_float(lot.get('quantity')))
+    for t in trades:
+        execution = t.get('transactionID')
+        if (t.get('assetCategory') in ('OPT', 'FOP', 'FSFOP')
+                and _open_close_parts(t) == {'C', 'O'}
+                and execution in closed_by_execution):
+            t['_lot_closed_quantity'] = closed_by_execution[execution]
+
+
+def _close_open_closing_quantity(t):
+    """Schließender Anteil einer C;O-Ausführung in Kontrakten, sonst None.
+
+    Bei C;O schließt eine Ausführung die bestehende Position und eröffnet
+    den Rest in Gegenrichtung. Primärquelle sind die CLOSED_LOTs der
+    Ausführung (_annotate_close_open_lot_quantities). Ohne Lots (z.B.
+    Vorjahres-Trades aus --history): IBKR weist `cost` und
+    `fifoPnlRealized` nur für den schließenden Teil aus; dessen Nettobetrag
+    (Erlös bzw. Rückkaufkosten) geteilt durch den Nettobetrag je Kontrakt
+    ergibt die geschlossene Menge. Die Provision verteilt IBKR dabei nicht
+    immer genau anteilig (SVOL: 1,99914 statt 2), deshalb die Toleranz.
+    Nicht ganzzahlig oder nicht echt zwischen 0 und Menge → None.
+    """
+    qty = abs(safe_float(t.get('quantity')))
+    if qty <= 0:
+        return None
+    lot_closed = t.get('_lot_closed_quantity')
+    if lot_closed is not None:
+        closing = lot_closed
+    else:
+        price = abs(safe_float(t.get('tradePrice')))
+        mult = abs(safe_float(t.get('multiplier'), 0))
+        if price <= 0 or mult <= 0:
+            return None
+        commission_per_contract = safe_float(t.get('ibCommission'), 0) / qty
+        cost = safe_float(t.get('cost'))
+        pnl = safe_float(t.get('fifoPnlRealized'))
+        if t.get('buySell') == 'SELL':
+            # Long geschlossen: cost = −Anschaffungskosten des Long.
+            closed_value = -cost + pnl
+            per_contract = price * mult + commission_per_contract
+        else:
+            # Short geschlossen: cost = Nettoerlös des Short (bei Penny-
+            # Optionen mit hoher Provision auch negativ).
+            closed_value = cost - pnl
+            per_contract = price * mult - commission_per_contract
+        if per_contract <= 0:
+            return None
+        closing = closed_value / per_contract
+    rounded = round(closing)
+    if abs(closing - rounded) > 0.01 or not 0 < rounded < qty:
+        return None
+    return float(rounded)
+
+
+def _option_opening_closing_quantities(t):
+    """(eröffnende, schließende) Kontrakte einer Options-Ausführung.
+
+    Quelle ist IBKRs openCloseIndicator (O, C, C;O). Ein Rückkauf oder
+    Long-Verkauf zum Einstand (Ergebnis 0) ist nach dem Kennzeichen eine
+    Schließung, keine Eröffnung. Eine C;O-Ausführung ohne belegbare
+    Aufteilung zählt ganz als Schließung (Prüffall
+    `option_close_open_unresolved`). Nur ohne Kennzeichen gilt die frühere
+    Ergebnis-Regel: realisiertes Ergebnis = Schließung, sonst Eröffnung.
+    """
+    qty = abs(safe_float(t.get('quantity')))
+    parts = _open_close_parts(t)
+    if parts == {'O'}:
+        return qty, 0.0
+    if parts == {'C'}:
+        return 0.0, qty
+    if parts == {'C', 'O'}:
+        closing = _close_open_closing_quantity(t)
+        if closing is None:
+            return 0.0, qty
+        return qty - closing, closing
+    if abs(safe_float(t.get('fifoPnlRealized'))) >= 0.01:
+        return 0.0, qty
+    return qty, 0.0
+
+
+def _option_opens(t):
+    """Eröffnet die Ausführung (ganz oder teilweise)? Auch ohne Stückzahl."""
+    parts = _open_close_parts(t)
+    if parts == {'C', 'O'}:
+        return _close_open_closing_quantity(t) is not None
+    if parts:
+        return parts == {'O'}
+    return abs(safe_float(t.get('fifoPnlRealized'))) < 0.01
+
+
+def _option_is_sell_open(t):
+    """Börsen-Verkauf, der (ganz oder teilweise) einen Short eröffnet."""
+    return (t.get('transactionType') == 'ExchTrade' and t.get('buySell') == 'SELL'
+            and _option_opens(t))
+
+
+def _option_sell_open_quantity(t):
+    """Eröffnete Short-Kontrakte einer Börsen-Ausführung (0 = keine Eröffnung)."""
+    if not _option_is_sell_open(t):
+        return 0.0
+    return _option_opening_closing_quantities(t)[0]
+
+
+def _option_sell_open_basis(t, opening_qty):
+    """FIFO-Basis der eröffneten Short-Kontrakte (Betrag, ohne Vorzeichen).
+
+    Bei reinen Eröffnungen ist das IBKRs `cost`. Bei C;O beschreibt `cost`
+    den geschlossenen Teil; die Eröffnung trägt dann ihren Anteil am
+    Nettoerlös.
+    """
+    qty = abs(safe_float(t.get('quantity')))
+    if qty <= 0 or opening_qty >= qty:
+        return abs(safe_float(t.get('cost')))
+    proceeds = abs(safe_float(t.get('proceeds'))) or (
+        abs(safe_float(t.get('tradePrice')))
+        * abs(safe_float(t.get('multiplier'), 0)) * qty)
+    net_proceeds = proceeds + safe_float(t.get('ibCommission'), 0)
+    return max(0.0, net_proceeds) * opening_qty / qty
+
+
+def _option_is_exch_buy_close(t):
+    """Börsen-Kauf, der (ganz oder teilweise) einen Short schließt."""
+    if t.get('transactionType') != 'ExchTrade' or t.get('buySell') != 'BUY':
+        return False
+    parts = _open_close_parts(t)
+    if parts:
+        return 'C' in parts
+    return abs(safe_float(t.get('fifoPnlRealized'))) >= 0.01
+
+
+def _option_buy_close_quantity(t):
+    """Geschlossene Short-Kontrakte eines Kaufs (Rückkauf, Verfall, Andienung)."""
+    if t.get('buySell') != 'BUY':
+        return 0.0
+    if t.get('transactionType') == 'ExchTrade':
+        return _option_opening_closing_quantities(t)[1]
+    return abs(safe_float(t.get('quantity')))
+
+
+def _option_buy_close_is_realized(t):
+    """Schließung mit steuerwirksamem Ergebnis: Rückkauf oder Verfall.
+
+    Ein Börsen-Rückkauf zählt nach openCloseIndicator, auch mit Ergebnis 0.
+    BookTrades tragen für Verfall und Andienung beide 'C'; dort trennt das
+    Ergebnis (Andienung: IBKR verschiebt die Prämie in den Basiswert, 0).
+    """
+    if t.get('buySell') != 'BUY':
+        return False
+    if t.get('transactionType') == 'ExchTrade':
+        return _option_is_exch_buy_close(t)
+    return abs(safe_float(t.get('fifoPnlRealized'))) >= 0.01
+
+
+def _option_close_open_unresolved(trades, tax_year):
+    """C;O-Verkäufe bis Steuerjahresende ohne belegbare Aufteilung.
+
+    Sie zählen ganz als Schließung des Long; ein dabei eröffneter Short
+    fehlt dann im Zufluss (Prüffall). Ein C;O-Kauf ohne Aufteilung bleibt
+    folgenlos: er schließt alle offenen Shorts und eröffnet einen Long.
+    """
+    unresolved = []
+    for t in trades:
+        if (t.get('assetCategory') not in ('OPT', 'FOP', 'FSFOP')
+                or t.get('transactionType') != 'ExchTrade'
+                or t.get('buySell') != 'SELL'
+                or _open_close_parts(t) != {'C', 'O'}):
+            continue
+        rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
+        if not rd or rd.year > tax_year:
+            continue
+        if _close_open_closing_quantity(t) is None:
+            unresolved.append({
+                'symbol': t.get('symbol') or t.get('description') or '',
+                'date': str(rd),
+                'quantity': abs(safe_float(t.get('quantity'))),
+                'transactionID': t.get('transactionID', ''),
+            })
+    return unresolved
+
+
 def _collect_option_series_events(trades, tax_year):
     """Sammelt die Zufluss-FIFO-relevanten Options-Events pro Series-Key.
 
     Drei Event-Klassen bis einschliesslich Steuerjahresende: SELL-to-open
-    (ExchTrade SELL, PnL ≈ 0), ExchTrade-BUY-Close (PnL ≠ 0) und BookTrade-BUY
+    (ExchTrade SELL mit eröffnendem Anteil laut openCloseIndicator),
+    ExchTrade-BUY-Close (schließender Anteil) und BookTrade-BUY
     (Assignment ODER Verfall — die Unterscheidung trifft erst die FIFO-Loop
     anhand des PnL). Reine Funktion: liefert
     (series_events: dict key -> [rows in trades-Reihenfolge],
@@ -3317,12 +3517,10 @@ def _collect_option_series_events(trades, tax_year):
         if not rd or rd.year > tax_year:
             continue
         key = _option_key(t)
-        if (t.get('transactionType') == 'ExchTrade' and t.get('buySell') == 'SELL'
-                and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01):
+        if _option_is_sell_open(t):
             series_events[key].append(t)
             all_sell_open_keys.add(key)
-        elif ((t.get('transactionType') == 'ExchTrade' and t.get('buySell') == 'BUY'
-               and abs(safe_float(t.get('fifoPnlRealized'))) >= 0.01)
+        elif (_option_is_exch_buy_close(t)
               or (t.get('transactionType') == 'BookTrade' and t.get('buySell') == 'BUY')):
             series_events[key].append(t)
     return series_events, all_sell_open_keys
@@ -3331,10 +3529,10 @@ def _collect_option_series_events(trades, tax_year):
 def _detect_zufluss_unmatched(trades, tax_year, all_sell_open_keys):
     """Erkennt Glattstellungen ohne Eroeffnungs-SELL (fehlendes Vorjahres-XML).
 
-    Close-Definition identisch zu is_buy_close im Zufluss-FIFO: jeder BUY mit
-    realisierter PnL (ExchTrade-Buyback ODER BookTrade-Verfall); Assignments
-    (PnL ≈ 0) fallen durch den PnL-Filter. Familien-Check analog zum FIFO:
-    ein Close unter einer OCC-umbenannten Serie (MMM1) gilt als gematcht, wenn
+    Close-Definition identisch zu is_buy_close im Zufluss-FIFO
+    (_option_buy_close_is_realized): Börsen-Rückkauf laut openCloseIndicator
+    oder BookTrade-Verfall; Assignments (PnL ≈ 0) zählen nicht.
+    Familien-Check analog zum FIFO: ein Close unter einer OCC-umbenannten Serie (MMM1) gilt als gematcht, wenn
     die Original-Serie (MMM) einen Eroeffnungs-SELL hat. Ohne Vorjahres-XML
     bleibt die Praemie doppelt versteuert — deshalb die Warnung.
 
@@ -3350,16 +3548,13 @@ def _detect_zufluss_unmatched(trades, tax_year, all_sell_open_keys):
         rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
         if not rd or rd.year > tax_year:
             continue
-        if (t.get('transactionType') == 'ExchTrade' and t.get('buySell') == 'SELL'
-                and abs(safe_float(t.get('fifoPnlRealized'))) < 0.01):
+        if _option_is_sell_open(t):
             open_sells_by_identity[_option_match_identity(t)].append(t)
 
     for t in trades:
         if t.get('assetCategory') not in ('OPT', 'FOP', 'FSFOP'):
             continue
-        if t.get('buySell') != 'BUY':
-            continue
-        if abs(safe_float(t.get('fifoPnlRealized'))) < 0.01:
+        if not _option_buy_close_is_realized(t):
             continue  # Opening BUY oder Assignment, not a taxable close
         rd = parse_date(t.get('reportDate') or t.get('dateTime') or t.get('tradeDate'))
         if not rd or rd.year != tax_year:
@@ -3766,9 +3961,11 @@ def _run_zufluss_fifo(series_events, tax_year, on_prior_close, on_current_open,
     bisherige OCC-Familie mit Exact-Key-Prioritaet aktiv.
 
     Event-Klassifikation innerhalb der Loop:
-      - ExchTrade SELL, PnL ≈ 0  → neuer offener Lot
-      - BUY mit |PnL| ≥ 0.01     → steuerwirksame Schliessung (Buyback ODER
-        BookTrade-Verfall); konsumiert Vorjahres-Lots im Steuerjahr via
+      - ExchTrade SELL mit eröffnendem Anteil (openCloseIndicator O bzw.
+        der eröffnende Teil von C;O) → neuer offener Lot
+      - steuerwirksame Schliessung (_option_buy_close_is_realized: Buyback
+        laut openCloseIndicator, auch mit Ergebnis 0, ODER BookTrade-Verfall);
+        konsumiert Vorjahres-Lots im Steuerjahr via
         on_prior_close(key, sell_trade, qty)
       - BookTrade-BUY mit PnL ≈ 0 (Assignment) → konsumiert Lots OHNE
         on_prior_close (Cross-Year-Praemie erfasst
@@ -3799,11 +3996,10 @@ def _run_zufluss_fifo(series_events, tax_year, on_prior_close, on_current_open,
             ev_date = parse_date(ev.get('reportDate') or ev.get('dateTime') or ev.get('tradeDate'))
             if not ev_date:
                 continue
-            if (ev.get('transactionType') == 'ExchTrade' and ev.get('buySell') == 'SELL'
-                    and abs(safe_float(ev.get('fifoPnlRealized'))) < 0.01):
-                qty = abs(safe_float(ev.get('quantity')))
+            if ev.get('buySell') == 'SELL':
+                qty = _option_sell_open_quantity(ev)
                 if qty > 0:
-                    basis = abs(safe_float(ev.get('cost')))
+                    basis = _option_sell_open_basis(ev, qty)
                     open_lots.append({
                         'trade': ev,
                         'remaining': qty,
@@ -3814,11 +4010,10 @@ def _run_zufluss_fifo(series_events, tax_year, on_prior_close, on_current_open,
                     })
                 continue
 
-            close_qty = abs(safe_float(ev.get('quantity')))
+            close_qty = _option_buy_close_quantity(ev)
             if close_qty <= 0:
                 continue
-            is_buy_close = (ev.get('buySell') == 'BUY'
-                            and abs(safe_float(ev.get('fifoPnlRealized'))) >= 0.01)
+            is_buy_close = _option_buy_close_is_realized(ev)
             remaining_close = close_qty
             close_basis = abs(safe_float(ev.get('cost')))
             remaining_close_basis = close_basis
@@ -5618,6 +5813,8 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
     stock_split_index = _build_stock_split_index(
         load_csv(os.path.join(ib_tax_dir, 'corporate_actions.csv')))
     _annotate_lot_split_factors(_alias_closed_lots, stock_split_index)
+    # C;O-Options-Ausführungen: geschlossene Menge aus ihren Lots.
+    _annotate_close_open_lot_quantities(trades, _alias_closed_lots)
     # Transparenz: jede Andienungskorrektur, die über einen Split umgerechnet
     # wurde, und jede, die mangels belegtem Verhältnis zum Prüffall wurde.
     stock_split_adjustments = []
@@ -7055,6 +7252,15 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
         print(f"  (!) WARNUNG: {len(zufluss_unmatched)} Glattstellung(en) ohne Eröffnungs-SELL. "
               f"Die Option wurde in einem Vorjahr verkauft (Prämie kassiert). Ohne das Vorjahres-XML "
               f"kann die Zufluss-Korrektur nicht angewendet werden (Prämie wird doppelt versteuert).")
+
+    # Schließt und eröffnet eine Ausführung zugleich (C;O) und lässt sich der
+    # eröffnende Anteil nicht aus cost/fifoPnlRealized ablesen, läuft sie als
+    # reine Schließung; ein dabei eröffneter Short fehlt im Zufluss.
+    option_close_open_unresolved = _option_close_open_unresolved(trades, tax_year)
+    if option_close_open_unresolved:
+        print(f"  (!) WARNUNG: {len(option_close_open_unresolved)} Options-Ausführung(en) "
+              f"schließen und eröffnen zugleich (C;O), die Aufteilung ist nicht belegbar. "
+              f"Ein dabei eröffneter Short fehlt im Zufluss der Stillhalterprämie.")
 
     # --- Cross-Year Put-Assignment Korrektur (BMF Rn. 33) ---
     # When a put was assigned in a PRIOR year, the stock was acquired at Strike.
@@ -8910,9 +9116,15 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             #   at option sell-date FX rate. Tageskurs correction would double-count.
             # - Long exercises (SELL): Cost bundled into stock's cost basis by IBKR.
             #   Tageskurs on the option lot is phantom.
+            # Ein Börsen-Rückkauf zum Einstand (Ergebnis 0) ist keine Andienung:
+            # der Zufluss-FIFO korrigiert dort die Vorjahresprämie, die
+            # Kursdifferenz des Lots bleibt deshalb erhalten.
             if category in ('OPT', 'FOP', 'FSFOP'):
                 lot_pnl = abs(safe_float(lot.get('fifoPnlRealized'), 0))
-                if lot_pnl < 0.01:
+                closing_fill = trade_by_tx.get(lot.get('closingTransactionID') or '')
+                exchange_close = (closing_fill is not None
+                                  and closing_fill.get('transactionType') == 'ExchTrade')
+                if lot_pnl < 0.01 and not exchange_close:
                     continue
 
             cost_raw = safe_float(lot.get('cost'), 0)
@@ -9632,6 +9844,7 @@ def calculate_tax(ib_tax_dir, tax_year=None, fx_csv_path=None, anlage_so_overrid
             "prior_zufluss_correction_eur": prior_zufluss_correction_eur,
             "prior_zufluss_details": prior_zufluss_details,
             "zufluss_unmatched": zufluss_unmatched,
+            "option_close_open_unresolved": option_close_open_unresolved,
             "occ_rename_matches": occ_rename_matches,
         }
     }

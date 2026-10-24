@@ -1214,6 +1214,7 @@ def merge_report_data(reports):
         'prior_zufluss_correction_eur': sum(r.get('audit', {}).get('prior_zufluss_correction_eur', 0) for r in reports),
         'prior_zufluss_details': [],
         'zufluss_unmatched': [],
+        'option_close_open_unresolved': [],
         'occ_rename_matches': [],
         'stock_split_adjustments': [],
         'stillhalter_corrections_dropped': [],
@@ -1316,6 +1317,8 @@ def merge_report_data(reports):
         merged_audit['zufluss_details'].extend(a.get('zufluss_details', []))
         merged_audit['prior_zufluss_details'].extend(a.get('prior_zufluss_details', []))
         merged_audit['zufluss_unmatched'].extend(a.get('zufluss_unmatched', []))
+        merged_audit['option_close_open_unresolved'].extend(
+            a.get('option_close_open_unresolved', []) or [])
         merged_audit['occ_rename_matches'].extend(a.get('occ_rename_matches', []))
         merged_audit['stock_split_adjustments'].extend(
             a.get('stock_split_adjustments', []) or [])
@@ -4451,6 +4454,7 @@ Bei Optionsassignments bündelt IBKR die Prämie in den Aktien-PnL. Das BMF verl
 - `fifoPnlRealized` ≈ 0 (IBKR zeigt keinen PnL auf der Option)
 
 **Original-Verkauf finden:**
+- Ob eine Ausführung eröffnet oder schließt, liest das Tool aus IBKRs Kennzeichen `openCloseIndicator` (`O` eröffnet, `C` schließt). Ein Rückkauf oder Long-Verkauf zum Einstand bleibt so eine Schließung, auch wenn das Ergebnis 0 ist. Bei `C;O` schließt eine Ausführung die bestehende Position und eröffnet den Rest in Gegenrichtung; als Optionsverkauf zählt nur der eröffnete Teil. Die geschlossene Menge steht in den Closed Lots der Ausführung, ersatzweise ergibt sie sich aus IBKRs `cost` und `fifoPnlRealized`. Ist die Aufteilung nicht belegbar, zählt die Ausführung als reine Schließung und es erscheint ein Prüffall.
 - Vorrangig über IBKRs Kontraktnummer (`conid`), die auch eine Umbenennung oder einen Split der Optionsserie übersteht. Ohne `conid` über `strike`, `expiry`, `putCall`.
 - Es können mehrere Teilfüllungen sein; verbraucht wird nach FIFO, älteste zuerst.
 
