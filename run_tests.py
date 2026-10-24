@@ -66,6 +66,7 @@ SYNTHETIC_TESTS = [
     ("Trade-Funds-Dedupe", "tests/test_dedupe.py"),
     ("FX-Rate-Parse-Ausfaelle", "tests/test_fx_rate_parse_failures.py"),
     ("Options-Event-Sammlung", "tests/test_option_event_collection.py"),
+    ("Options-Eroeffnung-Schliessung", "tests/test_option_open_close_indicator.py"),
     ("Tageskurs-Korrektur-Maps", "tests/test_tageskurs_adjustment_maps.py"),
     ("Underlying-Symbol-Aliasse", "tests/test_underlying_symbol_matching.py"),
     ("Instrumentenkategorie-Routing", "tests/test_asset_category_routing.py"),

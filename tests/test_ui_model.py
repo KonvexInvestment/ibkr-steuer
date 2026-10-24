@@ -509,6 +509,8 @@ def full_trigger_report():
                 {'symbol': 'BBB', 'type': 'cross_year'},
             ],
             'zufluss_unmatched': [{'symbol': 'CCC'}],
+            'option_close_open_unresolved': [
+                {'symbol': 'RUTW 260227P02470000', 'date': '2025-12-26'}],
             'unrouted_asset_categories': [
                 {'category': 'IOPT', 'count': 1, 'pnl_eur': 5.0,
                  'symbols': ['X']}],
@@ -573,7 +575,8 @@ def full_trigger_context():
 
 NOTICE_REGISTRY = {
     'stillhalter_unmatched', 'stillhalter_prior_lot_unmatched',
-    'zufluss_unmatched', 'unrouted_asset_categories',
+    'zufluss_unmatched', 'option_close_open_unresolved',
+    'unrouted_asset_categories',
     'unhandled_activity_codes', 'partnership_blocked',
     'transaction_tax_processed',
     'classification_review', 'etf_unknown_classification',
