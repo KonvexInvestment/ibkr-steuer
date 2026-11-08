@@ -15,6 +15,7 @@ Die Datei laeuft unveraendert unter lokalem Streamlit UND stlite/Pyodide
 (index.html) — keine Fremdkomponenten, keine externen Fonts, kein Netz.
 """
 
+import base64
 import contextlib
 import copy
 import html
@@ -370,6 +371,67 @@ st.markdown("""
         color: var(--ink-3); font-size: 0.76rem; line-height: 1.5;
         margin-bottom: 0.8rem;
     }
+    .video-card {
+        position: relative;
+        display: flex; align-items: center; gap: 0.85rem;
+        padding: 0.6rem; margin: 22px 0 0.2rem 0;
+        background: var(--card-soft); border: 1px solid var(--line);
+        border-radius: var(--radius); text-decoration: none !important;
+        transition: border-color 160ms ease, background 160ms ease,
+                    transform 160ms ease;
+    }
+    .video-card:hover, .video-card:focus-visible {
+        border-color: var(--accent-border); background: var(--accent-dim);
+        transform: translateY(-1px);
+    }
+    .video-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    /* Gestrichelte Linie von „1 · Flex Query“ in der Ablaufgrafik zur Karte:
+       Station 1 sitzt bei x = 57 von 520 der Grafik, also bei knapp 11 %. */
+    .video-card::before {
+        content: ""; position: absolute; left: calc(57 / 520 * 100% - 1px);
+        top: -31px; height: 30px; border-left: 2px dashed rgba(122,165,248,0.55);
+    }
+    .video-card::after {
+        content: ""; position: absolute; left: calc(57 / 520 * 100% - 4px);
+        top: -5px; width: 8px; height: 8px; border-radius: 50%;
+        background: var(--accent);
+    }
+    .video-card-thumb {
+        position: relative; flex: 0 0 42%; aspect-ratio: 16 / 9;
+        border-radius: var(--radius-sm); overflow: hidden;
+        background: #000; border: 1px solid var(--line);
+    }
+    .video-card-thumb img {
+        width: 100%; height: 100%; object-fit: cover; display: block;
+        transition: transform 300ms ease;
+    }
+    .video-card:hover .video-card-thumb img { transform: scale(1.03); }
+    .video-card-play {
+        position: absolute; left: 50%; top: 50%;
+        width: 42px; height: 42px; margin: -21px 0 0 -21px;
+        border-radius: 50%; background: var(--accent);
+        display: flex; align-items: center; justify-content: center;
+        box-shadow: 0 6px 22px rgba(0,0,0,0.45), 0 0 0 6px rgba(122,165,248,0.22);
+        transition: transform 160ms ease;
+    }
+    .video-card:hover .video-card-play { transform: scale(1.08); }
+    .video-card-play svg { width: 18px; height: 18px; fill: #0c0e12; margin-left: 2px; }
+    .video-card-dauer {
+        position: absolute; right: 6px; bottom: 6px;
+        padding: 1px 6px; border-radius: 5px;
+        background: rgba(0,0,0,0.72); color: var(--ink);
+        font-size: 0.66rem; font-weight: 700; font-variant-numeric: tabular-nums;
+    }
+    .video-card-text { display: flex; flex-direction: column; gap: 0.2rem; min-width: 0; }
+    .video-card-kicker {
+        color: var(--accent); font-size: 0.66rem; font-weight: 700;
+        letter-spacing: 0.08em; text-transform: uppercase;
+    }
+    .video-card-title {
+        color: var(--ink); font-size: 0.92rem; font-weight: 700;
+        line-height: 1.3; letter-spacing: -0.01em;
+    }
+    .video-card-meta { color: var(--ink-3); font-size: 0.72rem; line-height: 1.45; }
     .stApp:has(.start-title) [data-testid="stFileUploader"] {
         background: rgba(122,165,248,0.055);
         border-color: rgba(122,165,248,0.28);
@@ -383,12 +445,16 @@ st.markdown("""
     }
     .start-foot {
         color: var(--ink-3); background: var(--card-soft);
-        border: 1px solid var(--line-soft); border-left: 3px solid var(--warn);
-        border-radius: 0 var(--radius) var(--radius) 0; padding: 0.65rem 0.8rem;
-        font-size: 0.7rem; line-height: 1.5; margin-top: 1.35rem;
+        border: 1px solid var(--line); border-radius: var(--radius-lg);
+        padding: 0.85rem 1.2rem 0.9rem 1.2rem;
+        font-size: 0.72rem; line-height: 1.55; margin-top: 0.3rem;
         text-align: left;
     }
-    .start-foot strong { color: var(--ink-2); font-weight: 700; }
+    .start-foot-kicker {
+        color: var(--warn); font-size: 0.66rem; font-weight: 700;
+        letter-spacing: 0.08em; text-transform: uppercase;
+        margin-bottom: 0.3rem;
+    }
 
     /* ── Streamlit-Widgets angleichen ── */
     [data-testid="stFileUploader"] {
@@ -583,6 +649,8 @@ st.markdown("""
         .start-sub { font-size: 0.88rem; }
         .start-visual { max-width: none; margin-bottom: 0.8rem; }
         .st-key-start_upload_card { padding: 1rem; }
+        .video-card-play { width: 34px; height: 34px; margin: -17px 0 0 -17px; }
+        .video-card-play svg { width: 15px; height: 15px; }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -1574,6 +1642,44 @@ def _reset_all_data():
         st.session_state.pop(key, None)
 
 
+XML_VIDEO_URL = "https://konvexinvestment.de/ibkr-steuerrechner/#xml-export"
+XML_VIDEO_VORSCHAU = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "assets", "xml-video-vorschau.webp")
+
+
+def _xml_video_card_html():
+    """Karte zur Video-Anleitung auf der Startseite. Das Vorschaubild steckt
+    als data-URI in der Seite, damit beim Laden kein weiterer Server
+    angesprochen wird; konvexinvestment.de öffnet sich erst beim Klick in
+    einem neuen Tab. Fehlt die Bilddatei, bleibt die Karte ohne Bild."""
+    bild = ''
+    try:
+        with open(XML_VIDEO_VORSCHAU, 'rb') as f:
+            daten = base64.b64encode(f.read()).decode('ascii')
+        bild = (f'<img src="data:image/webp;base64,{daten}" alt="" '
+                'width="640" height="360">')
+    except OSError:
+        pass
+    return (
+        f'<a class="video-card" href="{XML_VIDEO_URL}" target="_blank" '
+        'rel="noopener" aria-label="Video-Anleitung XML-Datei in IBKR '
+        'erstellen, 3 Minuten 44 Sekunden, öffnet konvexinvestment.de">'
+        f'<span class="video-card-thumb">{bild}'
+        '<span class="video-card-play" aria-hidden="true">'
+        '<svg viewBox="0 0 24 24"><path d="M8 5.14v13.72a1 1 0 0 0 1.52.85'
+        'l11-6.86a1 1 0 0 0 0-1.7l-11-6.86A1 1 0 0 0 8 5.14z"/></svg>'
+        '</span><span class="video-card-dauer" aria-hidden="true">3:44</span>'
+        '</span>'
+        '<span class="video-card-text">'
+        '<span class="video-card-kicker">Noch keine XML-Datei?</span>'
+        '<span class="video-card-title">Video-Anleitung: XML-Datei in IBKR '
+        'erstellen</span>'
+        '<span class="video-card-meta">Flex Query einmal einrichten, dann je '
+        'Steuerjahr herunterladen · auf konvexinvestment.de ↗</span>'
+        '</span></a>'
+    )
+
+
 def _render_uploaders(scope):
     xml_key, csv_key = _upload_widget_keys(scope)
     append_existing = scope == 'sidebar'
@@ -1722,6 +1828,7 @@ if not _dataset_files:
             '<text class="sv-label" x="432" y="162" text-anchor="middle">'
             '<tspan>3</tspan> · Anlage KAP</text>'
             '</svg>'
+            + _xml_video_card_html() +
             '</div>',
             unsafe_allow_html=True,
         )
@@ -1736,15 +1843,16 @@ if not _dataset_files:
                 unsafe_allow_html=True,
             )
             _render_uploaders('start')
-    st.markdown(
-        '<div class="start-foot"><strong>Keine Steuerberatung · '
-        'Haftungsbeschränkung:</strong> '
-        'Nutzung und Prüfung der Ergebnisse erfolgen eigenverantwortlich. '
-        'Soweit gesetzlich zulässig, wird für Schäden aus der Nutzung sowie '
-        'für fehlerhafte oder unvollständige Berechnungen keine Haftung '
-        'übernommen.</div>',
-        unsafe_allow_html=True,
-    )
+        st.markdown(
+            '<div class="start-foot">'
+            '<div class="start-foot-kicker">Keine Steuerberatung · '
+            'Haftungsbeschränkung</div>'
+            'Nutzung und Prüfung der Ergebnisse erfolgen eigenverantwortlich. '
+            'Soweit gesetzlich zulässig, wird für Schäden aus der Nutzung sowie '
+            'für fehlerhafte oder unvollständige Berechnungen keine Haftung '
+            'übernommen.</div>',
+            unsafe_allow_html=True,
+        )
     st.stop()
 
 _dataset_id = _dataset.get('dataset_id', '')
