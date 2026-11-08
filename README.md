@@ -40,7 +40,7 @@ Die technischen XML-Felder sind grundsätzlich unabhängig von der Portalsprache
 
 Die Berechnung läuft **vollständig im Browser** via WebAssembly (stlite/Pyodide). Es gibt keinen Anwendungsserver und keine Datenbank: Die hochgeladenen IBKR-Dateien werden weder übertragen noch gespeichert und verlassen den Rechner nicht.
 
-Beim Laden der Seite holt der Browser allerdings die Laufzeitumgebung (stlite/Pyodide) von jsDelivr und die Schriftart von Google Fonts. Diese CDNs sehen dabei die IP-Adresse, bekommen aber keine Kontodaten zu sehen. Wer auch das vermeiden möchte, klont das Repository und startet die App lokal (siehe unten).
+Beim Laden der Seite holt der Browser allerdings die Seite selbst von GitHub Pages, die Laufzeitumgebung (stlite/Pyodide) von jsDelivr und einige Python-Pakete, darunter openpyxl für den Excel-Export, von PyPI (pypi.org und files.pythonhosted.org). Diese Dienste sehen dabei die IP-Adresse, bekommen aber keine Kontodaten zu sehen. Wer auch das vermeiden möchte, klont das Repository und startet die App lokal (siehe unten).
 
 ## Lokale Entwicklung
 
