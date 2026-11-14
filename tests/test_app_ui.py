@@ -130,6 +130,9 @@ def test_start_screen_without_dataset():
     assert "Keine Steuerberatung · Haftungsbeschränkung" in rendered
     assert "Nutzung und Prüfung der Ergebnisse erfolgen eigenverantwortlich" in rendered
     assert "Soweit gesetzlich zulässig" in rendered
+    # Anbieterkennzeichnung und Datenschutzhinweis schon vor dem Upload
+    assert 'href="https://konvexinvestment.de/impressum/"' in rendered
+    assert 'href="https://konvexinvestment.de/datenschutz/#ibkr-steuerrechner"' in rendered
     assert all(button.label != "Beispielbericht ansehen" for button in at.button)
 
 
@@ -143,6 +146,10 @@ def test_all_pages_render_and_nav_normalizes():
     dataset = make_dataset([("synthetic_2025.xml", make_xml())])
     at = run_app(dataset)
     assert_no_exception(at, "overview")
+    # Nach dem Upload bleiben Impressum und Datenschutz in der Seitenleiste erreichbar
+    sidebar = "\n".join(m.value for m in at.sidebar.markdown)
+    assert 'href="https://konvexinvestment.de/impressum/"' in sidebar
+    assert 'href="https://konvexinvestment.de/datenschutz/#ibkr-steuerrechner"' in sidebar
     vm_pages = ['overview', 'kap', 'kap_inv', 'prueffaelle', 'rechenwege',
                 'export']
     for page in vm_pages[1:]:
@@ -706,6 +713,8 @@ def test_guidance_copy_and_rechenwege_grouping():
     assert "Aktive Methoden im Report" in rendered
     assert "Produkte aus dem Upload · inklusive Vorjahreshistorie" in rendered
     assert "Eigenverantwortliche Nutzung" in rendered
+    assert "in der Browser-Fassung im Browser" in rendered
+    assert "Die Angaben zum Anbieter stehen im [Impressum](https://konvexinvestment.de/impressum/)" in rendered
     assert "Zwei-Töpfe-Struktur" in rendered
     assert "Schritt 1: XML-Extraktion" in rendered
     expander_labels = [expander.label for expander in at.expander]
