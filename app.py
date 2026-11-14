@@ -455,6 +455,10 @@ st.markdown("""
         letter-spacing: 0.08em; text-transform: uppercase;
         margin-bottom: 0.3rem;
     }
+    .legal-links { color: var(--ink-3); font-size: 0.72rem; margin-top: 0.45rem; }
+    .legal-links a { color: var(--ink-2); text-decoration: underline; text-underline-offset: 2px; }
+    .legal-links a:hover { color: var(--ink); }
+    .legal-links-sidebar { margin-top: 1.4rem; }
 
     /* ── Streamlit-Widgets angleichen ── */
     [data-testid="stFileUploader"] {
@@ -1643,6 +1647,22 @@ def _reset_all_data():
 
 
 XML_VIDEO_URL = "https://konvexinvestment.de/ibkr-steuerrechner/#xml-export"
+# Anbieterkennzeichnung (§ 5 DDG) und Datenschutzhinweis: Der Rechner ist ein
+# Angebot von Konvex Investment, Impressum und Datenschutzerklärung liegen auf
+# der Hauptseite. Die Links müssen auf jeder Ansicht erreichbar sein.
+IMPRESSUM_URL = "https://konvexinvestment.de/impressum/"
+DATENSCHUTZ_URL = "https://konvexinvestment.de/datenschutz/#ibkr-steuerrechner"
+
+
+def _legal_links_html(extra_class=""):
+    klasse = f"legal-links {extra_class}".strip()
+    return (
+        f'<div class="{klasse}">'
+        f'<a href="{IMPRESSUM_URL}" target="_blank" rel="noopener">Impressum</a>'
+        ' · '
+        f'<a href="{DATENSCHUTZ_URL}" target="_blank" rel="noopener">Datenschutz</a>'
+        '</div>'
+    )
 XML_VIDEO_VORSCHAU = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "assets", "xml-video-vorschau.webp")
 
@@ -1850,7 +1870,7 @@ if not _dataset_files:
             'Nutzung und Prüfung der Ergebnisse erfolgen eigenverantwortlich. '
             'Soweit gesetzlich zulässig, wird für Schäden aus der Nutzung sowie '
             'für fehlerhafte oder unvollständige Berechnungen keine Haftung '
-            'übernommen.</div>',
+            'übernommen.' + _legal_links_html() + '</div>',
             unsafe_allow_html=True,
         )
     st.stop()
@@ -1883,6 +1903,7 @@ with st.sidebar:
     st.markdown('<div class="eyebrow" style="margin-top:1.1rem;">Berechnung</div>',
                 unsafe_allow_html=True)
     _toggle_slot = st.container()
+    st.markdown(_legal_links_html("legal-links-sidebar"), unsafe_allow_html=True)
 
 # ── Compute-Snapshot ─────────────────────────────────────────────────────────
 
@@ -4286,12 +4307,19 @@ sonstigen Fällen zwingender gesetzlicher Haftung. Bei einer leicht
 fahrlässigen Verletzung wesentlicher Pflichten ist die Haftung auf den
 typischerweise vorhersehbaren Schaden begrenzt.
 
-**Datenschutz und Datenverarbeitung.** Sämtliche Berechnungen erfolgen in
-der lokal gestarteten Anwendung auf dem eigenen Rechner. Hochgeladene Dateien
-werden nur an den lokalen Streamlit-Prozess (`localhost`) übertragen und
-dort temporär verarbeitet; das Tool sendet sie nicht an externe Server oder
-Dritte und speichert sie nicht dauerhaft. Im Tool findet kein Tracking und
-keine Nutzungsanalyse statt.
+**Datenschutz und Datenverarbeitung.** Sämtliche Berechnungen erfolgen auf
+dem eigenen Rechner: in der Browser-Fassung im Browser (WebAssembly über
+stlite und Pyodide), in der lokal gestarteten Fassung im lokalen
+Streamlit-Prozess (`localhost`). Hochgeladene Dateien verlassen den Rechner
+nicht; das Tool sendet sie nicht an externe Server oder Dritte und speichert
+sie nicht dauerhaft. Im Tool findet kein Tracking und keine Nutzungsanalyse
+statt. Beim Laden der Browser-Fassung holt der Browser die Seite von GitHub
+Pages, die Laufzeitumgebung von jsDelivr und einige Python-Pakete von PyPI;
+diese Dienste sehen dabei die IP-Adresse, aber keine Kontodaten. Einzelheiten
+stehen in der [Datenschutzerklärung]({DATENSCHUTZ_URL}).
+
+**Anbieter.** Der Rechner ist ein kostenloses Angebot von Konvex Investment.
+Die Angaben zum Anbieter stehen im [Impressum]({IMPRESSUM_URL}).
 
 **Rechtsstand und Aktualität.** Dieser Bericht wurde für das Steuerjahr
 {int(steuerjahr)} berechnet. Berücksichtigter Rechtsstand: §20 EStG, das
